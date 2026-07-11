@@ -1,0 +1,13 @@
+[package]
+name = "nokk-stealth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Browser fingerprint spoofing and anti-bot stealth JavaScript for the nokk headless browser engine."
+repository.workspace = true
+keywords = ["stealth", "anti-bot", "fingerprint", "spoofing", "browser"]
+categories = ["web-programming"]
+
+[dependencies]
+serde = { workspace = true }

@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+
+# Machine-specific build env (BoringSSL/bindgen paths). Committed as
+# .cargo/config.toml.example; copy and edit for your machine.
+/.cargo/config.toml
+
+# Scratch / local test rigs
+*.log
+node_modules/
+
+# Local-only tooling notes — never publish
+/.claude/
+CLAUDE.md

@@ -1,0 +1,15 @@
+# Build environment for the BoringSSL-backed TLS client (nokk-net / wreq).
+#
+# Copy this to `.cargo/config.toml` and adjust the paths for your machine.
+# Needed only because `boring-sys` compiles BoringSSL and runs `bindgen`.
+#
+# Get the tools without root:
+#   pip install --user cmake       # puts cmake on PATH (~/.local/bin)
+#   pip install --user libclang    # provides libclang.so (path below)
+#
+# LIBCLANG_PATH  -> the directory containing libclang.so
+# BINDGEN_EXTRA_CLANG_ARGS -> where clang finds builtin headers (stddef.h, …);
+#                             point it at your GCC/clang include dir + /usr/include.
+[env]
+LIBCLANG_PATH = "/home/YOU/.local/lib/python3.X/site-packages/clang/native"
+BINDGEN_EXTRA_CLANG_ARGS = "-isystem /usr/lib/gcc/x86_64-linux-gnu/12/include -isystem /usr/include"

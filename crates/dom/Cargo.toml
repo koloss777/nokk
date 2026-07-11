@@ -1,0 +1,15 @@
+[package]
+name = "nokk-dom"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "HTML parsing into a DOM tree for the nokk headless browser engine."
+repository.workspace = true
+keywords = ["dom", "html", "html5ever", "browser", "parsing"]
+categories = ["web-programming", "parsing"]
+
+[dependencies]
+html5ever = { workspace = true }
+markup5ever_rcdom = { workspace = true }
+serde_json = { workspace = true }

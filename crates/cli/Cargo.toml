@@ -1,0 +1,28 @@
+[package]
+name = "nokk-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Command-line interface and CDP server binary for the nokk headless browser engine."
+repository.workspace = true
+keywords = ["headless-browser", "stealth", "scraping", "cli", "puppeteer"]
+categories = ["command-line-utilities", "web-programming"]
+
+[[bin]]
+name = "nokk"
+path = "src/main.rs"
+
+[dependencies]
+nokk = { workspace = true }
+nokk-net = { workspace = true }
+nokk-stealth = { workspace = true }
+nokk-cdp = { workspace = true }
+
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }

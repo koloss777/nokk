@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/net",
+    "crates/cdp",
+    "crates/stealth",
+    "crates/pool",
+    "crates/dom",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/koloss777/nokk"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# Internal crates
+nokk = { path = "crates/core" }
+nokk-net = { path = "crates/net" }
+nokk-cdp = { path = "crates/cdp" }
+nokk-stealth = { path = "crates/stealth" }
+nokk-pool = { path = "crates/pool" }
+nokk-dom = { path = "crates/dom" }
+
+# HTML parsing (Phase 3)
+html5ever = "0.39"
+markup5ever_rcdom = "0.39"
+url = "2"
+
+# Chrome-fingerprinted HTTP client (Phase 2). BoringSSL-backed; emits a Chrome
+# ClientHello (JA3/JA4) + HTTP/2 fingerprint. Build needs cmake + libclang (see
+# docs/BUILD.md).
+wreq = { version = "5", features = ["cookies"] }
+wreq-util = "2"
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# CDP WebSocket server (Phase 5)
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

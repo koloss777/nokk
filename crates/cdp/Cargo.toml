@@ -1,0 +1,21 @@
+[package]
+name = "nokk-cdp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Chrome DevTools Protocol server (Puppeteer-compatible) for the nokk headless browser engine."
+repository.workspace = true
+keywords = ["cdp", "devtools-protocol", "puppeteer", "browser", "websocket"]
+categories = ["web-programming", "network-programming"]
+
+[dependencies]
+nokk = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
