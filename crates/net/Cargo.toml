@@ -1,0 +1,21 @@
+[package]
+name = "nokk-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Chrome-fingerprinted HTTP client (BoringSSL JA3/JA4 + HTTP/2) for the nokk headless browser engine."
+repository.workspace = true
+keywords = ["ja3", "ja4", "tls-fingerprint", "http-client", "anti-bot"]
+categories = ["network-programming", "web-programming"]
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+# Chrome-fingerprinted HTTP client (Phase 2): BoringSSL-backed Chrome ClientHello
+# + HTTP/2 fingerprint. Build needs cmake + libclang (see docs/BUILD.md).
+wreq = { workspace = true }
+wreq-util = { workspace = true }

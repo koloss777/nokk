@@ -1,0 +1,25 @@
+[package]
+name = "nokk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "An undetectable headless browser engine: real V8 + DOM with a coherent Chrome TLS/JS fingerprint, driven over the Chrome DevTools Protocol."
+repository.workspace = true
+keywords = ["headless-browser", "stealth", "anti-bot", "fingerprint", "scraping"]
+categories = ["web-programming", "emulators"]
+
+[dependencies]
+nokk-pool = { workspace = true }
+nokk-net = { workspace = true }
+nokk-stealth = { workspace = true }
+nokk-dom = { workspace = true }
+
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time"] }

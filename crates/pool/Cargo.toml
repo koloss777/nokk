@@ -1,0 +1,19 @@
+[package]
+name = "nokk-pool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "V8 isolate worker pool with backpressure — the concurrency core of the nokk headless browser engine."
+repository.workspace = true
+keywords = ["v8", "isolate", "concurrency", "browser", "pool"]
+categories = ["concurrency", "web-programming"]
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+# Embedded JavaScript engine (Phase 1). Uses a prebuilt V8 static library, so it
+# does not compile V8 from source. One `v8::OwnedIsolate` lives per worker thread.
+v8 = "137"
