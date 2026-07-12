@@ -57,7 +57,34 @@ the ground up, and skip the rendering engine entirely.**
 
 ## Quick start
 
-### Prerequisites
+### Run with Docker (no build required)
+
+The published image bundles the binary, glibc, and TLS roots — nothing to compile:
+
+```bash
+docker run --rm -p 9222:9222 ghcr.io/koloss777/nokk:latest
+```
+
+That starts the CDP server; point Puppeteer at `ws://localhost:9222/devtools/browser/nokk`.
+One-shot modes work too — just override the args:
+
+```bash
+docker run --rm ghcr.io/koloss777/nokk:latest --eval 'navigator.webdriver'   # -> false
+docker run --rm ghcr.io/koloss777/nokk:latest --load https://example.com --eval 'document.title'
+```
+
+Or build the image yourself from a checkout: `docker build -t nokk .`
+
+### Run the prebuilt binary
+
+Grab the Linux x86_64 tarball from the [latest release](../../releases/latest):
+
+```bash
+tar -xzf nokk-*-linux-x86_64.tar.gz
+./nokk --eval 'navigator.webdriver'
+```
+
+### Build from source
 
 nokk's fingerprinted transport is backed by BoringSSL (via `wreq`), so the first build
 compiles it from source. You need a C/C++ toolchain, `cmake`, and `libclang`. On
@@ -65,19 +92,14 @@ Debian/Ubuntu:
 
 ```bash
 sudo apt install build-essential cmake clang libclang-dev
+git clone https://github.com/koloss777/nokk
+cd nokk
+cargo build --release
 ```
 
 > No root? BoringSSL can be bootstrapped from user-space `pip` packages — see
 > [`docs/BUILD.md`](docs/BUILD.md) for the `cmake` + `libclang` + `.cargo/config.toml`
 > recipe used to build this repo without sudo.
-
-### Build
-
-```bash
-git clone https://github.com/koloss/nokk
-cd nokk
-cargo build --release
-```
 
 ### Use it from the command line
 

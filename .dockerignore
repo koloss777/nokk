@@ -1,0 +1,17 @@
+# Build output — never copy the (huge) target dir into the build context.
+target/
+
+# VCS + local tooling
+.git/
+.gitignore
+.claude/
+CLAUDE.md
+
+# Machine-specific build env: a host .cargo/config.toml points LIBCLANG_PATH at
+# host paths that don't exist in the image, which would break the in-image build.
+# The container gets libclang from the system libclang-dev instead.
+.cargo/config.toml
+
+# Scratch
+**/*.log
+node_modules/
