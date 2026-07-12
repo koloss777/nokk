@@ -20,6 +20,11 @@ struct Cli {
     #[arg(long, env = "NOKK_PORT", default_value_t = 9222)]
     port: u16,
 
+    /// Address the CDP server binds to. Defaults to loopback; set `0.0.0.0` to
+    /// accept connections from other hosts (e.g. inside a Docker container).
+    #[arg(long, env = "NOKK_HOST", default_value = "127.0.0.1")]
+    host: std::net::IpAddr,
+
     /// Number of isolate worker threads. Defaults to available parallelism.
     #[arg(long, env = "NOKK_WORKERS")]
     workers: Option<usize>,
@@ -273,12 +278,16 @@ async fn main() -> Result<()> {
     }
 
     // Default: run the CDP server so Puppeteer/Playwright can drive the engine.
-    let addr: std::net::SocketAddr = ([127, 0, 0, 1], cli.port).into();
-    println!(
-        "CDP server on ws://127.0.0.1:{}/devtools/browser/nokk",
-        cli.port
-    );
-    println!("  Puppeteer: puppeteer.connect({{ browserWSEndpoint: 'ws://127.0.0.1:{}/devtools/browser/nokk' }})", cli.port);
+    let addr = std::net::SocketAddr::new(cli.host, cli.port);
+    // Advertise a connectable host: 0.0.0.0 isn't dialable, so point clients at
+    // loopback (the common `-p` / local case).
+    let advertise = if cli.host.is_unspecified() {
+        std::net::IpAddr::from([127, 0, 0, 1])
+    } else {
+        cli.host
+    };
+    println!("CDP server on ws://{advertise}:{}/devtools/browser/nokk", cli.port);
+    println!("  Puppeteer: puppeteer.connect({{ browserWSEndpoint: 'ws://{advertise}:{}/devtools/browser/nokk' }})", cli.port);
     nokk_cdp::serve(engine, nokk_cdp::ServerConfig { addr }).await?;
     Ok(())
 }

@@ -68,8 +68,9 @@ would flag today. Closing them is the top priority — coherence is the whole po
 
 ## Packaging & release (Phase 9)
 
+- 🟡 Prebuilt Linux binary + Docker image (`ghcr.io`), built by the tag-triggered
+  [release workflow](.github/workflows/release.yml). (macOS/Windows binaries: planned.)
 - ⬜ Publish crates to crates.io.
-- ⬜ Prebuilt binaries and a Docker image (BoringSSL baked in).
 - ⬜ Getting-started guide and API docs on docs.rs.
 
 ---
