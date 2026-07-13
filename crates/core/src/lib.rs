@@ -236,8 +236,10 @@ impl BrowserContext {
     /// [`load_html`](Self::load_html) it. Requires real networking (the stub
     /// client reports [`EngineError::NavNotImplemented`]).
     pub async fn navigate(&self, url: &str) -> Result<(), EngineError> {
-        let html = self.fetch_text(url, "document").await?;
-        self.load_html(url, &html).await
+        // Use the post-redirect URL as the document base, so `window.location`
+        // and relative-URL resolution reflect where we actually landed.
+        let (final_url, html) = self.fetch_text(url, "document").await?;
+        self.load_html(&final_url, &html).await
     }
 
     /// Build the DOM from `html`, then run its scripts in document order and fire
@@ -263,7 +265,7 @@ impl BrowserContext {
                 nokk_dom::Script::Inline(code) => code.clone(),
                 nokk_dom::Script::External(src) => match resolve_url(base_url, src) {
                     Some(abs) => match self.fetch_text(&abs, "script").await {
-                        Ok(code) => code,
+                        Ok((_, code)) => code,
                         Err(e) => {
                             tracing::warn!(url = %abs, error = %e, "external script fetch failed");
                             continue;
@@ -390,6 +392,8 @@ impl BrowserContext {
                 let headers_js =
                     serde_json::to_string(&resp.headers).unwrap_or_else(|_| "{}".into());
                 let body = String::from_utf8_lossy(&resp.body);
+                // `response.url` is the final URL after redirects (fetch spec).
+                let final_url = if resp.url.is_empty() { &url } else { &resp.url };
                 format!(
                     "__pt_fetchResolve({}, {}, {}, {}, {}, {})",
                     id,
@@ -397,7 +401,7 @@ impl BrowserContext {
                     serde_json::to_string(reason_phrase(resp.status)).unwrap(),
                     headers_js,
                     serde_json::to_string(&*body).unwrap(),
-                    serde_json::to_string(&url).unwrap(),
+                    serde_json::to_string(final_url).unwrap(),
                 )
             }
             Err(e) => {
@@ -416,9 +420,15 @@ impl BrowserContext {
         }
     }
 
-    /// GET `url` and return the body as text, using the engine's fingerprint
-    /// headers, recording it under `resource_type`. Runs off the isolate thread.
-    async fn fetch_text(&self, url: &str, resource_type: &str) -> Result<String, EngineError> {
+    /// GET `url` and return `(final_url, body)` as text, using the engine's
+    /// fingerprint headers, recording it under `resource_type`. `final_url` is the
+    /// destination after any redirects — the caller uses it as the document base.
+    /// Runs off the isolate thread.
+    async fn fetch_text(
+        &self,
+        url: &str,
+        resource_type: &str,
+    ) -> Result<(String, String), EngineError> {
         let mut headers = std::collections::BTreeMap::new();
         headers.insert(
             "User-Agent".to_string(),
@@ -437,7 +447,12 @@ impl BrowserContext {
         match self.engine.client.send(req).await {
             Ok(resp) => {
                 self.record("GET", url, resource_type, resp.status, &resp.body);
-                Ok(String::from_utf8_lossy(&resp.body).into_owned())
+                let final_url = if resp.url.is_empty() {
+                    url.to_string()
+                } else {
+                    resp.url.clone()
+                };
+                Ok((final_url, String::from_utf8_lossy(&resp.body).into_owned()))
             }
             Err(NetError::Unimplemented) => Err(EngineError::NavNotImplemented),
             Err(e) => {
