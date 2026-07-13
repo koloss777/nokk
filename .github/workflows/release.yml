@@ -37,7 +37,7 @@ jobs:
           generate_release_notes: true
 
   image:
-    name: Build and push image
+    name: Build and push images
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,21 +51,37 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Image metadata (tags + labels)
-        id: meta
+      # Default / smallest image: distroless. Tagged latest + version + :distroless.
+      - name: Metadata (distroless)
+        id: meta_distroless
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=semver,pattern={{version}}
             type=raw,value=latest
+            type=raw,value=distroless
 
-      - name: Build and push
+      - name: Build and push (distroless)
         uses: docker/build-push-action@v6
         with:
           context: .
+          target: distroless
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta_distroless.outputs.tags }}
+          labels: ${{ steps.meta_distroless.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Debian variant (has a shell for debugging): :debian + :<version>-debian.
+      - name: Build and push (debian)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: debian
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:debian
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}-debian
           cache-from: type=gha
           cache-to: type=gha,mode=max

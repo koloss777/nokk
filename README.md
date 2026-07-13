@@ -59,7 +59,9 @@ the ground up, and skip the rendering engine entirely.**
 
 ### Run with Docker (no build required)
 
-The published image bundles the binary, glibc, and TLS roots — nothing to compile:
+The published image bundles the binary, glibc, and TLS roots — nothing to compile.
+`:latest` is a tiny [distroless](https://github.com/GoogleContainerTools/distroless)
+image (~62 MB, ~22 MB compressed):
 
 ```bash
 docker run --rm -p 9222:9222 ghcr.io/koloss777/nokk:latest
@@ -73,7 +75,15 @@ docker run --rm ghcr.io/koloss777/nokk:latest --eval 'navigator.webdriver'   # -
 docker run --rm ghcr.io/koloss777/nokk:latest --load https://example.com --eval 'document.title'
 ```
 
-Or build the image yourself from a checkout: `docker build -t nokk .`
+Two variants are published per release:
+
+| Tag | Base | Notes |
+|-----|------|-------|
+| `:latest`, `:<version>`, `:distroless` | distroless | Smallest; no shell. The default. |
+| `:debian`, `:<version>-debian` | debian-slim | Larger, but has a shell for `docker exec` debugging. |
+
+Or build the image yourself from a checkout: `docker build -t nokk .` (add
+`--target debian` for the debian variant).
 
 ### Run the prebuilt binary
 
