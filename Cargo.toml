@@ -63,3 +63,6 @@ futures-util = "0.3"
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+# Drop the symbol table (~14 MB of V8 symbols) from the release binary: 51 -> 37 MB,
+# smaller image, faster pulls. Backtraces show addresses instead of names.
+strip = true
