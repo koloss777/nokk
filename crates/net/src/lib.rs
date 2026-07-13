@@ -117,6 +117,9 @@ pub struct Response {
     pub status: u16,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
+    /// Final URL after any redirects were followed — the origin the body
+    /// actually came from. Callers use it as the document base URL.
+    pub url: String,
 }
 
 /// The engine talks to the network exclusively through this trait, so the TLS
@@ -196,6 +199,10 @@ impl FingerprintClient {
             // (incl. any `cf_clearance`) are replayed on later requests from the
             // same engine. Cross-process persistence is a separate follow-up.
             .cookie_store(true)
+            // Follow 3xx redirects like a real browser (wreq defaults to *none*).
+            // Without this, navigating to e.g. `google.com` returns the `301
+            // Moved` body instead of the destination page. Capped at 10 hops.
+            .redirect(wreq::redirect::Policy::limited(10))
             .timeout(config.request_timeout);
 
         if let Some(p) = &config.proxy {
@@ -252,6 +259,8 @@ impl HttpClient for FingerprintClient {
             }
         })?;
         let status = resp.status().as_u16();
+        // Final URL after redirects — captured before `bytes()` consumes `resp`.
+        let url = resp.url().to_string();
         let mut headers = BTreeMap::new();
         for (k, v) in resp.headers() {
             if let Ok(s) = v.to_str() {
@@ -265,6 +274,7 @@ impl HttpClient for FingerprintClient {
             .to_vec();
         Ok(Response {
             status,
+            url,
             headers,
             body,
         })
