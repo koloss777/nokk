@@ -743,6 +743,7 @@ mod tests {
             pool: PoolConfig {
                 workers: 1,
                 max_live_contexts: 4,
+                max_heap_mb: None,
             },
             use_real_network: false,
             ..Default::default()

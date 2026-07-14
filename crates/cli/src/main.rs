@@ -33,6 +33,13 @@ struct Cli {
     #[arg(long, env = "NOKK_MAX_CONTEXTS")]
     max_contexts: Option<usize>,
 
+    /// Cap each worker isolate's JS heap, in MB (shared across that worker's
+    /// contexts). Total JS heap is bounded by roughly `workers * this`. A page
+    /// that exceeds it fails with an out-of-memory error instead of the process
+    /// growing unbounded. Unset = V8 default.
+    #[arg(long, env = "NOKK_MAX_HEAP_MB")]
+    max_heap_mb: Option<usize>,
+
     /// Log filter, e.g. `info`, `nokk_pool=debug`.
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     log: String,
@@ -139,6 +146,9 @@ impl Cli {
         }
         if let Some(m) = self.max_contexts {
             pool.max_live_contexts = m.max(1);
+        }
+        if let Some(mb) = self.max_heap_mb {
+            pool.max_heap_mb = Some(mb.max(16)); // a tiny cap would fail instantly
         }
         let mut client = ClientConfig::default();
         if let Some(spec) = &self.proxy {
