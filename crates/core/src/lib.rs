@@ -935,4 +935,37 @@ mod tests {
             Value::String("ok".into())
         );
     }
+
+    #[tokio::test]
+    async fn function_tostring_masking_survives_the_bypass() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        // A patched function must read `[native code]` through *every* route
+        // (incl. the `Function.prototype.toString.call(fn)` bypass), the patch
+        // must hide itself, identity must be preserved, and genuine page
+        // functions must NOT be masked.
+        let v = ctx
+            .evaluate(
+                r#"(() => {
+                    const FTS = Function.prototype.toString;
+                    const isNat = s => /\{\s*\[native code\]\s*\}/.test(s);
+                    const q = navigator.permissions.query;
+                    function pageFn(){ return 1; }
+                    const cv = document.createElement('canvas');
+                    const gl = cv.getContext('webgl');
+                    return String(
+                        isNat(FTS.call(q)) &&
+                        isNat(FTS.call(document.querySelector)) &&
+                        (!gl || isNat(FTS.call(gl.getParameter))) &&
+                        isNat(FTS.toString()) &&
+                        FTS.name === 'toString' && FTS.length === 0 &&
+                        !isNat(pageFn.toString())
+                    );
+                })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(v, Value::String("true".into()));
+    }
 }

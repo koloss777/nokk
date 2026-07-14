@@ -448,16 +448,56 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   const WEBGL_RENDERER = __WEBGL_RENDERER__;
 
   // --- native-function masking ------------------------------------------
-  // Make a patched function report `function name() { [native code] }`.
+  // Patch Function.prototype.toString ITSELF (via a Proxy apply trap) so that
+  // EVERY route — fn.toString(), Function.prototype.toString.call(fn),
+  // Reflect.apply(...) — reports `function name() { [native code] }` for the
+  // functions we register. This closes the classic
+  // `Function.prototype.toString.call(patchedFn)` bypass that a per-function
+  // `.toString` override misses. The proxy registers itself, so
+  // `Function.prototype.toString.toString()` reads native too, and `.name`/
+  // `.length` are forwarded from the original (both preserved).
+  const __ptNative = new WeakSet();
+  const __ptToStr = new Proxy(Function.prototype.toString, {
+    apply(target, thisArg, args) {
+      if (__ptNative.has(thisArg)) {
+        return 'function ' + ((thisArg && thisArg.name) || '') + '() { [native code] }';
+      }
+      return Reflect.apply(target, thisArg, args);
+    },
+  });
+  try {
+    Object.defineProperty(Function.prototype, 'toString', {
+      value: __ptToStr,
+      configurable: true,
+      writable: true,
+    });
+  } catch (e) {}
+  __ptNative.add(__ptToStr);
+
+  // Register a function as native, optionally renaming it. No longer sets an own
+  // `toString` (the global patch above handles every call route).
   const mask = (fn, name) => {
-    name = name || fn.name || '';
-    const ts = function toString() { return 'function ' + name + '() { [native code] }'; };
     try {
-      Object.defineProperty(ts, 'toString', { value: () => 'function toString() { [native code] }', configurable: true });
-      Object.defineProperty(fn, 'toString', { value: ts, configurable: true, writable: true });
-      Object.defineProperty(fn, 'name', { value: name, configurable: true });
+      if (name) Object.defineProperty(fn, 'name', { value: name, configurable: true });
     } catch (e) {}
+    if (typeof fn === 'function') __ptNative.add(fn);
     return fn;
+  };
+
+  // Mark every own function/accessor on a prototype as native — real DOM and
+  // Web-API methods all report `[native code]`, so ours must too.
+  const maskProto = (proto) => {
+    if (!proto) return proto;
+    for (const k of Object.getOwnPropertyNames(proto)) {
+      try {
+        const d = Object.getOwnPropertyDescriptor(proto, k);
+        if (!d) continue;
+        if (typeof d.value === 'function') __ptNative.add(d.value);
+        if (typeof d.get === 'function') __ptNative.add(d.get);
+        if (typeof d.set === 'function') __ptNative.add(d.set);
+      } catch (e) {}
+    }
+    return proto;
   };
 
   const noop = () => {};
@@ -482,7 +522,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     'wcPgncvXrx48eLFgwcPggcRBEEEQdQqiLZq09TUJk2TZpMdD5Nkk2yyu9nZ3dnk+8Fjs7Mzs+/N7' +
     'OzM7MJEBEREREREREREREREREREREREREREREREREREREREREREREREREREREZE/AZUqlQGVAZUBlQ' +
     'GVAZUBlQGVAZUBlQGVAZUBlQGVAZUBlQPUb+AXcBu4Dj4EnwFPgGfAceAG8BF4Br4E3wFvgHfAe+A';
-  const make2DContext = (canvas) => Object.assign(Object.create(globalThis.CanvasRenderingContext2D.prototype), {
+  const make2DContext = (canvas) => maskProto(Object.assign(Object.create(globalThis.CanvasRenderingContext2D.prototype), {
     canvas,
     fillStyle: '#000000', strokeStyle: '#000000', font: '10px sans-serif',
     globalAlpha: 1.0, lineWidth: 1.0, textBaseline: 'alphabetic', textAlign: 'start',
@@ -500,7 +540,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     createRadialGradient(){ return { addColorStop(){} }; },
     createPattern(){ return {}; },
     getContextAttributes(){ return { alpha: true, colorSpace: 'srgb', desynchronized: false, willReadFrequently: false }; },
-  });
+  }));
 
   // --- WebGL ------------------------------------------------------------
   const GL_EXTS = ['ANGLE_instanced_arrays','EXT_blend_minmax','EXT_color_buffer_half_float',
@@ -577,7 +617,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       'framebufferTexture2D','bindFramebuffer','createFramebuffer','readPixels','pixelStorei','depthFunc','flush','finish']) {
       if (!gl[m]) gl[m] = function(){};
     }
-    return gl;
+    return maskProto(gl);
   };
 
   // --- patch canvas element methods -------------------------------------
@@ -870,9 +910,18 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
 
   // --- mask key patched globals so their toString reads native ----------
   for (const [obj, key] of [[globalThis, 'fetch'], [globalThis, 'setTimeout'], [globalThis, 'setInterval'],
-    [globalThis, 'clearTimeout'], [globalThis, 'queueMicrotask'], [globalThis, 'requestAnimationFrame'],
-    [globalThis, 'XMLHttpRequest'], [globalThis, 'AudioContext'], [globalThis, 'Image']]) {
+    [globalThis, 'clearTimeout'], [globalThis, 'clearInterval'], [globalThis, 'queueMicrotask'],
+    [globalThis, 'requestAnimationFrame'], [globalThis, 'cancelAnimationFrame'], [globalThis, 'requestIdleCallback'],
+    [globalThis, 'XMLHttpRequest'], [globalThis, 'AudioContext'], [globalThis, 'Image'],
+    [globalThis, 'getComputedStyle'], [globalThis, 'matchMedia'], [globalThis, 'TextEncoder'],
+    [globalThis, 'TextDecoder'], [globalThis, 'Blob'], [globalThis, 'FormData'], [globalThis, 'URL']]) {
     if (obj[key]) mask(obj[key], key);
+  }
+  // Real DOM/Web-API methods are all native — mark the ones on our prototypes so
+  // `document.querySelector.toString()` etc. read `[native code]`.
+  for (const C of [globalThis.Node, globalThis.Element, globalThis.HTMLElement,
+    globalThis.Document, globalThis.Event]) {
+    if (C) { mask(C, C.name); if (C.prototype) maskProto(C.prototype); }
   }
 
   // --- hide engine internals so `Object.keys(window)` looks normal ------
