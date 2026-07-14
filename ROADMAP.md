@@ -31,8 +31,10 @@ would flag today. Closing them is the top priority — coherence is the whole po
   report `[native code]` through *all* routes, closing the
   `Function.prototype.toString.call(fn)` bypass; the patch hides itself and page
   functions stay unmasked. Regression-tested.
-- ⬜ **Hide engine internals from `Object.getOwnPropertyNames` / `Reflect.ownKeys`**, not
-  only from `Object.keys` (they are currently non-enumerable, but still listed).
+- ✅ **Hide engine internals from all introspection** — `__pt_*`/`__out` are filtered out
+  of `Object.getOwnPropertyNames`, `Reflect.ownKeys`, `Object.keys`,
+  `getOwnPropertyDescriptor(s)` and `hasOwnProperty` (and kept non-enumerable), while
+  staying callable by name. Filters read native (#1). Regression-tested.
 - ⬜ **Make `navigator` / `screen` / `location` / `history` real prototype instances**, so
   `Object.keys(navigator)` is empty, the prototype chain is correct, and
   `navigator instanceof Navigator` holds.

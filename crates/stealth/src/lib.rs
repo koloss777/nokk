@@ -924,15 +924,44 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     if (C) { mask(C, C.name); if (C.prototype) maskProto(C.prototype); }
   }
 
-  // --- hide engine internals so `Object.keys(window)` looks normal ------
-  // Our Rust↔JS bridge helpers (__pt_*) and other internals must not appear in
-  // property enumeration — their presence is an instant bot tell. They stay
-  // callable by name (non-enumerable), which is all the Rust driver needs.
+  // --- hide engine internals from ALL introspection ---------------------
+  // Our Rust↔JS bridge helpers (__pt_*) and __out must never surface. Marking
+  // them non-enumerable hides them from Object.keys / for-in, but
+  // Object.getOwnPropertyNames, Reflect.ownKeys, getOwnPropertyDescriptor(s) and
+  // hasOwnProperty still exposed them — an instant bot tell. Do both: keep them
+  // non-enumerable AND filter them out at every introspection choke point. They
+  // stay callable by bare name (the Rust driver's only need), which lookups by
+  // name still resolve. The filters themselves are marked native (#1).
+  const __ptHidden = (k) => typeof k === 'string' && (k.lastIndexOf('__pt', 0) === 0 || k === '__out');
   for (const k of Object.getOwnPropertyNames(globalThis)) {
-    if (k.indexOf('__pt') === 0 || k === '__out') {
+    if (__ptHidden(k)) {
       try { Object.defineProperty(globalThis, k, { enumerable: false }); } catch (e) {}
     }
   }
+
+  const origGOPN = Object.getOwnPropertyNames;
+  const origOwnKeys = Reflect.ownKeys;
+  const origKeys = Object.keys;
+  const origGOPD = Object.getOwnPropertyDescriptor;
+  const origGOPDs = Object.getOwnPropertyDescriptors;
+  const origHOP = Object.prototype.hasOwnProperty;
+  const drop = (arr) => arr.filter((k) => !__ptHidden(k));
+
+  Object.getOwnPropertyNames = mask(function getOwnPropertyNames(o) { return drop(origGOPN(o)); }, 'getOwnPropertyNames');
+  Reflect.ownKeys = mask(function ownKeys(o) { return drop(origOwnKeys(o)); }, 'ownKeys');
+  Object.keys = mask(function keys(o) { return drop(origKeys(o)); }, 'keys');
+  Object.getOwnPropertyDescriptor = mask(function getOwnPropertyDescriptor(o, k) {
+    return __ptHidden(k) ? undefined : origGOPD(o, k);
+  }, 'getOwnPropertyDescriptor');
+  Object.getOwnPropertyDescriptors = mask(function getOwnPropertyDescriptors(o) {
+    const d = origGOPDs(o);
+    for (const k of origGOPN(d)) { if (__ptHidden(k)) delete d[k]; }
+    return d;
+  }, 'getOwnPropertyDescriptors');
+  Object.defineProperty(Object.prototype, 'hasOwnProperty', {
+    value: mask(function hasOwnProperty(k) { return __ptHidden(k) ? false : origHOP.call(this, k); }, 'hasOwnProperty'),
+    configurable: true, writable: true,
+  });
 })();"#;
 
 fn json_string_array(items: &[String]) -> String {

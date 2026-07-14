@@ -968,4 +968,32 @@ mod tests {
             .unwrap();
         assert_eq!(v, Value::String("true".into()));
     }
+
+    #[tokio::test]
+    async fn engine_internals_are_hidden_from_all_introspection() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        // Load a page so the __pt_* bridge + DOM are fully installed, then assert
+        // none of them leak via any introspection route — while staying callable.
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+        let v = ctx
+            .evaluate(
+                r#"(() => {
+                    const hidden = k => typeof k === 'string' && (k.indexOf('__pt') === 0 || k === '__out');
+                    const g = globalThis;
+                    const viaNames = Object.getOwnPropertyNames(g).some(hidden);
+                    const viaOwnKeys = Reflect.ownKeys(g).filter(k => typeof k === 'string').some(hidden);
+                    const viaDesc = Object.getOwnPropertyDescriptor(g, '__pt_runNextTimer') !== undefined;
+                    const viaHasOwn = g.hasOwnProperty('__pt_runNextTimer');
+                    const callable = typeof __pt_runNextTimer === 'function';
+                    return String(!viaNames && !viaOwnKeys && !viaDesc && !viaHasOwn && callable);
+                })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(v, Value::String("true".into()));
+    }
 }
