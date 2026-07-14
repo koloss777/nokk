@@ -149,62 +149,81 @@ pub fn bootstrap_script(profile: &StealthProfile) -> String {
 /// [`bootstrap_script`]. Kept as a raw string so the JS reads naturally without
 /// brace-escaping.
 const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
-  const nav = {
-    userAgent: __UA__,
-    appVersion: __APPVERSION__,
-    appName: "Netscape",
-    appCodeName: "Mozilla",
-    platform: __PLATFORM__,
-    product: "Gecko",
-    productSub: "20030107",
-    vendor: __VENDOR__,
-    vendorSub: "",
-    language: __LANG0__,
-    languages: Object.freeze(__LANGS__),
-    hardwareConcurrency: __HW__,
-    deviceMemory: __MEM__,
-    maxTouchPoints: 0,
-    webdriver: false,
-    onLine: true,
-    cookieEnabled: true,
-    doNotTrack: null,
-    pdfViewerEnabled: true,
-    plugins: { length: 0 },
-    mimeTypes: { length: 0 },
-    userAgentData: {
-      brands: [
-        { brand: "Chromium", version: "137" },
-        { brand: "Google Chrome", version: "137" },
-        { brand: "Not.A/Brand", version: "24" }
-      ],
-      mobile: false,
-      platform: "Linux"
-    }
-  };
-  globalThis.navigator = nav;
-
   const win = globalThis;
+
+  // Host objects the Chrome way: their properties live on a constructor's
+  // prototype (as getters), so instances carry no own enumerable props —
+  // `Object.keys(navigator)` is [], the prototype chain is correct, and
+  // `navigator instanceof Navigator` holds. A plain object literal (the old
+  // approach) fails all three, an instant headless tell.
+  const defClass = (name) => {
+    const Ctor = function () { throw new TypeError("Illegal constructor"); };
+    try { Object.defineProperty(Ctor, "name", { value: name, configurable: true }); } catch (e) {}
+    win[name] = Ctor;
+    return Ctor.prototype;
+  };
+  // Define an accessor whose getter is named `get <key>` (matching Chrome's
+  // reflection) and reads `read()`; an optional `write` makes it settable.
+  const accessor = (proto, key, read, write) => {
+    const holder = write
+      ? { get [key]() { return read(); }, set [key](v) { write(v); } }
+      : { get [key]() { return read(); } };
+    Object.defineProperty(proto, key, Object.getOwnPropertyDescriptor(holder, key));
+  };
+  const staticProps = (proto, obj) => {
+    for (const k of Object.keys(obj)) { const v = obj[k]; accessor(proto, k, () => v); }
+  };
+  const protoMethod = (proto, name, fn) => {
+    try { Object.defineProperty(proto, name, { value: fn, enumerable: true, configurable: true, writable: true }); } catch (e) {}
+  };
+
+  // --- navigator --------------------------------------------------------
+  const NavigatorProto = defClass("Navigator");
+  staticProps(NavigatorProto, {
+    userAgent: __UA__, appVersion: __APPVERSION__, appName: "Netscape", appCodeName: "Mozilla",
+    platform: __PLATFORM__, product: "Gecko", productSub: "20030107", vendor: __VENDOR__, vendorSub: "",
+    language: __LANG0__, languages: Object.freeze(__LANGS__), hardwareConcurrency: __HW__,
+    deviceMemory: __MEM__, maxTouchPoints: 0, webdriver: false, onLine: true, cookieEnabled: true,
+    doNotTrack: null, pdfViewerEnabled: true,
+    userAgentData: { brands: [
+      { brand: "Chromium", version: "137" }, { brand: "Google Chrome", version: "137" }, { brand: "Not.A/Brand", version: "24" }
+    ], mobile: false, platform: "Linux" },
+  });
+  win.navigator = Object.create(NavigatorProto);
+
   win.window = win; win.self = win; win.top = win; win.parent = win; win.frames = win;
   win.length = 0; win.name = ""; win.closed = false;
 
-  win.screen = {
-    width: 1920, height: 1080, availWidth: 1920, availHeight: 1040,
-    availTop: 0, availLeft: 0, colorDepth: 24, pixelDepth: 24, isExtended: false,
-    orientation: { type: "landscape-primary", angle: 0 }
-  };
+  // --- screen -----------------------------------------------------------
+  const ScreenProto = defClass("Screen");
+  staticProps(ScreenProto, {
+    width: 1920, height: 1080, availWidth: 1920, availHeight: 1040, availTop: 0, availLeft: 0,
+    colorDepth: 24, pixelDepth: 24, isExtended: false,
+    orientation: { type: "landscape-primary", angle: 0 },
+  });
+  win.screen = Object.create(ScreenProto);
   win.innerWidth = 1920; win.innerHeight = 969;
   win.outerWidth = 1920; win.outerHeight = 1080;
   win.devicePixelRatio = 1;
 
-  win.location = {
-    href: "about:blank", protocol: "about:", host: "", hostname: "",
-    port: "", pathname: "blank", search: "", hash: "", origin: "null",
-    assign() {}, replace() {}, reload() {}, toString() { return this.href; }
-  };
+  // --- location (getters read a backing store the Rust driver updates) --
+  const LocationProto = defClass("Location");
+  const locState = { href: "about:blank", protocol: "about:", host: "", hostname: "", port: "", pathname: "blank", search: "", hash: "", origin: "null" };
+  for (const k of Object.keys(locState)) accessor(LocationProto, k, () => locState[k], (v) => { locState[k] = String(v); });
+  protoMethod(LocationProto, "assign", function assign(){});
+  protoMethod(LocationProto, "replace", function replace(){});
+  protoMethod(LocationProto, "reload", function reload(){});
+  protoMethod(LocationProto, "toString", function toString(){ return locState.href; });
+  win.location = Object.create(LocationProto);
   // Rust calls this on navigation to populate `location` from the real URL —
   // a static `about:blank` is an instant tell (and breaks relative logic).
-  globalThis.__pt_setLocation = (o) => { const L = win.location; for (const k in o) L[k] = o[k]; };
-  win.history = { length: 1, scrollRestoration: "auto", state: null };
+  globalThis.__pt_setLocation = (o) => { for (const k in o) if (k in locState) locState[k] = o[k]; };
+
+  // --- history ----------------------------------------------------------
+  const HistoryProto = defClass("History");
+  staticProps(HistoryProto, { length: 1, scrollRestoration: "auto", state: null });
+  for (const m of ["back", "forward", "go", "pushState", "replaceState"]) protoMethod(HistoryProto, m, function(){});
+  win.history = Object.create(HistoryProto);
 
   const noop = () => {};
   win.console = {
@@ -713,17 +732,21 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   });
   const pluginArray = mkArrayLike(plugins, 'name');
   const mimeArray = mkArrayLike([mimePdf, mimeText], 'type');
+  // Everything hangs off Navigator.prototype (as Chrome does), so the navigator
+  // instance keeps zero own properties.
+  const navProto = Object.getPrototypeOf(navigator);
   try {
-    Object.defineProperty(navigator, 'plugins', { get: () => pluginArray, configurable: true });
-    Object.defineProperty(navigator, 'mimeTypes', { get: () => mimeArray, configurable: true });
+    Object.defineProperty(navProto, 'plugins', { get: () => pluginArray, enumerable: true, configurable: true });
+    Object.defineProperty(navProto, 'mimeTypes', { get: () => mimeArray, enumerable: true, configurable: true });
   } catch (e) {}
 
   // --- permissions ------------------------------------------------------
-  navigator.permissions = { query: mask(function query(desc){
+  const permissions = { query: mask(function query(desc){
     const name = desc && desc.name;
     const state = name === 'notifications' ? 'prompt' : (name === 'geolocation' ? 'prompt' : 'granted');
     return Promise.resolve({ state, name, onchange: null, addEventListener(){}, removeEventListener(){} });
   }, 'query') };
+  try { Object.defineProperty(navProto, 'permissions', { get: () => permissions, enumerable: true, configurable: true }); } catch (e) {}
 
   // --- window.chrome (its absence/shape is a classic headless tell) -----
   if (!globalThis.chrome) {
@@ -748,7 +771,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   }
 
   // --- extra navigator surface -----------------------------------------
-  const navExtra = (name, value) => { try { Object.defineProperty(navigator, name, { value, configurable: true, writable: true }); } catch (e) {} };
+  const navExtra = (name, value) => { try { Object.defineProperty(navProto, name, { value, enumerable: true, configurable: true, writable: true }); } catch (e) {} };
   navExtra('mediaDevices', {
     enumerateDevices: () => Promise.resolve([]),
     getUserMedia: () => Promise.reject(new Error('Permission denied')),
@@ -917,10 +940,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     [globalThis, 'TextDecoder'], [globalThis, 'Blob'], [globalThis, 'FormData'], [globalThis, 'URL']]) {
     if (obj[key]) mask(obj[key], key);
   }
-  // Real DOM/Web-API methods are all native — mark the ones on our prototypes so
-  // `document.querySelector.toString()` etc. read `[native code]`.
+  // Real DOM/Web-API methods and accessors are all native — mark the ones on our
+  // prototypes so `document.querySelector.toString()` and
+  // `Object.getOwnPropertyDescriptor(Navigator.prototype,'userAgent').get.toString()`
+  // read `[native code]`.
   for (const C of [globalThis.Node, globalThis.Element, globalThis.HTMLElement,
-    globalThis.Document, globalThis.Event]) {
+    globalThis.Document, globalThis.Event, globalThis.Navigator, globalThis.Screen,
+    globalThis.Location, globalThis.History]) {
     if (C) { mask(C, C.name); if (C.prototype) maskProto(C.prototype); }
   }
 

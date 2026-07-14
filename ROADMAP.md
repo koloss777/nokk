@@ -35,9 +35,11 @@ would flag today. Closing them is the top priority — coherence is the whole po
   of `Object.getOwnPropertyNames`, `Reflect.ownKeys`, `Object.keys`,
   `getOwnPropertyDescriptor(s)` and `hasOwnProperty` (and kept non-enumerable), while
   staying callable by name. Filters read native (#1). Regression-tested.
-- ⬜ **Make `navigator` / `screen` / `location` / `history` real prototype instances**, so
-  `Object.keys(navigator)` is empty, the prototype chain is correct, and
-  `navigator instanceof Navigator` holds.
+- ✅ **`navigator` / `screen` / `location` / `history` are real prototype instances** —
+  `Navigator`/`Screen`/`Location`/`History` constructors exist, all properties are getters
+  on the prototype, so `Object.keys(navigator)` is `[]`, the prototype chain and
+  `constructor` are right, `instanceof` holds, and `webdriver` is a prototype getter (no
+  own descriptor). Getters read native (#1). Regression-tested.
 - ⬜ **Timezone coherence** — shim `Date.prototype.getTimezoneOffset` / `toString` /
   `toLocaleString` so `Date` and `Intl` agree on the profile's zone.
 - ⬜ **Put canvas/WebGL/audio methods on their prototypes** (not as own properties), and
