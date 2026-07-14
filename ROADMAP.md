@@ -41,6 +41,29 @@ would flag today. Closing them is the top priority — coherence is the whole po
 - ⬜ **Fingerprint regression tests** — snapshot the JS fingerprint and fail the build on
   drift, so hardening never silently regresses.
 
+## Architecture: move detectable surfaces to native (Rust)
+
+Our DOM/stealth is injected JavaScript, which is fast to iterate and gives real JS
+semantics — but page-visible methods read as JS source, not `[native code]`, and are
+introspectable. Where a native implementation is inherently *more authentic* than a JS
+shim, move it to Rust (native functions appear as `[native code]` for free and expose
+no readable source). Where JS is the advantage (control of the environment, iteration
+speed, no FFI overhead), keep it.
+
+Move to native (Rust):
+- ⬜ **`crypto.subtle` (WebCrypto)** — replace the JS shim with real Rust crypto
+  (aes-gcm/sha2/hmac/pbkdf2/hkdf), so it is correct, fast, and native-looking. (This is
+  what obscura does.)
+- ⬜ **Hot / most-probed DOM + graphics methods as native functions** — at minimum the
+  ones fingerprinters read (`getContext`, `getParameter`, `toDataURL`, `getImageData`,
+  `querySelector`), so `Function.prototype.toString` on them is `[native code]` without
+  a masking layer. (Interim: the Phase 6 toString mask above.)
+
+Keep in JS (the advantage is real):
+- Environment assembly (navigator/window/screen/timers), the virtual-time event loop,
+  and the fetch/XHR queue orchestration — control and iteration speed outweigh a native
+  rewrite, and none of it is a `[native code]` tell in the same way.
+
 ## Near-term: protocol & DOM completeness (Phase 5)
 
 - 🟡 **CDP registry lifecycle** — honor `removeScriptToEvaluateOnNewDocument` and
