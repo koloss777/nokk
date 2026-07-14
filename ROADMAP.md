@@ -26,8 +26,11 @@ Legend: ✅ done · 🟡 partial / in progress · ⬜ planned
 These are the concrete tells a dedicated fingerprinting suite (CreepJS, FingerprintJS)
 would flag today. Closing them is the top priority — coherence is the whole point.
 
-- ⬜ **Patch `Function.prototype.toString` itself**, so masked natives survive the
-  `Function.prototype.toString.call(fn)` bypass, not just `fn.toString()`.
+- ✅ **Patch `Function.prototype.toString` itself** — a Proxy apply-trap + native
+  registry makes every masked function (DOM/canvas/WebGL/permissions/timers/fetch…)
+  report `[native code]` through *all* routes, closing the
+  `Function.prototype.toString.call(fn)` bypass; the patch hides itself and page
+  functions stay unmasked. Regression-tested.
 - ⬜ **Hide engine internals from `Object.getOwnPropertyNames` / `Reflect.ownKeys`**, not
   only from `Object.keys` (they are currently non-enumerable, but still listed).
 - ⬜ **Make `navigator` / `screen` / `location` / `history` real prototype instances**, so
