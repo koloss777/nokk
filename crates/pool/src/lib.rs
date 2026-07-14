@@ -43,6 +43,11 @@ pub struct PoolConfig {
     pub workers: usize,
     /// Maximum number of simultaneously live contexts across the whole pool.
     pub max_live_contexts: usize,
+    /// Per-isolate JS heap cap in MB (shared across that worker's contexts).
+    /// `None` leaves V8's default. Total JS heap is bounded by roughly
+    /// `workers * max_heap_mb`; exceeding the cap fails the offending run with an
+    /// out-of-memory error instead of aborting the process.
+    pub max_heap_mb: Option<usize>,
 }
 
 impl Default for PoolConfig {
@@ -55,6 +60,7 @@ impl Default for PoolConfig {
             // A conservative default; the scheduler (Phase 7) tunes this against
             // the per-context memory budget.
             max_live_contexts: workers * 16,
+            max_heap_mb: None,
         }
     }
 }
@@ -93,6 +99,7 @@ impl IsolatePool {
         isolate::init_platform();
 
         let mut workers = Vec::with_capacity(config.workers);
+        let max_heap_mb = config.max_heap_mb;
         for i in 0..config.workers {
             let id = WorkerId(i);
             let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
@@ -108,7 +115,7 @@ impl IsolatePool {
                 .stack_size(Isolate::STACK_SIZE)
                 .spawn(move || {
                     // Each thread owns exactly one isolate for its whole life.
-                    let mut isolate = Isolate::new(id);
+                    let mut isolate = Isolate::new(id, max_heap_mb);
                     tracing::debug!(worker = i, "isolate worker started");
                     // Blocking receive: isolate threads are OS threads, not tokio
                     // tasks, since V8 work is CPU-bound and thread-affine.
@@ -258,6 +265,7 @@ mod tests {
         IsolatePool::new(PoolConfig {
             workers: 4,
             max_live_contexts: 8,
+            max_heap_mb: None,
         })
     }
 
@@ -295,6 +303,7 @@ mod tests {
         let pool = IsolatePool::new(PoolConfig {
             workers: 2,
             max_live_contexts: 2,
+            max_heap_mb: None,
         });
         let _a = pool.acquire_context().await.unwrap();
         let _b = pool.acquire_context().await.unwrap();

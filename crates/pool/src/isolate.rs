@@ -6,6 +6,8 @@
 //! are only ever touched from the worker thread that created them — which is
 //! exactly the [`crate::IsolatePool`] contract.
 
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Mutex, Once};
 use std::time::Duration;
@@ -47,6 +49,42 @@ pub struct Isolate {
     /// [`BrowserContext`] keeps its index for its whole life.
     contexts: Vec<Option<v8::Global<v8::Context>>>,
     isolate: v8::OwnedIsolate,
+    /// Backing store for the near-heap-limit callback, when a heap cap is set.
+    /// Declared last so it is dropped *after* `isolate` — V8 holds a raw pointer
+    /// into this box for the callback, so it must outlive the isolate.
+    heap_state: Option<Box<HeapLimitState>>,
+}
+
+/// Shared state for the near-heap-limit callback. A raw pointer to this (kept
+/// alive in [`Isolate::heap_state`]) is handed to V8.
+struct HeapLimitState {
+    /// Cross-thread handle used to force-terminate the running script from inside
+    /// the callback (the callback runs on the isolate's own thread during GC).
+    handle: v8::IsolateHandle,
+    /// Set by the callback when the cap is reached, read+cleared after each run.
+    hit: AtomicBool,
+    /// The configured cap in bytes, used to restore the limit after a hit so it
+    /// doesn't ratchet upward from the headroom the callback grants.
+    limit_bytes: usize,
+}
+
+/// Called by V8 when the isolate's heap is about to exceed its limit. Rather than
+/// let V8 hard-abort the process (its default on OOM), we flag the event and
+/// terminate the running script — it unwinds and surfaces as a catchable error,
+/// while the isolate and its other contexts survive. We return a slightly higher
+/// limit so V8 has room to unwind before it would abort; the caller restores the
+/// real cap afterwards (see [`Isolate::took_oom`]).
+extern "C" fn near_heap_limit_callback(
+    data: *mut c_void,
+    current_heap_limit: usize,
+    _initial_heap_limit: usize,
+) -> usize {
+    // SAFETY: `data` is the pointer to the `HeapLimitState` box owned by the
+    // isolate for at least as long as this callback is registered.
+    let state = unsafe { &*(data as *const HeapLimitState) };
+    state.hit.store(true, Ordering::SeqCst);
+    state.handle.terminate_execution();
+    current_heap_limit + 32 * 1024 * 1024
 }
 
 impl Isolate {
@@ -69,18 +107,57 @@ impl Isolate {
             .unwrap_or(Self::EVAL_TIMEOUT)
     }
 
-    pub(crate) fn new(id: WorkerId) -> Self {
+    /// Create an isolate. `max_heap_mb` caps this isolate's JS heap (shared across
+    /// all its contexts); `None` leaves V8's default (effectively unbounded).
+    pub(crate) fn new(id: WorkerId, max_heap_mb: Option<usize>) -> Self {
         init_platform();
-        let isolate = {
+        let mut params = v8::CreateParams::default();
+        if let Some(mb) = max_heap_mb {
+            // initial = 0 lets V8 pick its default starting heap; max is the cap.
+            params = params.heap_limits(0, mb * 1024 * 1024);
+        }
+        let mut isolate = {
             // Never construct two isolates concurrently (see CREATE_LOCK).
             let _guard = CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            v8::Isolate::new(v8::CreateParams::default())
+            v8::Isolate::new(params)
         };
+        // Install the graceful-OOM callback once, if a cap is in effect.
+        let heap_state = max_heap_mb.map(|mb| {
+            let state = Box::new(HeapLimitState {
+                handle: isolate.thread_safe_handle(),
+                hit: AtomicBool::new(false),
+                limit_bytes: mb * 1024 * 1024,
+            });
+            let data = &*state as *const HeapLimitState as *mut c_void;
+            isolate.add_near_heap_limit_callback(near_heap_limit_callback, data);
+            state
+        });
         Self {
             id,
             contexts: Vec::new(),
             isolate,
+            heap_state,
         }
+    }
+
+    /// If the heap cap was hit during the last run, clear the flag, restore the
+    /// real cap (undoing the headroom the callback granted so it doesn't ratchet
+    /// up), and report `true`. Callers turn this into a clean "out of memory"
+    /// error instead of the opaque termination V8 surfaces.
+    fn took_oom(&mut self) -> bool {
+        let (hit, limit) = match self.heap_state.as_ref() {
+            Some(s) => (s.hit.swap(false, Ordering::SeqCst), s.limit_bytes),
+            None => return false,
+        };
+        if !hit {
+            return false;
+        }
+        let data = &**self.heap_state.as_ref().unwrap() as *const HeapLimitState as *mut c_void;
+        self.isolate
+            .remove_near_heap_limit_callback(near_heap_limit_callback, limit);
+        self.isolate
+            .add_near_heap_limit_callback(near_heap_limit_callback, data);
+        true
     }
 
     /// The worker thread that owns this isolate.
@@ -136,6 +213,11 @@ impl Isolate {
         // isolate starts clean.
         watchdog.disarm();
         self.isolate.cancel_terminate_execution();
+        // A termination caused by the heap cap reads as a generic error; surface
+        // it as a clear out-of-memory message instead.
+        if self.took_oom() {
+            return Err("JavaScript heap out of memory (isolate cap reached)".to_string());
+        }
         result
     }
 
@@ -165,6 +247,9 @@ impl Isolate {
         let result = self.pump_timers(&global, max_callbacks, deadline);
         watchdog.disarm();
         self.isolate.cancel_terminate_execution();
+        if self.took_oom() {
+            return Err("JavaScript heap out of memory (isolate cap reached)".to_string());
+        }
         result
     }
 

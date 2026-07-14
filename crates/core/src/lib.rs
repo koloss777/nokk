@@ -562,6 +562,7 @@ mod tests {
             pool: PoolConfig {
                 workers,
                 max_live_contexts: max_ctx,
+                max_heap_mb: None,
             },
             ..Default::default()
         })
