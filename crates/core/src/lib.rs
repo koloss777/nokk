@@ -996,4 +996,32 @@ mod tests {
             .unwrap();
         assert_eq!(v, Value::String("true".into()));
     }
+
+    #[tokio::test]
+    async fn navigator_and_friends_are_real_prototype_instances() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        // Real Chrome host objects carry no own enumerable props (all live on the
+        // constructor's prototype), have the right prototype/constructor, and
+        // satisfy `instanceof`. A plain object literal fails all of these.
+        let v = ctx
+            .evaluate(
+                r#"(() => String(
+                    Object.keys(navigator).length === 0 &&
+                    Object.getOwnPropertyNames(navigator).length === 0 &&
+                    Object.getPrototypeOf(navigator) === Navigator.prototype &&
+                    navigator.constructor.name === 'Navigator' &&
+                    navigator instanceof Navigator &&
+                    navigator.webdriver === false &&
+                    Object.getOwnPropertyDescriptor(navigator, 'webdriver') === undefined &&
+                    screen instanceof Screen && Object.keys(screen).length === 0 &&
+                    location instanceof Location && history instanceof History &&
+                    navigator.hardwareConcurrency > 0 && navigator.plugins.length > 0
+                ))()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(v, Value::String("true".into()));
+    }
 }
