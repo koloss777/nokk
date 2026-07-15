@@ -1024,4 +1024,31 @@ mod tests {
             .unwrap();
         assert_eq!(v, Value::String("true".into()));
     }
+
+    #[tokio::test]
+    async fn timezone_is_coherent_between_date_and_intl() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        // Date must agree with the profile timezone reported by Intl, with DST
+        // applied — not V8's process (UTC) timezone. Default profile is
+        // America/New_York: EDT (240) in summer, EST (300) in winter.
+        let v = ctx
+            .evaluate(
+                r#"(() => {
+                    const jul = new Date('2025-07-15T16:00:00Z');
+                    const jan = new Date('2025-01-15T16:00:00Z');
+                    return String(
+                        Intl.DateTimeFormat().resolvedOptions().timeZone === 'America/New_York' &&
+                        jul.getTimezoneOffset() === 240 && jan.getTimezoneOffset() === 300 &&
+                        jul.getHours() === 12 && jan.getHours() === 11 &&
+                        jul.toString().indexOf('GMT-0400 (Eastern Daylight Time)') >= 0 &&
+                        jan.toString().indexOf('GMT-0500 (Eastern Standard Time)') >= 0
+                    );
+                })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(v, Value::String("true".into()));
+    }
 }
