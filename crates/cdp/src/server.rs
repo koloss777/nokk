@@ -13,12 +13,13 @@
 //! messages; page-scoped messages carry a `sessionId`. No rendering, so visual
 //! domains (screenshots, layout) are absent by design.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use nokk::{BrowserContext, Engine};
+use nokk::{BrowserContext, Engine, ProxyConfig, ProxyScheme};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -149,12 +150,49 @@ struct Target {
     /// `Page.addScriptToEvaluateOnNewDocument` sources — Puppeteer injects its
     /// query utilities (`cssQuerySelector`, …) this way; we run them on every nav.
     init_scripts: Vec<String>,
+    /// The Puppeteer browser context this page belongs to (`None` = default).
+    browser_context_id: Option<String>,
 }
 
 struct Conn {
     engine: Engine,
     auto_attach: bool,
     targets: Vec<Target>,
+    /// Puppeteer browser contexts (`browser.createBrowserContext`) → the proxy
+    /// each one routes through. Targets created in a context inherit its proxy,
+    /// giving per-identity (IP + cookie jar) isolation.
+    browser_contexts: HashMap<String, Option<ProxyConfig>>,
+}
+
+/// Parse a CDP `proxyServer` string (`scheme://[user:pass@]host:port`, scheme
+/// optional → http) into a [`ProxyConfig`].
+fn parse_proxy_server(s: &str) -> Option<ProxyConfig> {
+    let (scheme, rest) = s.split_once("://").unwrap_or(("http", s));
+    let scheme = match scheme {
+        "http" | "https" => ProxyScheme::Http,
+        "socks5" | "socks5h" | "socks" => ProxyScheme::Socks5,
+        _ => return None,
+    };
+    let (auth, hostport) = match rest.rsplit_once('@') {
+        Some((a, hp)) => (Some(a), hp),
+        None => (None, rest),
+    };
+    let (host, port) = hostport.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    let (username, password) = match auth {
+        Some(a) => match a.split_once(':') {
+            Some((u, p)) => (Some(u.to_string()), Some(p.to_string())),
+            None => (Some(a.to_string()), None),
+        },
+        None => (None, None),
+    };
+    Some(ProxyConfig {
+        scheme,
+        host: host.to_string(),
+        port,
+        username,
+        password,
+    })
 }
 
 /// A `Target.createTarget` whose context is being built off the read loop. The
@@ -169,6 +207,7 @@ struct PendingTarget {
     session_id: String,
     url: String,
     auto_attach: bool,
+    browser_context_id: Option<String>,
 }
 
 async fn run_session<S>(ws: tokio_tungstenite::WebSocketStream<S>, engine: Engine)
@@ -197,6 +236,7 @@ where
         engine,
         auto_attach: false,
         targets: Vec::new(),
+        browser_contexts: HashMap::new(),
     };
 
     loop {
@@ -249,6 +289,7 @@ impl Conn {
             session_id,
             url,
             auto_attach,
+            browser_context_id,
         } = pending;
         match result {
             Ok(ctx) => {
@@ -260,6 +301,7 @@ impl Conn {
                     url,
                     iso_worlds: Vec::new(),
                     init_scripts: Vec::new(),
+                    browser_context_id,
                 };
                 let info = target_info(&t);
                 self.targets.push(t);
@@ -321,7 +363,27 @@ impl Conn {
                 vec![ok(id, &session, json!({}))]
             }
             "Target.getBrowserContexts" => {
-                vec![ok(id, &session, json!({ "browserContextIds": [] }))]
+                let ids: Vec<&String> = self.browser_contexts.keys().collect();
+                vec![ok(id, &session, json!({ "browserContextIds": ids }))]
+            }
+            "Target.createBrowserContext" => {
+                // Puppeteer's `browser.createBrowserContext({ proxyServer })`: a new
+                // isolated context (its own proxy + cookie jar). Pages created in it
+                // route through that proxy.
+                let proxy = params
+                    .get("proxyServer")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .and_then(parse_proxy_server);
+                let bcid = next_id("BC");
+                self.browser_contexts.insert(bcid.clone(), proxy);
+                vec![ok(id, &session, json!({ "browserContextId": bcid }))]
+            }
+            "Target.disposeBrowserContext" => {
+                if let Some(bc) = params.get("browserContextId").and_then(|v| v.as_str()) {
+                    self.browser_contexts.remove(bc);
+                }
+                vec![ok(id, &session, json!({ "success": true }))]
             }
             "Target.getTargets" => {
                 let infos: Vec<Value> = self.targets.iter().map(target_info).collect();
@@ -333,6 +395,15 @@ impl Conn {
                     .and_then(|v| v.as_str())
                     .unwrap_or("about:blank")
                     .to_string();
+                // Route this page through its browser context's proxy, if any.
+                let browser_context_id = params
+                    .get("browserContextId")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let proxy = browser_context_id
+                    .as_deref()
+                    .and_then(|bc| self.browser_contexts.get(bc).cloned())
+                    .flatten();
                 let target_id = next_id("T");
                 let session_id = next_id("S");
                 let engine = self.engine.clone();
@@ -342,7 +413,10 @@ impl Conn {
                 // Build the context off the read loop; the read loop registers it
                 // and replies via `register_target` once it's ready.
                 tokio::spawn(async move {
-                    let result = engine.new_context().await.map_err(|e| e.to_string());
+                    let result = engine
+                        .new_context_with_proxy(proxy)
+                        .await
+                        .map_err(|e| e.to_string());
                     let _ = reg.send(PendingTarget {
                         id,
                         session,
@@ -351,6 +425,7 @@ impl Conn {
                         session_id,
                         url,
                         auto_attach,
+                        browser_context_id,
                     });
                 });
                 vec![]
@@ -764,7 +839,8 @@ fn js_str(s: &str) -> String {
 fn target_info(t: &Target) -> Value {
     json!({
         "targetId": t.target_id, "type": "page", "title": "", "url": t.url,
-        "attached": true, "canAccessOpener": false, "browserContextId": "default"
+        "attached": true, "canAccessOpener": false,
+        "browserContextId": t.browser_context_id.as_deref().unwrap_or("default")
     })
 }
 
@@ -816,6 +892,7 @@ mod tests {
             engine,
             auto_attach: false,
             targets: Vec::new(),
+            browser_contexts: HashMap::new(),
         }
     }
 
@@ -864,6 +941,22 @@ mod tests {
     fn has_event(out: &[Value], method: &str) -> bool {
         out.iter()
             .any(|m| m.get("method").and_then(|v| v.as_str()) == Some(method))
+    }
+
+    #[test]
+    fn parse_proxy_server_forms() {
+        let p = super::parse_proxy_server("http://user:pass@10.0.0.1:8080").unwrap();
+        assert_eq!(p.scheme, ProxyScheme::Http);
+        assert_eq!(p.host, "10.0.0.1");
+        assert_eq!(p.port, 8080);
+        assert_eq!(p.username.as_deref(), Some("user"));
+        assert_eq!(p.password.as_deref(), Some("pass"));
+        // scheme optional -> http; socks5; no-auth
+        assert_eq!(super::parse_proxy_server("host:3128").unwrap().scheme, ProxyScheme::Http);
+        assert_eq!(super::parse_proxy_server("socks5://h:1080").unwrap().scheme, ProxyScheme::Socks5);
+        assert!(super::parse_proxy_server("host:3128").unwrap().username.is_none());
+        assert!(super::parse_proxy_server("ftp://h:1").is_none());
+        assert!(super::parse_proxy_server("no-port").is_none());
     }
 
     #[tokio::test]
