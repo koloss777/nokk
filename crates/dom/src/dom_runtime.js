@@ -231,7 +231,25 @@
     querySelector(s) { return this.documentElement ? this.documentElement.querySelector(s) : null; }
     querySelectorAll(s) { return this.documentElement ? this.documentElement.querySelectorAll(s) : []; }
 
-    write() {} writeln() {} open() {} close() {}
+    // document.write inserts parsed markup at the position of the script that
+    // called it (tracked as `currentScript`), matching in-parse behaviour for the
+    // common `<script>document.write(x)</script>` idiom. With no current script
+    // (e.g. async), it appends to <body>. Dynamically written <script> tags are
+    // inserted but not executed (our script list is fixed at parse time).
+    write(...args) {
+      const nodes = parseFragment(args.join(''));
+      const cur = this.currentScript;
+      if (cur && cur.parentNode) {
+        const ref = cur.nextSibling;
+        for (const n of nodes) cur.parentNode.insertBefore(n, ref);
+      } else {
+        const host = this.body || this.documentElement;
+        if (host) for (const n of nodes) host.appendChild(n);
+      }
+    }
+    writeln(...args) { this.write(args.join('') + '\n'); }
+    open() { return this; }
+    close() {}
     _shallowClone() { return new Document(); }
   }
 
@@ -454,17 +472,29 @@
   globalThis.DocumentFragment = Node;
   document.defaultView = globalThis;
 
+  // <script> nodes in document order, so the loader can point `currentScript` at
+  // the one it is about to run (for document.write positioning).
+  let scriptNodes = [];
+
   // Called by the loader with the Rust-parsed <html> tree.
   globalThis.__pt_installDocument = (tree) => {
     document.childNodes = [];
     document.documentElement = null;
+    document.currentScript = null;
     if (tree && tree.k === 'e') {
       const html = buildNode(document, tree);
       document.appendChild(html);
       document.documentElement = html;
     }
+    scriptNodes = document.getElementsByTagName('script') || [];
     document.readyState = 'interactive';
   };
+
+  // The loader brackets each page script with these so `document.currentScript`
+  // (and therefore document.write's insertion point) is correct while it runs.
+  // The index matches the loader's document-order script list.
+  globalThis.__pt_beginScript = (i) => { document.currentScript = scriptNodes[i] || null; };
+  globalThis.__pt_endScript = () => { document.currentScript = null; };
 
   // Called after all page scripts have run: fire DOMContentLoaded then load.
   globalThis.__pt_finishLoad = () => {
