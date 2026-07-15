@@ -304,7 +304,18 @@ impl BrowserContext {
         const TIMER_CAP: u32 = 10_000;
         const MAX_FETCHES: usize = 200;
         const MAX_ROUNDS: usize = 2_000;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        // Total wall-clock the post-load event loop may run. Kept short because it
+        // executes on the (shared) isolate worker: a page with endless ad/tracker
+        // `setInterval`s would otherwise monopolise a worker for the full budget
+        // and starve every other context pinned to it — the dominant cause of
+        // timeouts under concurrent load. The load-critical async (promise chains,
+        // one-shot timers, initial fetches) normally settles well under a second.
+        // Override with `NOKK_EVENT_LOOP_MS`.
+        let budget_ms = std::env::var("NOKK_EVENT_LOOP_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(3_000);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
         let index = self.index;
         let base = self.base_url.lock().map(|b| b.clone()).unwrap_or_default();
 
@@ -324,7 +335,9 @@ impl BrowserContext {
                 .engine
                 .pool
                 .dispatch(self.worker, move |iso| {
-                    iso.run_event_loop(index, remaining, std::time::Duration::from_secs(2))
+                    // Short per-round grab so the worker is released back to other
+                    // contexts frequently (fairness), rather than held for seconds.
+                    iso.run_event_loop(index, remaining, std::time::Duration::from_millis(250))
                 })
                 .await?
                 .map_err(EngineError::Js)?;
