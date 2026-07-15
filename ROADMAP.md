@@ -40,8 +40,10 @@ would flag today. Closing them is the top priority — coherence is the whole po
   on the prototype, so `Object.keys(navigator)` is `[]`, the prototype chain and
   `constructor` are right, `instanceof` holds, and `webdriver` is a prototype getter (no
   own descriptor). Getters read native (#1). Regression-tested.
-- ⬜ **Timezone coherence** — shim `Date.prototype.getTimezoneOffset` / `toString` /
-  `toLocaleString` so `Date` and `Intl` agree on the profile's zone.
+- ✅ **Timezone coherence** — a DST-aware `Date` shim derives `getTimezoneOffset`, the
+  local getters, and `toString`/`toDateString`/`toTimeString`/`toLocale*` from the
+  profile's UTC offset (US/EU DST rules), so `Date` and `Intl` always agree instead of
+  `Date` leaking V8's process (UTC) zone. Methods read native (#1). Regression-tested.
 - ⬜ **Put canvas/WebGL/audio methods on their prototypes** (not as own properties), and
   expose `PluginArray` / `MimeTypeArray` / `Plugin` types rather than plain arrays.
 - ⬜ **`performance.now()` / `timeOrigin` / `performance.timing`** coherent with wall clock.

@@ -33,6 +33,18 @@ pub struct StealthProfile {
     /// (`Intl.DateTimeFormat().resolvedOptions().timeZone`). A fingerprint vector,
     /// so it lives with the rest of the identity.
     pub timezone: String,
+    /// Standard-time (non-DST) UTC offset in minutes, in `getTimezoneOffset`
+    /// convention (positive = behind UTC). Must be coherent with [`Self::timezone`]
+    /// — the `Date` shim derives every timezone-dependent value from it so
+    /// `getTimezoneOffset()`, `Date.toString()` and `Intl` never disagree.
+    pub timezone_offset_minutes: i32,
+    /// DST rule: `"us"` (2nd Sun Mar → 1st Sun Nov), `"eu"` (last Sun Mar → last
+    /// Sun Oct), or `"none"` (fixed offset). DST subtracts 60 from the offset.
+    pub timezone_dst: String,
+    /// Long zone names for `Date.toString()`, standard and DST
+    /// (e.g. "Eastern Standard Time" / "Eastern Daylight Time").
+    pub timezone_name_std: String,
+    pub timezone_name_dst: String,
 }
 
 impl Default for StealthProfile {
@@ -54,6 +66,10 @@ impl Default for StealthProfile {
             webgl_vendor: "Google Inc. (Intel)".into(),
             webgl_renderer: "ANGLE (Intel, Mesa Intel(R) UHD Graphics, OpenGL 4.6)".into(),
             timezone: "America/New_York".into(),
+            timezone_offset_minutes: 300, // EST (UTC-5); DST rule yields EDT (240)
+            timezone_dst: "us".into(),
+            timezone_name_std: "Eastern Standard Time".into(),
+            timezone_name_dst: "Eastern Daylight Time".into(),
         }
     }
 }
@@ -140,7 +156,11 @@ pub fn bootstrap_script(profile: &StealthProfile) -> String {
     // pins timezone/locale to the profile — both fingerprint vectors.
     let intl = INTL_SHIM_TEMPLATE
         .replace("__TZ__", &quoted(&profile.timezone))
-        .replace("__LANG0__", &lang0);
+        .replace("__LANG0__", &lang0)
+        .replace("__TZ_OFFSET__", &profile.timezone_offset_minutes.to_string())
+        .replace("__TZ_DST__", &quoted(&profile.timezone_dst))
+        .replace("__TZ_NAME_STD__", &quoted(&profile.timezone_name_std))
+        .replace("__TZ_NAME_DST__", &quoted(&profile.timezone_name_dst));
 
     format!("{env}\n{intl}\n{TIMERS_TEMPLATE}\n{FETCH_TEMPLATE}")
 }
@@ -291,11 +311,68 @@ const INTL_SHIM_TEMPLATE: &str = r#"(() => {
     supportedValuesOf: () => [],
   };
 
-  // Date/String/Number locale methods also hit ICU natively — override them.
-  const dp = Date.prototype;
-  dp.toLocaleString = function () { return this.toString(); };
-  dp.toLocaleDateString = function () { return this.toDateString(); };
-  dp.toLocaleTimeString = function () { return this.toTimeString(); };
+  // --- timezone-coherent Date ------------------------------------------
+  // V8's native Date reflects the *process* timezone (usually UTC), which
+  // contradicts the profile timezone we report through Intl — a classic
+  // cross-check tell (`getTimezoneOffset()` vs `resolvedOptions().timeZone`).
+  // Derive every timezone-dependent value from the profile offset instead, so
+  // Date and Intl always agree. DST is handled by rule (US/EU) so the offset is
+  // right in both seasons.
+  const TZ_OFFSET_STD = __TZ_OFFSET__, TZ_DST = __TZ_DST__;
+  const TZ_NAME_STD = __TZ_NAME_STD__, TZ_NAME_DST = __TZ_NAME_DST__;
+  // UTC ms of the Nth (1-based; -1 = last) `weekday` (0=Sun) in `month` (0-based).
+  const nthWeekday = (year, month, weekday, n) => {
+    if (n === -1) {
+      const last = new Date(Date.UTC(year, month + 1, 0));
+      return last.getTime() - ((last.getUTCDay() - weekday + 7) % 7) * 86400000;
+    }
+    const first = new Date(Date.UTC(year, month, 1));
+    const offset = (weekday - first.getUTCDay() + 7) % 7;
+    return first.getTime() + (offset + (n - 1) * 7) * 86400000;
+  };
+  // getTimezoneOffset() convention: minutes to add to local to reach UTC
+  // (positive = behind UTC). DST subtracts 60. Boundaries are compared in the
+  // zone's own standard time (STD offset applied), which is exact to the hour.
+  const tzOffset = (utcMs) => {
+    if (TZ_DST === 'none') return TZ_OFFSET_STD;
+    const y = new Date(utcMs).getUTCFullYear();
+    let start, end;
+    if (TZ_DST === 'us') {
+      start = nthWeekday(y, 2, 0, 2) + (2 * 60 + TZ_OFFSET_STD) * 60000; // 2nd Sun Mar 02:00 local
+      end = nthWeekday(y, 10, 0, 1) + (2 * 60 + TZ_OFFSET_STD - 60) * 60000; // 1st Sun Nov 02:00 DST-local
+    } else { // 'eu': transitions at 01:00 UTC
+      start = nthWeekday(y, 2, 0, -1) + 60 * 60000;
+      end = nthWeekday(y, 9, 0, -1) + 60 * 60000;
+    }
+    const inDst = utcMs >= start && utcMs < end;
+    return inDst ? TZ_OFFSET_STD - 60 : TZ_OFFSET_STD;
+  };
+
+  const DP = Date.prototype, RAW = {};
+  for (const m of ['getTime','getUTCFullYear','getUTCMonth','getUTCDate','getUTCDay','getUTCHours','getUTCMinutes','getUTCSeconds','getUTCMilliseconds']) RAW[m] = DP[m];
+  // A Date shifted so that its UTC fields read as the profile-local wall clock.
+  const localParts = function (self) { return new Date(RAW.getTime.call(self) - tzOffset(RAW.getTime.call(self)) * 60000); };
+  const patch = (name, fn) => { try { Object.defineProperty(DP, name, { value: fn, configurable: true, writable: true }); } catch (e) {} };
+
+  patch('getTimezoneOffset', function getTimezoneOffset() { return tzOffset(RAW.getTime.call(this)); });
+  for (const [loc, utc] of [['getFullYear','getUTCFullYear'],['getMonth','getUTCMonth'],['getDate','getUTCDate'],['getDay','getUTCDay'],['getHours','getUTCHours'],['getMinutes','getUTCMinutes'],['getSeconds','getUTCSeconds'],['getMilliseconds','getUTCMilliseconds']]) {
+    patch(loc, function () { return RAW[utc].call(localParts(this)); });
+  }
+  const WD = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'], MO = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const p2 = (n) => (n < 10 ? '0' + n : '' + n);
+  const gmtStr = function (self) {
+    const off = tzOffset(RAW.getTime.call(self)), sign = off > 0 ? '-' : '+', a = Math.abs(off);
+    return 'GMT' + sign + p2((a / 60) | 0) + p2(a % 60);
+  };
+  const dateStr = function (self) { const l = localParts(self); return WD[RAW.getUTCDay.call(l)] + ' ' + MO[RAW.getUTCMonth.call(l)] + ' ' + p2(RAW.getUTCDate.call(l)) + ' ' + RAW.getUTCFullYear.call(l); };
+  const timeStr = function (self) { const l = localParts(self); const off = tzOffset(RAW.getTime.call(self)); const name = (TZ_DST !== 'none' && off === TZ_OFFSET_STD - 60) ? TZ_NAME_DST : TZ_NAME_STD; return p2(RAW.getUTCHours.call(l)) + ':' + p2(RAW.getUTCMinutes.call(l)) + ':' + p2(RAW.getUTCSeconds.call(l)) + ' ' + gmtStr(self) + ' (' + name + ')'; };
+  patch('toDateString', function toDateString() { return dateStr(this); });
+  patch('toTimeString', function toTimeString() { return timeStr(this); });
+  patch('toString', function toString() { return isNaN(RAW.getTime.call(this)) ? 'Invalid Date' : dateStr(this) + ' ' + timeStr(this); });
+  patch('toLocaleString', function toLocaleString() { return this.toString(); });
+  patch('toLocaleDateString', function toLocaleDateString() { return this.toDateString(); });
+  patch('toLocaleTimeString', function toLocaleTimeString() { return this.toTimeString(); });
+
   String.prototype.localeCompare = function (other) { const a = String(this), b = String(other); return a < b ? -1 : a > b ? 1 : 0; };
   Number.prototype.toLocaleString = function () { return String(this); };
 })();"#;
@@ -946,7 +1023,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // read `[native code]`.
   for (const C of [globalThis.Node, globalThis.Element, globalThis.HTMLElement,
     globalThis.Document, globalThis.Event, globalThis.Navigator, globalThis.Screen,
-    globalThis.Location, globalThis.History]) {
+    globalThis.Location, globalThis.History, globalThis.Date]) {
     if (C) { mask(C, C.name); if (C.prototype) maskProto(C.prototype); }
   }
 
@@ -1053,6 +1130,11 @@ mod tests {
             "__MEM__",
             "__WEBGL_VENDOR__",
             "__WEBGL_RENDERER__",
+            "__TZ__",
+            "__TZ_OFFSET__",
+            "__TZ_DST__",
+            "__TZ_NAME_STD__",
+            "__TZ_NAME_DST__",
         ] {
             assert!(!script.contains(token), "unsubstituted placeholder {token}");
         }
