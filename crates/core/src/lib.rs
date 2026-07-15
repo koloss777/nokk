@@ -1051,4 +1051,34 @@ mod tests {
             .unwrap();
         assert_eq!(v, Value::String("true".into()));
     }
+
+    #[tokio::test]
+    async fn plugins_are_real_plugin_array_types() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        // navigator.plugins/mimeTypes must be PluginArray/MimeTypeArray with
+        // Plugin/MimeType entries — not plain Arrays (an instant tell).
+        let v = ctx
+            .evaluate(
+                r#"(() => {
+                    const T = Object.prototype.toString;
+                    return String(
+                        T.call(navigator.plugins) === '[object PluginArray]' &&
+                        T.call(navigator.mimeTypes) === '[object MimeTypeArray]' &&
+                        navigator.plugins instanceof PluginArray &&
+                        navigator.mimeTypes instanceof MimeTypeArray &&
+                        navigator.plugins.length === 5 &&
+                        navigator.plugins[0] instanceof Plugin &&
+                        T.call(navigator.plugins[0]) === '[object Plugin]' &&
+                        navigator.mimeTypes[0] instanceof MimeType &&
+                        [...navigator.plugins].length === 5 &&
+                        navigator.connection.type === undefined
+                    );
+                })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(v, Value::String("true".into()));
+    }
 }
