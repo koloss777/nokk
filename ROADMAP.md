@@ -44,8 +44,11 @@ would flag today. Closing them is the top priority — coherence is the whole po
   local getters, and `toString`/`toDateString`/`toTimeString`/`toLocale*` from the
   profile's UTC offset (US/EU DST rules), so `Date` and `Intl` always agree instead of
   `Date` leaking V8's process (UTC) zone. Methods read native (#1). Regression-tested.
-- ⬜ **Put canvas/WebGL/audio methods on their prototypes** (not as own properties), and
-  expose `PluginArray` / `MimeTypeArray` / `Plugin` types rather than plain arrays.
+- ✅ **`PluginArray` / `MimeTypeArray` / `Plugin` / `MimeType` types** — `navigator.plugins`
+  and `mimeTypes` are real typed instances (`Object.prototype.toString` tag, `instanceof`,
+  named access + iterator), entries are `Plugin`/`MimeType`; `connection.type` (mobile-only)
+  removed. Methods read native (#1). Regression-tested. (Canvas/WebGL method-on-prototype
+  placement still open.)
 - ⬜ **`performance.now()` / `timeOrigin` / `performance.timing`** coherent with wall clock.
 - ⬜ **Fingerprint regression tests** — snapshot the JS fingerprint and fail the build on
   drift, so hardening never silently regresses.

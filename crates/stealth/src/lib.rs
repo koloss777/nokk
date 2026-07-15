@@ -791,24 +791,41 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     }
   }, 'OfflineAudioContext');
 
-  // --- navigator.plugins / mimeTypes (Chrome's PDF set) -----------------
-  const mkArrayLike = (items, nameKey) => {
-    const arr = items.slice();
-    arr.item = (i) => arr[i] || null;
-    arr.namedItem = (n) => arr.find(x => x[nameKey] === n) || null;
-    for (let i = 0; i < items.length; i++) arr[items[i][nameKey]] = items[i];
+  // --- navigator.plugins / mimeTypes (Chrome's PDF set, properly typed) --
+  // Real Chrome exposes PluginArray / MimeTypeArray / Plugin / MimeType
+  // interfaces: `Object.prototype.toString.call(navigator.plugins)` is
+  // '[object PluginArray]', entries are real Plugin/MimeType instances, and
+  // both satisfy `instanceof`. A plain Array (the old shape) is an instant tell.
+  const iface = (name) => {
+    const Ctor = function () { throw new TypeError('Illegal constructor'); };
+    try { Object.defineProperty(Ctor, 'name', { value: name, configurable: true }); } catch (e) {}
+    try { Object.defineProperty(Ctor.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {}
+    globalThis[name] = Ctor;
+    return Ctor.prototype;
+  };
+  const PluginProto = iface('Plugin'), MimeTypeProto = iface('MimeType');
+  const PluginArrayProto = iface('PluginArray'), MimeTypeArrayProto = iface('MimeTypeArray');
+  const arrayLike = (proto, keyOf) => {
+    proto.item = function item(i) { return this[i] || null; };
+    proto.namedItem = function namedItem(n) { for (let i = 0; i < this.length; i++) if (keyOf(this[i]) === n) return this[i]; return null; };
+    proto[Symbol.iterator] = function () { let i = 0; const self = this; return { next: () => i < self.length ? { value: self[i++], done: false } : { value: undefined, done: true } }; };
+  };
+  arrayLike(PluginArrayProto, (p) => p && p.name);
+  arrayLike(MimeTypeArrayProto, (m) => m && m.type);
+  const fill = (arr, items, key) => {
+    items.forEach((it, i) => { arr[i] = it; arr[it[key]] = it; });
+    Object.defineProperty(arr, 'length', { value: items.length, enumerable: false, configurable: true });
     return arr;
   };
-  const mimePdf = { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' };
-  const mimeText = { type: 'text/pdf', suffixes: 'pdf', description: 'Portable Document Format' };
-  const pluginNames = ['PDF Viewer', 'Chrome PDF Viewer', 'Chromium PDF Viewer', 'Microsoft Edge PDF Viewer', 'WebKit built-in PDF'];
-  const plugins = pluginNames.map(name => {
-    const p = { name, filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 2 };
-    p[0] = mimePdf; p[1] = mimeText; p.item = (i) => p[i] || null; p.namedItem = (t) => (t === mimePdf.type ? mimePdf : t === mimeText.type ? mimeText : null);
-    return p;
-  });
-  const pluginArray = mkArrayLike(plugins, 'name');
-  const mimeArray = mkArrayLike([mimePdf, mimeText], 'type');
+  const mkMime = (type, plugin) => Object.assign(Object.create(MimeTypeProto), { type, suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: plugin });
+  const mkPlugin = (name) => {
+    const p = Object.assign(Object.create(PluginProto), { name, filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 2 });
+    return fill(p, [mkMime('application/pdf', p), mkMime('text/pdf', p)], 'type');
+  };
+  const plugins = ['PDF Viewer', 'Chrome PDF Viewer', 'Chromium PDF Viewer', 'Microsoft Edge PDF Viewer', 'WebKit built-in PDF'].map(mkPlugin);
+  const pluginArray = fill(Object.create(PluginArrayProto), plugins, 'name');
+  const mimeArray = fill(Object.create(MimeTypeArrayProto), [mkMime('application/pdf', plugins[0]), mkMime('text/pdf', plugins[0])], 'type');
+
   // Everything hangs off Navigator.prototype (as Chrome does), so the navigator
   // instance keeps zero own properties.
   const navProto = Object.getPrototypeOf(navigator);
@@ -856,7 +873,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     getSupportedConstraints: () => ({ aspectRatio: true, autoGainControl: true, brightness: true, channelCount: true, deviceId: true, echoCancellation: true, facingMode: true, frameRate: true, groupId: true, height: true, noiseSuppression: true, sampleRate: true, sampleSize: true, width: true }),
     ondevicechange: null, addEventListener: noop, removeEventListener: noop,
   });
-  navExtra('connection', { effectiveType: '4g', rtt: 50, downlink: 10, saveData: false, type: 'wifi', onchange: null, addEventListener: noop, removeEventListener: noop });
+  // Desktop Chrome's NetworkInformation omits `type` (it's mobile-only) — its
+  // presence is a tell, so we leave it off.
+  navExtra('connection', { effectiveType: '4g', rtt: 50, downlink: 10, saveData: false, onchange: null, addEventListener: noop, removeEventListener: noop });
   const batteryLevel = 0.7 + (SEED % 300) / 1000; // per-session, plausible
   navExtra('getBattery', mask(function getBattery() { return Promise.resolve({ charging: true, chargingTime: 0, dischargingTime: Infinity, level: Math.round(batteryLevel * 100) / 100, onchargingchange: null, onchargingtimechange: null, ondischargingtimechange: null, onlevelchange: null, addEventListener: noop, removeEventListener: noop }); }, 'getBattery'));
   navExtra('storage', { estimate: () => Promise.resolve({ quota: 299977155072, usage: 0, usageDetails: {} }), persist: () => Promise.resolve(false), persisted: () => Promise.resolve(false) });
@@ -1023,7 +1042,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // read `[native code]`.
   for (const C of [globalThis.Node, globalThis.Element, globalThis.HTMLElement,
     globalThis.Document, globalThis.Event, globalThis.Navigator, globalThis.Screen,
-    globalThis.Location, globalThis.History, globalThis.Date]) {
+    globalThis.Location, globalThis.History, globalThis.Date, globalThis.Plugin,
+    globalThis.MimeType, globalThis.PluginArray, globalThis.MimeTypeArray]) {
     if (C) { mask(C, C.name); if (C.prototype) maskProto(C.prototype); }
   }
 
