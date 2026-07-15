@@ -104,17 +104,15 @@ to ~49% when hammered at concurrency 10 on 8 workers — pure contention, not pe
 weight. Current guidance: keep client concurrency ≤ `--workers`. The items below lift that
 ceiling.
 
-- ⬜ **Offload `Target.createTarget` off the connection read loop.** `new_context()` is
-  still awaited inline, so under worker saturation a slow context creation stalls the whole
-  connection and cascades into `newPage`/`evaluate` timeouts. Move the targets registry
-  behind a short-held lock so createTarget can run on a spawned task like the other slow
-  commands.
-- ⬜ **Per-context identity: proxy + cookie jar per context, not per process.** Today the
-  proxy is baked into a single engine-wide `FingerprintClient` (all contexts share one IP
-  and one cookie jar), which defeats the main reason to run many contexts — concurrent
-  scraping under *rotating* identities. Move to a per-context `Client` selected by a
-  `ContextConfig { proxy, … }` on `new_context`, pooling clients by unique proxy so
-  hundreds of contexts don't mean hundreds of connection pools. Closes cookie isolation too.
+- ✅ **`Target.createTarget` runs off the read loop.** It spawns `new_context()` and hands
+  the finished target back through a registration channel; the read loop (a `select!` over
+  frames + registrations) registers it. No inline await → effective concurrency scales
+  cleanly to `--workers` (a 24-site sweep at concurrency 8 held ~88%, vs the old collapse).
+- ✅ **Per-context identity: proxy + cookie jar per context.** `Engine::new_context_with_proxy`
+  selects a per-context client, pooled by proxy (contexts sharing a proxy share one pool +
+  cookie jar). Exposed via CDP `Target.createBrowserContext({ proxyServer })` +
+  `createTarget({ browserContextId })` — i.e. `browser.createBrowserContext({ proxyServer })`
+  in Puppeteer. Verified end-to-end.
 - ⬜ **Enforce per-host / per-proxy / global connection limits** in the network layer.
 - ⬜ **Context recycling & isolate churn** under sustained 100–1000 concurrent load.
 - ⬜ **Navigation task queue + per-proxy concurrency caps** with fair scheduling.
