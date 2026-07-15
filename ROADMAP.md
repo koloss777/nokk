@@ -84,8 +84,11 @@ Keep in JS (the advantage is real):
   `Runtime.getProperties` reporting non-enumerable props (an array's `length`) as
   enumerable, which made Puppeteer's query-iterator drain loop forever; it now reports
   real descriptor flags. Verified end-to-end against `page.$`/`$eval`/`$$eval`.
-- ⬜ **CSS selector engine** — descendant/child combinators and attribute operators
-  (`^=`, `*=`, `$=`, `~=`) in `querySelector`/`matches`/`closest`.
+- ✅ **CSS selector engine** — attribute operators (`^= $= *= ~= |= =`) parse correctly,
+  and `matches()`/`closest()` honor descendant/child combinators (right-to-left match with
+  backtracking) instead of testing only the rightmost compound. `querySelector`/`All`
+  already handled combinators. Regression-tested. (Sibling `+`/`~` and `:pseudo` classes
+  still unimplemented.)
 - ✅ **`document.write` / `writeln`** — insert parsed markup at the calling script's
   position (`document.currentScript` tracked per script), so the classic
   `<script>document.write(x)</script>` idiom populates in place instead of no-op'ing.
