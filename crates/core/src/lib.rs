@@ -1136,4 +1136,46 @@ mod tests {
             .unwrap();
         assert_eq!(v, Value::String("true".into()));
     }
+
+    #[tokio::test]
+    async fn css_selectors_operators_and_combinators() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        let html = r#"<html><body>
+            <nav><ul><li><a id="a1" href="/api/x" class="btn primary" data-role="link">A</a></li></ul></nav>
+            <div class="parent"><span class="child" title="foo bar">C</span></div>
+            <a id="a2" href="/home">H</a>
+        </body></html>"#;
+        ctx.load_html("https://example.com/", html).await.unwrap();
+        let v = ctx
+            .evaluate(
+                r#"(() => {
+                    const q = s => document.querySelector(s);
+                    const a1 = document.getElementById('a1');
+                    const child = document.querySelector('.child');
+                    return String(
+                        // attribute operators (were broken: split on first '=')
+                        q('a[href^="/api"]') === a1 &&
+                        q('[class*="prim"]') === a1 &&
+                        q('a[href$="/home"]').id === 'a2' &&
+                        q('[data-role~="link"]') === a1 &&
+                        document.querySelectorAll('a[href^="/"]').length === 2 &&
+                        // descendant + child combinators in query
+                        q('nav ul a').id === 'a1' &&
+                        q('nav > ul > li > a').id === 'a1' &&
+                        // matches()/closest() with combinators (were ignored)
+                        a1.matches('nav a') === true &&
+                        a1.matches('div a') === false &&
+                        child.matches('.parent .child') === true &&
+                        child.matches('.parent > .child') === true &&
+                        child.closest('.parent') !== null &&
+                        a1.closest('nav') !== null
+                    );
+                })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(v, Value::String("true".into()));
+    }
 }

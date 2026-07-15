@@ -339,21 +339,65 @@
       else if (tok[0] === '#') tests.push(e => e.id === tok.slice(1));
       else if (tok[0] === '.') tests.push(e => e.classList.contains(tok.slice(1)));
       else if (tok[0] === '[') {
-        const inner = tok.slice(1, -1);
-        const eq = inner.indexOf('=');
-        if (eq < 0) tests.push(e => e.hasAttribute(inner.trim()));
-        else { const name = inner.slice(0, eq).trim();
-          const val = inner.slice(eq + 1).trim().replace(/^["']|["']$/g, '');
-          tests.push(e => e.getAttribute(name) === val); }
+        // [name] / [name=v] / [name^=v] [name$=v] [name*=v] [name~=v] [name|=v]
+        const am = /^\s*([\w-]+)\s*(?:([~^$*|]?=)\s*(.*?))?\s*$/.exec(tok.slice(1, -1));
+        if (!am) { tests.push(() => false); continue; }
+        const name = am[1], op = am[2];
+        if (!op) { tests.push(e => e.hasAttribute(name)); continue; }
+        const val = (am[3] || '').replace(/^["']|["']$/g, '');
+        tests.push(e => {
+          const a = e.getAttribute(name);
+          if (a == null) return false;
+          switch (op) {
+            case '=': return a === val;
+            case '^=': return val !== '' && a.slice(0, val.length) === val;
+            case '$=': return val !== '' && a.slice(-val.length) === val;
+            case '*=': return val !== '' && a.indexOf(val) >= 0;
+            case '~=': return val !== '' && a.split(/\s+/).indexOf(val) >= 0;
+            case '|=': return a === val || a.slice(0, val.length + 1) === val + '-';
+            default: return false;
+          }
+        });
       } else tests.push(e => e.localName === tok.toLowerCase());
     }
     return (e) => tests.every(t => t(e));
   }
+  // Parse one selector branch (no commas) into compound predicates plus the
+  // combinators between them, e.g. `nav > ul a` -> compounds [nav, ul, a],
+  // combinators ['child', 'descendant'] (combinators[k] links compound k -> k+1).
+  function parseComplex(sel) {
+    const steps = sel.trim().replace(/\s*>\s*/g, ' > ').split(/\s+/).filter(Boolean);
+    const compounds = [], combinators = [];
+    let comb = 'descendant';
+    for (const s of steps) {
+      if (s === '>') { comb = 'child'; continue; }
+      if (compounds.length) combinators.push(comb);
+      compounds.push(parseCompound(s));
+      comb = 'descendant';
+    }
+    return { compounds, combinators };
+  }
+  // Match `el` against compounds[idx] then walk left through the combinators,
+  // verifying an ancestor (descendant) or parent (child) for each earlier
+  // compound. Descendant combinators backtrack over all ancestors.
+  function matchesSteps(el, compounds, combinators, idx) {
+    if (!compounds[idx](el)) return false;
+    if (idx === 0) return true;
+    const comb = combinators[idx - 1];
+    if (comb === 'child') {
+      const p = el.parentNode;
+      return !!p && p.nodeType === ELEMENT_NODE && matchesSteps(p, compounds, combinators, idx - 1);
+    }
+    for (let p = el.parentNode; p && p.nodeType === ELEMENT_NODE; p = p.parentNode) {
+      if (matchesSteps(p, compounds, combinators, idx - 1)) return true;
+    }
+    return false;
+  }
   function matchesSelector(el, selector) {
+    if (!el || el.nodeType !== ELEMENT_NODE) return false;
     return selector.split(',').some(sel => {
-      const parts = sel.trim().split(/\s+/);
-      const last = parseCompound(parts[parts.length - 1]);
-      return last(el); // simplified: matches ignores ancestor chain
+      const { compounds, combinators } = parseComplex(sel);
+      return compounds.length > 0 && matchesSteps(el, compounds, combinators, compounds.length - 1);
     });
   }
   function query(root, selector) {
