@@ -98,6 +98,17 @@ Keep in JS (the advantage is real):
 
 ## Scaling & concurrency (Phase 7)
 
+Measured on a real 208-site sweep (8-core box): after the CDP concurrency fix the engine
+loads real sites at **~88% OK when concurrency ≤ worker count** (avg 1–4 s), but degrades
+to ~49% when hammered at concurrency 10 on 8 workers — pure contention, not per-site
+weight. Current guidance: keep client concurrency ≤ `--workers`. The items below lift that
+ceiling.
+
+- ⬜ **Offload `Target.createTarget` off the connection read loop.** `new_context()` is
+  still awaited inline, so under worker saturation a slow context creation stalls the whole
+  connection and cascades into `newPage`/`evaluate` timeouts. Move the targets registry
+  behind a short-held lock so createTarget can run on a spawned task like the other slow
+  commands.
 - ⬜ **Per-context identity: proxy + cookie jar per context, not per process.** Today the
   proxy is baked into a single engine-wide `FingerprintClient` (all contexts share one IP
   and one cookie jar), which defeats the main reason to run many contexts — concurrent
