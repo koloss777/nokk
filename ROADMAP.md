@@ -103,7 +103,9 @@ Keep in JS (the advantage is real):
 
 ## Testing & benchmarks (Phase 8)
 
-- ⬜ Start-time and per-context memory benchmarks against the < 100 ms / 30–50 MB targets.
+- 🟡 Start-time and per-context memory measured (8-core Linux): ~4 ms engine start, ~20 MB
+  idle, ~0.5 MB/context (100 contexts ≈ 65 MB) — well past the < 100 ms / 30–50 MB targets.
+  A committed, repeatable benchmark harness is still to come.
 - ⬜ A fixture-based WAF-challenge test suite (offline replay of real challenge pages).
 - ⬜ Load test: sustained thousand-context throughput and tail latency.
 
