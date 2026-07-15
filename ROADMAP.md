@@ -98,8 +98,13 @@ Keep in JS (the advantage is real):
 
 ## Scaling & concurrency (Phase 7)
 
+- ⬜ **Per-context identity: proxy + cookie jar per context, not per process.** Today the
+  proxy is baked into a single engine-wide `FingerprintClient` (all contexts share one IP
+  and one cookie jar), which defeats the main reason to run many contexts — concurrent
+  scraping under *rotating* identities. Move to a per-context `Client` selected by a
+  `ContextConfig { proxy, … }` on `new_context`, pooling clients by unique proxy so
+  hundreds of contexts don't mean hundreds of connection pools. Closes cookie isolation too.
 - ⬜ **Enforce per-host / per-proxy / global connection limits** in the network layer.
-- ⬜ **Per-context cookie isolation** (each context its own jar; no cross-context bleed).
 - ⬜ **Context recycling & isolate churn** under sustained 100–1000 concurrent load.
 - ⬜ **Navigation task queue + per-proxy concurrency caps** with fair scheduling.
 - ⬜ Settle fetches dropped past the per-navigation cap instead of leaving promises pending.
