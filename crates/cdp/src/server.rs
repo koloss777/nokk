@@ -15,12 +15,14 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use nokk::{BrowserContext, Engine};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::tungstenite::Message;
@@ -136,7 +138,9 @@ async fn serve_http(stream: &mut TcpStream, path: &str, port: u16) -> std::io::R
 struct Target {
     target_id: String,
     session_id: String,
-    ctx: BrowserContext,
+    /// `Arc` so slow engine work (navigate/evaluate) can be handed to a spawned
+    /// task and run concurrently, without holding up the connection's read loop.
+    ctx: Arc<BrowserContext>,
     exec_ctx_id: i64,
     url: String,
     /// Puppeteer's isolated "utility" worlds: (worldName, current context id).
@@ -155,9 +159,21 @@ struct Conn {
 
 async fn run_session<S>(ws: tokio_tungstenite::WebSocketStream<S>, engine: Engine)
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (mut write, mut read) = ws.split();
+    // All outgoing frames funnel through one channel + writer task, so responses
+    // from concurrently-running command tasks (and the read loop) can interleave
+    // safely on the single socket.
+    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    let writer = tokio::spawn(async move {
+        while let Some(m) = rx.recv().await {
+            if write.send(m).await.is_err() {
+                break;
+            }
+        }
+    });
+
     let mut conn = Conn {
         engine,
         auto_attach: false,
@@ -169,7 +185,7 @@ where
             Message::Text(t) => t,
             Message::Close(_) => break,
             Message::Ping(p) => {
-                let _ = write.send(Message::Pong(p)).await;
+                let _ = tx.send(Message::Pong(p));
                 continue;
             }
             _ => continue,
@@ -178,17 +194,22 @@ where
             Ok(v) => v,
             Err(_) => continue,
         };
-        let out = conn.dispatch(&cmd).await;
+        // dispatch does the connection-state work synchronously and hands slow
+        // engine work (navigate/evaluate/…) to spawned tasks that reply via `tx`,
+        // so one slow navigation never blocks other commands on this connection.
+        let out = conn.dispatch(&cmd, &tx).await;
         for m in out {
-            if write.send(Message::Text(m.to_string())).await.is_err() {
-                return;
+            if tx.send(Message::Text(m.to_string())).is_err() {
+                break;
             }
         }
     }
+    drop(tx);
+    let _ = writer.await;
 }
 
 impl Conn {
-    async fn dispatch(&mut self, cmd: &Value) -> Vec<Value> {
+    async fn dispatch(&mut self, cmd: &Value, tx: &UnboundedSender<Message>) -> Vec<Value> {
         let id = cmd.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
         let method = cmd.get("method").and_then(|v| v.as_str()).unwrap_or("");
         let params = cmd.get("params").cloned().unwrap_or(json!({}));
@@ -242,7 +263,7 @@ impl Conn {
                         let t = Target {
                             target_id: target_id.clone(),
                             session_id: session_id.clone(),
-                            ctx,
+                            ctx: Arc::new(ctx),
                             exec_ctx_id: IDS.fetch_add(1, Ordering::Relaxed) as i64,
                             url: url.to_string(),
                             iso_worlds: Vec::new(),
@@ -323,7 +344,7 @@ impl Conn {
             }
 
             // ---- session-scoped domains ----
-            _ => self.dispatch_session(id, method, &params, &session).await,
+            _ => self.dispatch_session(id, method, &params, &session, tx).await,
         }
     }
 
@@ -333,6 +354,7 @@ impl Conn {
         method: &str,
         params: &Value,
         session: &Option<String>,
+        tx: &UnboundedSender<Message>,
     ) -> Vec<Value> {
         // Resolve the target for this session.
         let idx = match session
@@ -438,135 +460,94 @@ impl Conn {
                     .to_string();
                 let loader = next_id("L");
                 let new_ctx = IDS.fetch_add(1, Ordering::Relaxed) as i64;
-                let target_id = {
+                // Connection-state work is done synchronously here (in the read
+                // loop): swap the target's execution context and re-key its
+                // isolated worlds. The slow part (fetch + DOM + scripts) is then
+                // run on a spawned task so it can't block other commands.
+                let (target_id, scripts, iso_worlds) = {
                     let t = &mut self.targets[idx];
                     t.url = url.clone();
-                    // Navigation replaces the document → a new execution context.
                     t.exec_ctx_id = new_ctx;
-                    t.target_id.clone()
-                };
-                // Drive the real navigation (fetch + DOM + scripts + event loop).
-                let nav = self.targets[idx].ctx.navigate(&url).await;
-                // Puppeteer keys goto() failure off `result.errorText`; surface the
-                // transport/DOM error there so `page.goto()` rejects instead of
-                // resolving on a document that never loaded.
-                let nav_error = nav.as_ref().err().map(|e| e.to_string());
-                if let Some(e) = &nav_error {
-                    tracing::debug!(error = %e, "Page.navigate error");
-                }
-                // Run Puppeteer's init scripts against the new document (this is
-                // how its query utilities get injected).
-                let scripts = self.targets[idx].init_scripts.clone();
-                for src in &scripts {
-                    let _ = self.targets[idx].ctx.evaluate(src).await;
-                }
-                let frame = json!({
-                    "id": target_id, "loaderId": loader, "url": url,
-                    "domainAndRegistry": "", "securityOrigin": "://", "mimeType": "text/html"
-                });
-                let lifecycle = |name: &str| {
-                    event(
-                        "Page.lifecycleEvent",
-                        session,
-                        json!({
-                            "frameId": target_id, "loaderId": loader, "name": name, "timestamp": 0.0
-                        }),
+                    for w in t.iso_worlds.iter_mut() {
+                        w.1 = IDS.fetch_add(1, Ordering::Relaxed) as i64;
+                    }
+                    (
+                        t.target_id.clone(),
+                        t.init_scripts.clone(),
+                        t.iso_worlds.clone(),
                     )
                 };
-                // Re-create the isolated worlds for the new document (fresh ids),
-                // so Puppeteer's isolated-realm evaluates (page.title/$eval) resolve.
-                let mut iso_events = Vec::new();
-                for w in self.targets[idx].iso_worlds.iter_mut() {
-                    let nid = IDS.fetch_add(1, Ordering::Relaxed) as i64;
-                    w.1 = nid;
-                    iso_events.push(event("Runtime.executionContextCreated", session, json!({ "context": {
-                        "id": nid, "origin": url, "name": w.0,
-                        "uniqueId": format!("{nid}.1"),
-                        "auxData": { "isDefault": false, "type": "isolated", "frameId": target_id }
-                    }})));
-                }
-                // Emit the full navigation → load sequence Puppeteer's
-                // LifecycleWatcher waits for (loaderId ties events to this nav),
-                // and swap execution contexts so post-nav `evaluate` resolves.
-                let nav_result = match &nav_error {
-                    Some(e) => {
-                        json!({ "frameId": target_id, "loaderId": loader, "errorText": e })
+                let ctx = self.targets[idx].ctx.clone();
+                let session = session.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    // Drive the real navigation, then Puppeteer's init scripts.
+                    let nav = ctx.navigate(&url).await;
+                    let nav_error = nav.as_ref().err().map(|e| e.to_string());
+                    if let Some(e) = &nav_error {
+                        tracing::debug!(error = %e, "Page.navigate error");
                     }
-                    None => json!({ "frameId": target_id, "loaderId": loader }),
-                };
-                let mut out = vec![
-                    ok(id, session, nav_result),
-                    event(
-                        "Page.frameStartedLoading",
-                        session,
-                        json!({ "frameId": target_id }),
-                    ),
-                    event(
-                        "Page.frameNavigated",
-                        session,
-                        json!({ "frame": frame, "type": "Navigation" }),
-                    ),
-                    event("Runtime.executionContextsCleared", session, json!({})),
-                    event(
-                        "Runtime.executionContextCreated",
-                        session,
-                        json!({ "context": {
-                            "id": new_ctx, "origin": url, "name": "",
-                            "uniqueId": format!("{new_ctx}.1"),
+                    for src in &scripts {
+                        let _ = ctx.evaluate(src).await;
+                    }
+                    let ev = |name: &str, params: Value| event(name, &session, params);
+                    let lifecycle = |name: &str| {
+                        ev(
+                            "Page.lifecycleEvent",
+                            json!({ "frameId": target_id, "loaderId": loader, "name": name, "timestamp": 0.0 }),
+                        )
+                    };
+                    let nav_result = match &nav_error {
+                        Some(e) => json!({ "frameId": target_id, "loaderId": loader, "errorText": e }),
+                        None => json!({ "frameId": target_id, "loaderId": loader }),
+                    };
+                    let frame = json!({
+                        "id": target_id, "loaderId": loader, "url": url,
+                        "domainAndRegistry": "", "securityOrigin": "://", "mimeType": "text/html"
+                    });
+                    let mut out = vec![
+                        ok(id, &session, nav_result),
+                        ev("Page.frameStartedLoading", json!({ "frameId": target_id })),
+                        ev("Page.frameNavigated", json!({ "frame": frame, "type": "Navigation" })),
+                        ev("Runtime.executionContextsCleared", json!({})),
+                        ev("Runtime.executionContextCreated", json!({ "context": {
+                            "id": new_ctx, "origin": url, "name": "", "uniqueId": format!("{new_ctx}.1"),
                             "auxData": { "isDefault": true, "type": "default", "frameId": target_id }
-                        }}),
-                    ),
-                ];
-                out.extend(iso_events);
-                out.push(lifecycle("init"));
-                out.push(lifecycle("DOMContentLoaded"));
-                out.push(event(
-                    "Page.domContentEventFired",
-                    session,
-                    json!({ "timestamp": 0.0 }),
-                ));
-                out.push(lifecycle("load"));
-                out.push(event(
-                    "Page.loadEventFired",
-                    session,
-                    json!({ "timestamp": 0.0 }),
-                ));
-                out.push(event(
-                    "Page.frameStoppedLoading",
-                    session,
-                    json!({ "frameId": target_id }),
-                ));
-                out
+                        }})),
+                    ];
+                    for (name, nid) in &iso_worlds {
+                        out.push(ev("Runtime.executionContextCreated", json!({ "context": {
+                            "id": nid, "origin": url, "name": name, "uniqueId": format!("{nid}.1"),
+                            "auxData": { "isDefault": false, "type": "isolated", "frameId": target_id }
+                        }})));
+                    }
+                    out.push(lifecycle("init"));
+                    out.push(lifecycle("DOMContentLoaded"));
+                    out.push(ev("Page.domContentEventFired", json!({ "timestamp": 0.0 })));
+                    out.push(lifecycle("load"));
+                    out.push(ev("Page.loadEventFired", json!({ "timestamp": 0.0 })));
+                    out.push(ev("Page.frameStoppedLoading", json!({ "frameId": target_id })));
+                    for m in out {
+                        let _ = tx.send(Message::Text(m.to_string()));
+                    }
+                });
+                vec![]
             }
             "Runtime.evaluate" => {
-                let expr = params
-                    .get("expression")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let by_value = params
-                    .get("returnByValue")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let await_promise = params
-                    .get("awaitPromise")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let ro = remote_eval(&self.targets[idx].ctx, expr, by_value, await_promise).await;
-                vec![ok(id, session, json!({ "result": ro }))]
+                let expr = params.get("expression").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let by_value = params.get("returnByValue").and_then(|v| v.as_bool()).unwrap_or(false);
+                let await_promise = params.get("awaitPromise").and_then(|v| v.as_bool()).unwrap_or(false);
+                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let ro = remote_eval(&ctx, &expr, by_value, await_promise).await;
+                    let _ = tx.send(Message::Text(ok(id, &session, json!({ "result": ro })).to_string()));
+                });
+                vec![]
             }
             "Runtime.callFunctionOn" => {
-                let decl = params
-                    .get("functionDeclaration")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let by_value = params
-                    .get("returnByValue")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let await_promise = params
-                    .get("awaitPromise")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let decl = params.get("functionDeclaration").and_then(|v| v.as_str()).unwrap_or("");
+                let by_value = params.get("returnByValue").and_then(|v| v.as_bool()).unwrap_or(false);
+                let await_promise = params.get("awaitPromise").and_then(|v| v.as_bool()).unwrap_or(false);
                 // `this` is the handle's object (by objectId) or the global.
                 let this_js = match params.get("objectId").and_then(|v| v.as_str()) {
                     Some(oid) => format!("__pt_objGet({})", js_str(oid)),
@@ -589,62 +570,78 @@ impl Conn {
                     })
                     .unwrap_or_default();
                 let expr = format!("({decl}).apply({this_js}, [{}])", args_js.join(","));
-                let ro = remote_eval(&self.targets[idx].ctx, &expr, by_value, await_promise).await;
-                vec![ok(id, session, json!({ "result": ro }))]
+                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let ro = remote_eval(&ctx, &expr, by_value, await_promise).await;
+                    let _ = tx.send(Message::Text(ok(id, &session, json!({ "result": ro })).to_string()));
+                });
+                vec![]
             }
             "Runtime.getProperties" => {
-                let props = match params.get("objectId").and_then(|v| v.as_str()) {
-                    Some(oid) => {
-                        let js = format!("JSON.stringify(__pt_getProps({}))", js_str(oid));
-                        match self.targets[idx].ctx.evaluate(&js).await {
-                            Ok(Value::String(s)) => serde_json::from_str(&s).unwrap_or(json!([])),
-                            _ => json!([]),
+                let oid = params.get("objectId").and_then(|v| v.as_str()).map(str::to_string);
+                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let props = match oid {
+                        Some(oid) => {
+                            let js = format!("JSON.stringify(__pt_getProps({}))", js_str(&oid));
+                            match ctx.evaluate(&js).await {
+                                Ok(Value::String(s)) => serde_json::from_str(&s).unwrap_or(json!([])),
+                                _ => json!([]),
+                            }
                         }
-                    }
-                    None => json!([]),
-                };
-                vec![ok(id, session, json!({ "result": props }))]
+                        None => json!([]),
+                    };
+                    let _ = tx.send(Message::Text(ok(id, &session, json!({ "result": props })).to_string()));
+                });
+                vec![]
             }
             "Runtime.releaseObject" => {
-                if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
-                    let _ = self.targets[idx]
-                        .ctx
-                        .evaluate(&format!("__pt_release({})", js_str(oid)))
-                        .await;
-                }
-                vec![ok(id, session, json!({}))]
+                let oid = params.get("objectId").and_then(|v| v.as_str()).map(str::to_string);
+                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                tokio::spawn(async move {
+                    if let Some(oid) = oid {
+                        let _ = ctx.evaluate(&format!("__pt_release({})", js_str(&oid))).await;
+                    }
+                    let _ = tx.send(Message::Text(ok(id, &session, json!({})).to_string()));
+                });
+                vec![]
             }
             "Runtime.releaseObjectGroup" => vec![ok(id, session, json!({}))],
             "DOM.describeNode" => {
-                let node = match params.get("objectId").and_then(|v| v.as_str()) {
-                    Some(oid) => {
-                        let js = format!(
-                            "JSON.stringify(__pt_describe(__pt_objGet({})))",
-                            js_str(oid)
-                        );
-                        match self.targets[idx].ctx.evaluate(&js).await {
-                            Ok(Value::String(s)) => serde_json::from_str(&s).unwrap_or(Value::Null),
-                            _ => Value::Null,
+                let oid = params.get("objectId").and_then(|v| v.as_str()).map(str::to_string);
+                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let node = match oid {
+                        Some(oid) => {
+                            let js = format!("JSON.stringify(__pt_describe(__pt_objGet({})))", js_str(&oid));
+                            match ctx.evaluate(&js).await {
+                                Ok(Value::String(s)) => serde_json::from_str(&s).unwrap_or(Value::Null),
+                                _ => Value::Null,
+                            }
                         }
-                    }
-                    None => Value::Null,
-                };
-                vec![ok(id, session, json!({ "node": node }))]
+                        None => Value::Null,
+                    };
+                    let _ = tx.send(Message::Text(ok(id, &session, json!({ "node": node })).to_string()));
+                });
+                vec![]
             }
             "DOM.resolveNode" => {
-                let obj = match params.get("backendNodeId").and_then(|v| v.as_i64()) {
-                    Some(bid) => {
-                        let js = format!("JSON.stringify(__pt_wrap(__pt_nodeById({bid}), false))");
-                        match self.targets[idx].ctx.evaluate(&js).await {
-                            Ok(Value::String(s)) => {
-                                serde_json::from_str(&s).unwrap_or(json!({ "type": "undefined" }))
+                let bid = params.get("backendNodeId").and_then(|v| v.as_i64());
+                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let obj = match bid {
+                        Some(bid) => {
+                            let js = format!("JSON.stringify(__pt_wrap(__pt_nodeById({bid}), false))");
+                            match ctx.evaluate(&js).await {
+                                Ok(Value::String(s)) => serde_json::from_str(&s).unwrap_or(json!({ "type": "undefined" })),
+                                _ => json!({ "type": "undefined" }),
                             }
-                            _ => json!({ "type": "undefined" }),
                         }
-                    }
-                    None => json!({ "type": "undefined" }),
-                };
-                vec![ok(id, session, json!({ "object": obj }))]
+                        None => json!({ "type": "undefined" }),
+                    };
+                    let _ = tx.send(Message::Text(ok(id, &session, json!({ "object": obj })).to_string()));
+                });
+                vec![]
             }
             "DOM.getDocument" => vec![ok(
                 id,
@@ -760,6 +757,14 @@ mod tests {
         json!({ "id": id, "method": method, "params": params })
     }
 
+    /// A drained outgoing-message sink for `dispatch` in tests (the Target.*
+    /// commands under test reply synchronously and never use it).
+    fn sink() -> UnboundedSender<Message> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        tx
+    }
+
     /// The response object (has a matching `id`) from a dispatch batch.
     fn response(out: &[Value], id: i64) -> &Value {
         out.iter()
@@ -782,7 +787,7 @@ mod tests {
                 1,
                 "Target.createTarget",
                 json!({ "url": "about:blank" }),
-            ))
+            ), &sink())
             .await;
         let tid = response(&out, 1)["result"]["targetId"]
             .as_str()
@@ -802,7 +807,7 @@ mod tests {
                 1,
                 "Target.createTarget",
                 json!({ "url": "about:blank" }),
-            ))
+            ), &sink())
             .await;
         let tid = response(&created, 1)["result"]["targetId"]
             .as_str()
@@ -810,7 +815,7 @@ mod tests {
             .to_string();
 
         let out = conn
-            .dispatch(&cmd(2, "Target.closeTarget", json!({ "targetId": tid })))
+            .dispatch(&cmd(2, "Target.closeTarget", json!({ "targetId": tid })), &sink())
             .await;
         // Puppeteer's page.close() hangs without these two events.
         assert!(has_event(&out, "Target.targetDestroyed"));
@@ -827,9 +832,9 @@ mod tests {
             1,
             "Target.createTarget",
             json!({ "url": "about:blank" }),
-        ))
+        ), &sink())
         .await;
-        let out = conn.dispatch(&cmd(2, "Target.getTargets", json!({}))).await;
+        let out = conn.dispatch(&cmd(2, "Target.getTargets", json!({})), &sink()).await;
         let infos = response(&out, 2)["result"]["targetInfos"]
             .as_array()
             .expect("targetInfos array");
