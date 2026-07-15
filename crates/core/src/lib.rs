@@ -259,8 +259,11 @@ impl BrowserContext {
         // Install the parsed tree as `document`.
         self.evaluate(&page.install_script()).await?;
 
-        // Execute scripts in order against the live document.
-        for script in &page.scripts {
+        // Execute scripts in order against the live document. `idx` matches the
+        // document-order script list the DOM runtime built, so `__pt_beginScript`
+        // can point `document.currentScript` at the running node (document.write
+        // positioning); `__pt_endScript` clears it afterward.
+        for (idx, script) in page.scripts.iter().enumerate() {
             let code = match script {
                 nokk_dom::Script::Inline(code) => code.clone(),
                 nokk_dom::Script::External(src) => match resolve_url(base_url, src) {
@@ -277,9 +280,11 @@ impl BrowserContext {
                     }
                 },
             };
+            let _ = self.evaluate(&format!("__pt_beginScript({idx})")).await;
             if let Err(e) = self.evaluate(&code).await {
                 tracing::debug!(error = %e, "page script threw");
             }
+            let _ = self.evaluate("__pt_endScript()").await;
         }
 
         // Fire lifecycle events, then drain the event loop so timers and async
@@ -1076,6 +1081,32 @@ mod tests {
                         navigator.connection.type === undefined
                     );
                 })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(v, Value::String("true".into()));
+    }
+
+    #[tokio::test]
+    async fn document_write_inserts_at_the_calling_script() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        // Each document.write must land next to the script that called it (the
+        // in-parse idiom that many sites — and bot tests — rely on), not clear
+        // the page or append everywhere.
+        let html = r#"<html><body>
+            <span id="c1"><script>document.write('X=' + (1 + 2))</script></span>
+            <div id="after"><script>document.write('<b>bold</b>')</script></div>
+        </body></html>"#;
+        ctx.load_html("https://example.com/", html).await.unwrap();
+        let v = ctx
+            .evaluate(
+                r#"(() => String(
+                    document.getElementById('c1').textContent.indexOf('X=3') >= 0 &&
+                    document.querySelector('#after b').textContent === 'bold' &&
+                    document.currentScript === null
+                ))()"#,
             )
             .await
             .unwrap();

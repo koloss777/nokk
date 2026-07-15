@@ -84,6 +84,10 @@ Keep in JS (the advantage is real):
   (currently `page.evaluate()` only).
 - ⬜ **CSS selector engine** — descendant/child combinators and attribute operators
   (`^=`, `*=`, `$=`, `~=`) in `querySelector`/`matches`/`closest`.
+- ✅ **`document.write` / `writeln`** — insert parsed markup at the calling script's
+  position (`document.currentScript` tracked per script), so the classic
+  `<script>document.write(x)</script>` idiom populates in place instead of no-op'ing.
+  (Dynamically written `<script>` tags are inserted but not executed.)
 - ⬜ **`window`-targeted `DOMContentLoaded`** and a more complete event path.
 - ⬜ **Playwright compatibility** (`newPage`, its CDP dialect).
 
