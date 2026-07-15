@@ -157,6 +157,20 @@ struct Conn {
     targets: Vec<Target>,
 }
 
+/// A `Target.createTarget` whose context is being built off the read loop. The
+/// engine work runs on a spawned task; the read loop registers the finished
+/// target and sends the reply, so a slow/queued `new_context()` (under worker
+/// saturation) never stalls the other commands on this connection.
+struct PendingTarget {
+    id: i64,
+    session: Option<String>,
+    result: Result<BrowserContext, String>,
+    target_id: String,
+    session_id: String,
+    url: String,
+    auto_attach: bool,
+}
+
 async fn run_session<S>(ws: tokio_tungstenite::WebSocketStream<S>, engine: Engine)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -174,33 +188,48 @@ where
         }
     });
 
+    // `Target.createTarget` builds its context off the read loop and hands the
+    // finished target back through this channel; the read loop then registers it
+    // (targets stay single-threaded here) and replies.
+    let (reg_tx, mut reg_rx) = mpsc::unbounded_channel::<PendingTarget>();
+
     let mut conn = Conn {
         engine,
         auto_attach: false,
         targets: Vec::new(),
     };
 
-    while let Some(Ok(msg)) = read.next().await {
-        let text = match msg {
-            Message::Text(t) => t,
-            Message::Close(_) => break,
-            Message::Ping(p) => {
-                let _ = tx.send(Message::Pong(p));
-                continue;
+    loop {
+        tokio::select! {
+            msg = read.next() => {
+                let Some(Ok(msg)) = msg else { break };
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Close(_) => break,
+                    Message::Ping(p) => {
+                        let _ = tx.send(Message::Pong(p));
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let cmd: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                // dispatch does the connection-state work synchronously and hands
+                // slow engine work (navigate/evaluate/createTarget/…) to spawned
+                // tasks that reply via `tx`/`reg_tx`, so nothing blocks the loop.
+                let out = conn.dispatch(&cmd, &tx, &reg_tx).await;
+                for m in out {
+                    if tx.send(Message::Text(m.to_string())).is_err() {
+                        break;
+                    }
+                }
             }
-            _ => continue,
-        };
-        let cmd: Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        // dispatch does the connection-state work synchronously and hands slow
-        // engine work (navigate/evaluate/…) to spawned tasks that reply via `tx`,
-        // so one slow navigation never blocks other commands on this connection.
-        let out = conn.dispatch(&cmd, &tx).await;
-        for m in out {
-            if tx.send(Message::Text(m.to_string())).is_err() {
-                break;
+            Some(pending) = reg_rx.recv() => {
+                for m in conn.register_target(pending) {
+                    let _ = tx.send(Message::Text(m.to_string()));
+                }
             }
         }
     }
@@ -209,7 +238,54 @@ where
 }
 
 impl Conn {
-    async fn dispatch(&mut self, cmd: &Value, tx: &UnboundedSender<Message>) -> Vec<Value> {
+    /// Register a target whose context finished building off the read loop, and
+    /// produce its `Target.createTarget` reply + `targetCreated` (+ attach) events.
+    fn register_target(&mut self, pending: PendingTarget) -> Vec<Value> {
+        let PendingTarget {
+            id,
+            session,
+            result,
+            target_id,
+            session_id,
+            url,
+            auto_attach,
+        } = pending;
+        match result {
+            Ok(ctx) => {
+                let t = Target {
+                    target_id: target_id.clone(),
+                    session_id: session_id.clone(),
+                    ctx: Arc::new(ctx),
+                    exec_ctx_id: IDS.fetch_add(1, Ordering::Relaxed) as i64,
+                    url,
+                    iso_worlds: Vec::new(),
+                    init_scripts: Vec::new(),
+                };
+                let info = target_info(&t);
+                self.targets.push(t);
+                let mut out = vec![
+                    ok(id, &session, json!({ "targetId": target_id })),
+                    event("Target.targetCreated", &None, json!({ "targetInfo": info })),
+                ];
+                if auto_attach {
+                    out.push(event(
+                        "Target.attachedToTarget",
+                        &None,
+                        json!({ "sessionId": session_id, "targetInfo": info, "waitingForDebugger": false }),
+                    ));
+                }
+                out
+            }
+            Err(e) => vec![err(id, &session, -32000, &format!("createTarget: {e}"))],
+        }
+    }
+
+    async fn dispatch(
+        &mut self,
+        cmd: &Value,
+        tx: &UnboundedSender<Message>,
+        reg_tx: &UnboundedSender<PendingTarget>,
+    ) -> Vec<Value> {
         let id = cmd.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
         let method = cmd.get("method").and_then(|v| v.as_str()).unwrap_or("");
         let params = cmd.get("params").cloned().unwrap_or(json!({}));
@@ -255,39 +331,29 @@ impl Conn {
                 let url = params
                     .get("url")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("about:blank");
-                match self.engine.new_context().await {
-                    Ok(ctx) => {
-                        let target_id = next_id("T");
-                        let session_id = next_id("S");
-                        let t = Target {
-                            target_id: target_id.clone(),
-                            session_id: session_id.clone(),
-                            ctx: Arc::new(ctx),
-                            exec_ctx_id: IDS.fetch_add(1, Ordering::Relaxed) as i64,
-                            url: url.to_string(),
-                            iso_worlds: Vec::new(),
-                            init_scripts: Vec::new(),
-                        };
-                        let info = target_info(&t);
-                        self.targets.push(t);
-                        let mut out = vec![ok(id, &session, json!({ "targetId": target_id }))];
-                        out.push(event(
-                            "Target.targetCreated",
-                            &None,
-                            json!({ "targetInfo": info }),
-                        ));
-                        if self.auto_attach {
-                            out.push(event(
-                                "Target.attachedToTarget",
-                                &None,
-                                json!({ "sessionId": session_id, "targetInfo": info, "waitingForDebugger": false }),
-                            ));
-                        }
-                        out
-                    }
-                    Err(e) => vec![err(id, &session, -32000, &format!("createTarget: {e}"))],
-                }
+                    .unwrap_or("about:blank")
+                    .to_string();
+                let target_id = next_id("T");
+                let session_id = next_id("S");
+                let engine = self.engine.clone();
+                let auto_attach = self.auto_attach;
+                let session = session.clone();
+                let reg = reg_tx.clone();
+                // Build the context off the read loop; the read loop registers it
+                // and replies via `register_target` once it's ready.
+                tokio::spawn(async move {
+                    let result = engine.new_context().await.map_err(|e| e.to_string());
+                    let _ = reg.send(PendingTarget {
+                        id,
+                        session,
+                        result,
+                        target_id,
+                        session_id,
+                        url,
+                        auto_attach,
+                    });
+                });
+                vec![]
             }
             "Target.attachToTarget" => {
                 let tid = params
@@ -757,12 +823,34 @@ mod tests {
         json!({ "id": id, "method": method, "params": params })
     }
 
-    /// A drained outgoing-message sink for `dispatch` in tests (the Target.*
-    /// commands under test reply synchronously and never use it).
+    /// A drained outgoing-message sink for `dispatch` in tests.
     fn sink() -> UnboundedSender<Message> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         tx
+    }
+
+    /// A drained target-registration sink (used by dispatch calls that aren't
+    /// createTarget and so never register a target).
+    fn reg_sink() -> UnboundedSender<PendingTarget> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        tx
+    }
+
+    /// Drive `Target.createTarget` end to end: dispatch queues the async
+    /// `new_context`; the server's read loop registers the finished target — here
+    /// we do that inline and return the createTarget reply batch.
+    async fn create_target(conn: &mut Conn, id: i64) -> Vec<Value> {
+        let (reg_tx, mut reg_rx) = mpsc::unbounded_channel();
+        conn.dispatch(
+            &cmd(id, "Target.createTarget", json!({ "url": "about:blank" })),
+            &sink(),
+            &reg_tx,
+        )
+        .await;
+        let pending = reg_rx.recv().await.expect("pending target");
+        conn.register_target(pending)
     }
 
     /// The response object (has a matching `id`) from a dispatch batch.
@@ -782,13 +870,7 @@ mod tests {
     async fn create_target_returns_id_and_emits_created() {
         let _s = SERIAL.lock().await;
         let mut conn = test_conn();
-        let out = conn
-            .dispatch(&cmd(
-                1,
-                "Target.createTarget",
-                json!({ "url": "about:blank" }),
-            ), &sink())
-            .await;
+        let out = create_target(&mut conn, 1).await;
         let tid = response(&out, 1)["result"]["targetId"]
             .as_str()
             .expect("targetId")
@@ -802,20 +884,18 @@ mod tests {
     async fn close_target_emits_destroyed_and_drops_it() {
         let _s = SERIAL.lock().await;
         let mut conn = test_conn();
-        let created = conn
-            .dispatch(&cmd(
-                1,
-                "Target.createTarget",
-                json!({ "url": "about:blank" }),
-            ), &sink())
-            .await;
+        let created = create_target(&mut conn, 1).await;
         let tid = response(&created, 1)["result"]["targetId"]
             .as_str()
             .unwrap()
             .to_string();
 
         let out = conn
-            .dispatch(&cmd(2, "Target.closeTarget", json!({ "targetId": tid })), &sink())
+            .dispatch(
+                &cmd(2, "Target.closeTarget", json!({ "targetId": tid })),
+                &sink(),
+                &reg_sink(),
+            )
             .await;
         // Puppeteer's page.close() hangs without these two events.
         assert!(has_event(&out, "Target.targetDestroyed"));
@@ -828,13 +908,10 @@ mod tests {
     async fn get_targets_lists_open_targets() {
         let _s = SERIAL.lock().await;
         let mut conn = test_conn();
-        conn.dispatch(&cmd(
-            1,
-            "Target.createTarget",
-            json!({ "url": "about:blank" }),
-        ), &sink())
-        .await;
-        let out = conn.dispatch(&cmd(2, "Target.getTargets", json!({})), &sink()).await;
+        create_target(&mut conn, 1).await;
+        let out = conn
+            .dispatch(&cmd(2, "Target.getTargets", json!({})), &sink(), &reg_sink())
+            .await;
         let infos = response(&out, 2)["result"]["targetInfos"]
             .as_array()
             .expect("targetInfos array");
