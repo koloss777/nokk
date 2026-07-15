@@ -14,7 +14,8 @@
 //! through the correct machinery but return `NotImplemented` until Phases 1–2
 //! land V8 and the networking stack.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use nokk_net::{
     Client, ClientConfig, FingerprintClient, HttpClient, NetError, Request, StubClient,
@@ -25,7 +26,7 @@ use serde_json::Value;
 
 // Re-export the types callers commonly need, so depending on `nokk`
 // is sufficient to configure and drive an engine.
-pub use nokk_net::Response as HttpResponse;
+pub use nokk_net::{ProxyConfig, ProxyScheme, Response as HttpResponse};
 pub use nokk_pool::{PoolConfig, WorkerId};
 
 /// Errors surfaced by the engine.
@@ -55,11 +56,45 @@ pub struct EngineConfig {
 
 struct EngineInner {
     pool: IsolatePool,
+    /// The default (no per-context proxy) client.
     client: Client,
+    /// Base client configuration, cloned to build per-proxy clients.
+    client_config: ClientConfig,
+    use_real_network: bool,
+    /// Fingerprint clients keyed by proxy, so contexts sharing a proxy share one
+    /// connection pool (per-context identity without a client-per-context blow-up).
+    client_pool: Mutex<HashMap<String, Client>>,
     stealth: StealthProfile,
     /// JS run in every new context before any page script: the spoofed
     /// `navigator`/`window`/`screen` environment. Built once from the profile.
     bootstrap: String,
+}
+
+impl EngineInner {
+    /// The client a context with `proxy` should use — the default when `proxy` is
+    /// `None`, otherwise a per-proxy fingerprint client (built once and pooled).
+    /// With the stub network (tests), always the default.
+    fn client_for(&self, proxy: Option<ProxyConfig>) -> Result<Client, EngineError> {
+        let Some(p) = proxy.filter(|_| self.use_real_network) else {
+            return Ok(self.client.clone());
+        };
+        let key = format!(
+            "{:?}|{}|{}|{}",
+            p.scheme,
+            p.host,
+            p.port,
+            p.username.as_deref().unwrap_or("")
+        );
+        let mut pool = self.client_pool.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = pool.get(&key) {
+            return Ok(c.clone());
+        }
+        let mut cfg = self.client_config.clone();
+        cfg.proxy = Some(p);
+        let client = Client::Fingerprint(FingerprintClient::new(&cfg)?);
+        pool.insert(key, client.clone());
+        Ok(client)
+    }
 }
 
 /// A running engine: owns the isolate worker pool and hands out contexts.
@@ -75,7 +110,7 @@ impl Engine {
         let client = if config.use_real_network {
             Client::Fingerprint(FingerprintClient::new(&config.client)?)
         } else {
-            Client::Stub(StubClient::new(config.client))
+            Client::Stub(StubClient::new(config.client.clone()))
         };
         // Per-context bootstrap, in dependency order: the stealth environment
         // (navigator/window/screen/Intl/timers/fetch), then the DOM runtime
@@ -97,6 +132,9 @@ impl Engine {
             inner: Arc::new(EngineInner {
                 pool,
                 client,
+                client_config: config.client,
+                use_real_network: config.use_real_network,
+                client_pool: Mutex::new(HashMap::new()),
                 stealth: config.stealth,
                 bootstrap,
             }),
@@ -117,6 +155,19 @@ impl Engine {
     /// places the context on the least-loaded worker, and creates it on that
     /// worker's isolate.
     pub async fn new_context(&self) -> Result<BrowserContext, EngineError> {
+        self.new_context_with_proxy(None).await
+    }
+
+    /// Like [`new_context`](Self::new_context), but routes this context's network
+    /// (document, scripts, `fetch`/XHR) through `proxy` and its own cookie jar —
+    /// per-context identity for concurrent scraping under rotating proxies.
+    /// Contexts sharing a proxy share one connection pool. `None` uses the
+    /// engine's default client.
+    pub async fn new_context_with_proxy(
+        &self,
+        proxy: Option<ProxyConfig>,
+    ) -> Result<BrowserContext, EngineError> {
+        let client = self.inner.client_for(proxy)?;
         let permit = self.inner.pool.acquire_context().await?;
         let worker = self.inner.pool.pick_worker();
         let load = self.inner.pool.register_context(worker);
@@ -130,6 +181,7 @@ impl Engine {
         tracing::debug!(?worker, index, "context created");
         Ok(BrowserContext {
             engine: self.inner.clone(),
+            client,
             worker,
             index,
             base_url: std::sync::Mutex::new("about:blank".to_string()),
@@ -179,6 +231,9 @@ impl Engine {
 /// both, freeing a slot for a queued navigation.
 pub struct BrowserContext {
     engine: Arc<EngineInner>,
+    /// This context's HTTP client — its own proxy + cookie jar when created with
+    /// [`Engine::new_context_with_proxy`], else the engine default.
+    client: Client,
     worker: WorkerId,
     index: usize,
     /// Document URL of the last `load_html`/`navigate`, used to resolve relative
@@ -404,7 +459,7 @@ impl BrowserContext {
         };
 
         let method = req.method.clone();
-        match self.engine.client.send(req).await {
+        match self.client.send(req).await {
             Ok(resp) => {
                 self.record(&method, &url, &kind, resp.status, &resp.body);
                 let headers_js =
@@ -462,7 +517,7 @@ impl BrowserContext {
             headers,
             body: None,
         };
-        match self.engine.client.send(req).await {
+        match self.client.send(req).await {
             Ok(resp) => {
                 self.record("GET", url, resource_type, resp.status, &resp.body);
                 let final_url = if resp.url.is_empty() {
