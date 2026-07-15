@@ -569,8 +569,18 @@
     const o = __ptObjs.get(id); const out = [];
     if (o != null) {
       for (const k of Object.getOwnPropertyNames(o)) {
-        let val; try { val = o[k]; } catch (e) { continue; }
-        out.push({ name: String(k), value: globalThis.__pt_wrap(val, false), configurable: true, enumerable: true, writable: true, isOwn: true });
+        // Report the REAL descriptor flags. Reporting non-enumerable props (e.g.
+        // an array's `length`) as enumerable makes Puppeteer's iterator drain
+        // (which stops when getProperties returns 0 enumerable entries) loop
+        // forever — the root cause of page.$/$$/$eval hanging.
+        let d; try { d = Object.getOwnPropertyDescriptor(o, k); } catch (e) { continue; }
+        if (!d) continue;
+        let val; try { val = 'value' in d ? d.value : o[k]; } catch (e) { continue; }
+        out.push({
+          name: String(k), value: globalThis.__pt_wrap(val, false),
+          configurable: !!d.configurable, enumerable: !!d.enumerable,
+          writable: !!d.writable, isOwn: true,
+        });
       }
     }
     return out;
