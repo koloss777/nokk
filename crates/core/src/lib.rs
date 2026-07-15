@@ -1112,4 +1112,28 @@ mod tests {
             .unwrap();
         assert_eq!(v, Value::String("true".into()));
     }
+
+    #[tokio::test]
+    async fn get_props_reports_real_enumerable_flags() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        // Runtime.getProperties must report the true `enumerable` flag: an array's
+        // `length` is non-enumerable. Reporting it as enumerable made Puppeteer's
+        // query iterator (page.$/$$/$eval), which stops when a batch yields 0
+        // enumerable properties, loop forever.
+        let v = ctx
+            .evaluate(
+                r#"(() => {
+                    const w = __pt_wrap([10, 20], false);
+                    const props = __pt_getProps(w.objectId);
+                    const len = props.find(p => p.name === 'length');
+                    const i0 = props.find(p => p.name === '0');
+                    return String(!!len && len.enumerable === false && !!i0 && i0.enumerable === true);
+                })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(v, Value::String("true".into()));
+    }
 }

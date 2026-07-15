@@ -193,9 +193,9 @@ What is **not** done yet, and where the sharp edges are:
   making `navigator`/`screen` real prototype instances, timezone coherence). nokk passes
   mainstream WAF challenges today but is **not** yet a match for a dedicated fingerprinting
   suite like CreepJS. See the [roadmap](ROADMAP.md).
-- **CDP coverage is the Puppeteer happy path**, not the whole protocol. `page.$`/`$eval`
-  via Puppeteer's injected query utilities and Playwright are not supported yet; use
-  `page.evaluate()`.
+- **CDP coverage is the Puppeteer happy path**, not the whole protocol. `page.$` /
+  `$eval` / `$$eval` and `page.evaluate()` work; Playwright and less-common CDP domains
+  are not supported yet.
 - **Per-context network limits and cookie isolation** are not yet enforced (Phase 7).
 - No rendering — screenshots, PDF, and layout/paint are out of scope by design.
 

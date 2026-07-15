@@ -80,8 +80,10 @@ Keep in JS (the advantage is real):
 
 - 🟡 **CDP registry lifecycle** — honor `removeScriptToEvaluateOnNewDocument` and
   `releaseObjectGroup`; bound per-connection registry growth.
-- ⬜ **Puppeteer `page.$` / `$eval` / `$$eval`** — support the injected query utilities
-  (currently `page.evaluate()` only).
+- ✅ **Puppeteer `page.$` / `$eval` / `$$eval`** — work now. The blocker was
+  `Runtime.getProperties` reporting non-enumerable props (an array's `length`) as
+  enumerable, which made Puppeteer's query-iterator drain loop forever; it now reports
+  real descriptor flags. Verified end-to-end against `page.$`/`$eval`/`$$eval`.
 - ⬜ **CSS selector engine** — descendant/child combinators and attribute operators
   (`^=`, `*=`, `$=`, `~=`) in `querySelector`/`matches`/`closest`.
 - ✅ **`document.write` / `writeln`** — insert parsed markup at the calling script's
