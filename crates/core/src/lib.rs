@@ -71,30 +71,43 @@ struct EngineInner {
 }
 
 impl EngineInner {
-    /// The client a context with `proxy` should use — the default when `proxy` is
-    /// `None`, otherwise a per-proxy fingerprint client (built once and pooled).
-    /// With the stub network (tests), always the default.
-    fn client_for(&self, proxy: Option<ProxyConfig>) -> Result<Client, EngineError> {
-        let Some(p) = proxy.filter(|_| self.use_real_network) else {
+    /// The client for a context with a given identity `key` and optional `proxy`.
+    /// An empty key (the default browser context) or the stub network always uses
+    /// the shared default client. Otherwise the client is built once per key and
+    /// pooled — so each identity gets its *own* cookie jar (Puppeteer browser
+    /// contexts are isolated even when they share, or omit, a proxy).
+    fn client_for(&self, key: &str, proxy: Option<ProxyConfig>) -> Result<Client, EngineError> {
+        if key.is_empty() || !self.use_real_network {
             return Ok(self.client.clone());
-        };
-        let key = format!(
-            "{:?}|{}|{}|{}",
-            p.scheme,
-            p.host,
-            p.port,
-            p.username.as_deref().unwrap_or("")
-        );
-        let mut pool = self.client_pool.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(c) = pool.get(&key) {
+        }
+        if let Some(c) = self
+            .client_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+        {
             return Ok(c.clone());
         }
+        // Build the (BoringSSL) client outside the lock so concurrent first-use of
+        // *different* identities don't serialise on it; re-check on insert.
         let mut cfg = self.client_config.clone();
-        cfg.proxy = Some(p);
+        cfg.proxy = proxy;
         let client = Client::Fingerprint(FingerprintClient::new(&cfg)?);
-        pool.insert(key, client.clone());
-        Ok(client)
+        let mut pool = self.client_pool.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(pool.entry(key.to_string()).or_insert(client).clone())
     }
+}
+
+/// Pool key for a proxy (used by [`Engine::new_context_with_proxy`] to share one
+/// client among contexts that route through the same proxy).
+fn proxy_key(p: &ProxyConfig) -> String {
+    format!(
+        "proxy:{:?}|{}|{}|{}",
+        p.scheme,
+        p.host,
+        p.port,
+        p.username.as_deref().unwrap_or("")
+    )
 }
 
 /// A running engine: owns the isolate worker pool and hands out contexts.
@@ -155,19 +168,34 @@ impl Engine {
     /// places the context on the least-loaded worker, and creates it on that
     /// worker's isolate.
     pub async fn new_context(&self) -> Result<BrowserContext, EngineError> {
-        self.new_context_with_proxy(None).await
+        self.new_context_with_identity(String::new(), None).await
     }
 
     /// Like [`new_context`](Self::new_context), but routes this context's network
-    /// (document, scripts, `fetch`/XHR) through `proxy` and its own cookie jar —
-    /// per-context identity for concurrent scraping under rotating proxies.
-    /// Contexts sharing a proxy share one connection pool. `None` uses the
-    /// engine's default client.
+    /// through `proxy` and its own cookie jar. Contexts routing through the *same*
+    /// proxy share one client (jar + connection pool) — convenient for rotating
+    /// proxies. For strict per-context isolation use
+    /// [`new_context_with_identity`](Self::new_context_with_identity).
     pub async fn new_context_with_proxy(
         &self,
         proxy: Option<ProxyConfig>,
     ) -> Result<BrowserContext, EngineError> {
-        let client = self.inner.client_for(proxy)?;
+        let key = proxy.as_ref().map(proxy_key).unwrap_or_default();
+        self.new_context_with_identity(key, proxy).await
+    }
+
+    /// Create a context bound to a named identity: all contexts sharing the same
+    /// non-empty `identity` share one client (cookie jar + proxy + connection
+    /// pool); distinct identities are fully isolated even with the same `proxy`.
+    /// An empty identity uses the engine's shared default client. The CDP layer
+    /// passes the Puppeteer browser-context id here so browser contexts are
+    /// cookie-isolated.
+    pub async fn new_context_with_identity(
+        &self,
+        identity: String,
+        proxy: Option<ProxyConfig>,
+    ) -> Result<BrowserContext, EngineError> {
+        let client = self.inner.client_for(&identity, proxy)?;
         let permit = self.inner.pool.acquire_context().await?;
         let worker = self.inner.pool.pick_worker();
         let load = self.inner.pool.register_context(worker);
@@ -244,6 +272,19 @@ pub struct BrowserContext {
     requests: std::sync::Mutex<Vec<NetworkRecord>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
     _load: nokk_pool::ContextLoadGuard,
+}
+
+impl Drop for BrowserContext {
+    fn drop(&mut self) {
+        // Dispose the V8 context on its owning worker so the isolate reclaims it.
+        // Without this, create/close churn (every Puppeteer newPage/close) grows
+        // the isolate's context table unbounded — a slow leak on a busy server.
+        // Fire-and-forget: there's no caller to return to from Drop.
+        let index = self.index;
+        self.engine
+            .pool
+            .dispatch_detached(self.worker, move |iso| iso.dispose_context(index));
+    }
 }
 
 /// One network request the engine performed on a page's behalf. Because page JS
@@ -640,6 +681,61 @@ mod tests {
             ..Default::default()
         })
         .expect("stub engine never fails to build")
+    }
+
+    #[tokio::test]
+    async fn dropping_a_context_disposes_it_on_the_isolate() {
+        let _serial = serial().await;
+        let engine = engine(1, 4);
+        let ctx = engine.new_context().await.unwrap();
+        let worker = ctx.worker();
+        let before = engine
+            .inner
+            .pool
+            .dispatch(worker, |iso| iso.context_count())
+            .await
+            .unwrap();
+        drop(ctx); // fires the detached dispose job (FIFO before the count below)
+        let after = engine
+            .inner
+            .pool
+            .dispatch(worker, |iso| iso.context_count())
+            .await
+            .unwrap();
+        assert_eq!(before, 1);
+        assert_eq!(after, 0, "closed context must be disposed on the isolate");
+    }
+
+    #[tokio::test]
+    async fn distinct_identities_get_isolated_clients() {
+        let _serial = serial().await;
+        // Real network so per-identity clients are actually built (no request is
+        // made — building a client is offline).
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 8,
+                max_heap_mb: None,
+            },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let _def = engine.new_context().await.unwrap(); // empty identity → default client, not pooled
+        let _a = engine
+            .new_context_with_identity("A".into(), None)
+            .await
+            .unwrap();
+        let _b = engine
+            .new_context_with_identity("B".into(), None)
+            .await
+            .unwrap();
+        let _a2 = engine
+            .new_context_with_identity("A".into(), None)
+            .await
+            .unwrap();
+        // A and B each got their own client; A2 reused A's; the default is separate.
+        assert_eq!(engine.inner.client_pool.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

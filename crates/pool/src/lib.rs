@@ -207,6 +207,19 @@ impl IsolatePool {
         rx.await.map_err(|_| PoolError::Canceled)
     }
 
+    /// Fire-and-forget a closure onto `worker`'s isolate thread — no result is
+    /// awaited. For teardown work (e.g. disposing a context) that must run on the
+    /// owning thread but has no caller to return to (called from `Drop`). A gone
+    /// worker is ignored.
+    pub fn dispatch_detached<F>(&self, worker: WorkerId, f: F)
+    where
+        F: FnOnce(&mut Isolate) + Send + 'static,
+    {
+        if let Some(w) = self.workers.get(worker.0) {
+            let _ = w.tx.send(Box::new(f));
+        }
+    }
+
     /// Stop accepting work and join all worker threads. Equivalent to dropping
     /// the pool, but blocks until every isolate has finished draining.
     pub fn shutdown(self) {
