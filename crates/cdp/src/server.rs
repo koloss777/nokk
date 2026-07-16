@@ -380,10 +380,29 @@ impl Conn {
                 vec![ok(id, &session, json!({ "browserContextId": bcid }))]
             }
             "Target.disposeBrowserContext" => {
+                let mut out = Vec::new();
                 if let Some(bc) = params.get("browserContextId").and_then(|v| v.as_str()) {
                     self.browser_contexts.remove(bc);
+                    // Close (drop) every page in this context, freeing its engine
+                    // context, and tell the client — otherwise the targets leak.
+                    let closing: Vec<String> = self
+                        .targets
+                        .iter()
+                        .filter(|t| t.browser_context_id.as_deref() == Some(bc))
+                        .map(|t| t.target_id.clone())
+                        .collect();
+                    self.targets
+                        .retain(|t| t.browser_context_id.as_deref() != Some(bc));
+                    for tid in closing {
+                        out.push(event(
+                            "Target.targetDestroyed",
+                            &None,
+                            json!({ "targetId": tid }),
+                        ));
+                    }
                 }
-                vec![ok(id, &session, json!({ "success": true }))]
+                out.push(ok(id, &session, json!({ "success": true })));
+                out
             }
             "Target.getTargets" => {
                 let infos: Vec<Value> = self.targets.iter().map(target_info).collect();
@@ -410,11 +429,16 @@ impl Conn {
                 let auto_attach = self.auto_attach;
                 let session = session.clone();
                 let reg = reg_tx.clone();
+                // Identity = the browser context id, so every page in a browser
+                // context shares its cookie jar while distinct contexts stay
+                // isolated (Puppeteer semantics); the default context (empty id)
+                // uses the engine's shared default client.
+                let identity = browser_context_id.clone().unwrap_or_default();
                 // Build the context off the read loop; the read loop registers it
                 // and replies via `register_target` once it's ready.
                 tokio::spawn(async move {
                     let result = engine
-                        .new_context_with_proxy(proxy)
+                        .new_context_with_identity(identity, proxy)
                         .await
                         .map_err(|e| e.to_string());
                     let _ = reg.send(PendingTarget {
