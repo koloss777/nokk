@@ -35,6 +35,28 @@ jobs:
         with:
           files: nokk-*-linux-x86_64.tar.gz
           generate_release_notes: true
+          # SEO-oriented lead (keyword-rich); the auto-generated changelog is
+          # appended below it by generate_release_notes.
+          body: |
+            **nokk ${{ github.ref_name }}** — an **undetectable headless browser engine** in
+            **Rust**: real **V8** JavaScript + a DOM with a coherent **Chrome TLS/HTTP
+            fingerprint (JA3/JA4)** and JS-level **anti-bot stealth**, driven over the
+            **Chrome DevTools Protocol** so existing **Puppeteer** code just connects. No
+            Chromium, no rendering. Good for **stealth web scraping**, **Cloudflare / anti-bot
+            bypass**, and high-concurrency automation with **per-context proxy rotation**.
+
+            ### Run it
+            ```bash
+            docker run --rm -p 9222:9222 ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            # or the Linux x86_64 binary attached below
+            ```
+            Point Puppeteer at `ws://localhost:9222/devtools/browser/nokk`.
+
+            > Keywords: undetectable headless browser · anti-bot bypass · Cloudflare bypass ·
+            > JA3/JA4 TLS fingerprint · browser fingerprint spoofing · stealth web scraping ·
+            > Puppeteer-compatible · headless Chrome alternative · Rust.
+
+            ---
 
   image:
     name: Build and push images

@@ -108,11 +108,19 @@ ceiling.
   the finished target back through a registration channel; the read loop (a `select!` over
   frames + registrations) registers it. No inline await → effective concurrency scales
   cleanly to `--workers` (a 24-site sweep at concurrency 8 held ~88%, vs the old collapse).
-- ✅ **Per-context identity: proxy + cookie jar per context.** `Engine::new_context_with_proxy`
-  selects a per-context client, pooled by proxy (contexts sharing a proxy share one pool +
-  cookie jar). Exposed via CDP `Target.createBrowserContext({ proxyServer })` +
-  `createTarget({ browserContextId })` — i.e. `browser.createBrowserContext({ proxyServer })`
-  in Puppeteer. Verified end-to-end.
+- ✅ **Per-context identity: proxy + cookie jar per context.** Clients keyed by identity
+  (the Puppeteer browser-context id) so contexts are cookie-isolated even when they share
+  or omit a proxy; `Engine::new_context_with_identity(id, proxy)` /
+  `new_context_with_proxy(proxy)`. Exposed via CDP
+  `Target.createBrowserContext({ proxyServer })` + `createTarget({ browserContextId })`
+  (`browser.createBrowserContext({ proxyServer })` in Puppeteer). Verified end-to-end.
+- ⬜ **Persistent / named sessions — warm up once, resume anytime.** Give a session a name;
+  persist its cookie jar (incl. `cf_clearance`) + identity to disk/store, so you can warm a
+  session (log in, clear a challenge) once and re-attach it later — a fresh context, or a
+  new process — instead of re-solving every run. Shape: `new_context_with_session(name,
+  proxy)` that loads/saves the jar, plus CDP `Storage.getCookies`/`setCookies` and a
+  `--session-store <dir>`. Turns the in-memory per-context jar above into a reusable,
+  cross-run identity.
 - ⬜ **Enforce per-host / per-proxy / global connection limits** in the network layer.
 - ⬜ **Context recycling & isolate churn** under sustained 100–1000 concurrent load.
 - ⬜ **Navigation task queue + per-proxy concurrency caps** with fair scheduling.
