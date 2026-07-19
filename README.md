@@ -151,6 +151,33 @@ console.log(await page.title());
 await browser.close();
 ```
 
+### Persistent sessions (warm up once, resume anytime)
+
+Start nokk with a session store, then bind a browser context to a **session name**. Its
+cookie jar — login state, `cf_clearance`, session cookies and all — persists to
+`<store>/<name>.json` and reloads automatically, even in a new process. Warm a session once
+and re-attach it later instead of re-solving a challenge every run:
+
+```bash
+cargo run --release --bin nokk -- --port 9222 --session-store ./sessions
+```
+
+```js
+const browser = await puppeteer.connect({
+  browserWSEndpoint: 'ws://127.0.0.1:9222/devtools/browser/nokk',
+});
+// `sessionName` is a nokk extension to Target.createBrowserContext, sent via raw CDP.
+const cdp = await browser.target().createCDPSession();
+const { browserContextId } = await cdp.send('Target.createBrowserContext', {
+  sessionName: 'acme',
+  // proxyServer: 'http://user:pass@host:port',   // optional, per-session IP
+});
+```
+
+Every page opened in that context shares the named jar; it flushes to disk when the context
+closes. Distinct session names are fully isolated. Without `--session-store`, sessions are
+in-memory only. From the Rust API this is `Engine::new_context_with_session(name, proxy)`.
+
 ## How it works
 
 nokk is a Cargo workspace of small, single-responsibility crates:
@@ -196,7 +223,9 @@ What is **not** done yet, and where the sharp edges are:
 - **CDP coverage is the Puppeteer happy path**, not the whole protocol. `page.$` /
   `$eval` / `$$eval` and `page.evaluate()` work; Playwright and less-common CDP domains
   are not supported yet.
-- **Per-context network limits and cookie isolation** are not yet enforced (Phase 7).
+- **Per-context cookie isolation and per-session persistence** work (each browser context
+  gets its own jar; named sessions persist across runs); **per-host / per-proxy / global
+  connection limits** are not yet enforced (Phase 7).
 - No rendering — screenshots, PDF, and layout/paint are out of scope by design.
 
 See [ROADMAP.md](ROADMAP.md) for the phased plan and the concrete hardening backlog.

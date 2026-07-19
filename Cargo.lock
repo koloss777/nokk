@@ -1156,10 +1156,12 @@ dependencies = [
 name = "nokk-net"
 version = "0.0.0"
 dependencies = [
+ "cookie_store",
  "serde",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
  "wreq",
  "wreq-util",
 ]

@@ -114,13 +114,18 @@ ceiling.
   `new_context_with_proxy(proxy)`. Exposed via CDP
   `Target.createBrowserContext({ proxyServer })` + `createTarget({ browserContextId })`
   (`browser.createBrowserContext({ proxyServer })` in Puppeteer). Verified end-to-end.
-- ⬜ **Persistent / named sessions — warm up once, resume anytime.** Give a session a name;
-  persist its cookie jar (incl. `cf_clearance`) + identity to disk/store, so you can warm a
-  session (log in, clear a challenge) once and re-attach it later — a fresh context, or a
-  new process — instead of re-solving every run. Shape: `new_context_with_session(name,
-  proxy)` that loads/saves the jar, plus CDP `Storage.getCookies`/`setCookies` and a
-  `--session-store <dir>`. Turns the in-memory per-context jar above into a reusable,
-  cross-run identity.
+- ✅ **Persistent / named sessions — warm up once, resume anytime.** Give a session a name
+  and its cookie jar (incl. session-only cookies and `cf_clearance`) persists to
+  `<store>/<name>.json`, so a session warmed up once (log in, clear a challenge) re-attaches
+  later — a fresh context *or a new process* — instead of re-solving every run. A
+  serializable [`SessionJar`](crates/net/src/session.rs) (implements wreq's `CookieStore`)
+  backs the client; `Engine::new_context_with_session(name, proxy)` loads it on first use and
+  it flushes to disk when a session context closes (or via `Engine::save_session`). Driven
+  over CDP by naming a browser context —
+  `Target.createBrowserContext({ sessionName, proxyServer })` — and enabled with
+  `--session-store <dir>` (`NOKK_SESSION_STORE`). Verified end-to-end: a cookie warmed in one
+  process resumes in a *restarted* process, and distinct session names stay isolated.
+  (Follow-up: CDP `Network.getCookies`/`setCookie` for manual save/restore from page code.)
 - ⬜ **Enforce per-host / per-proxy / global connection limits** in the network layer.
 - ⬜ **Context recycling & isolate churn** under sustained 100–1000 concurrent load.
 - ⬜ **Navigation task queue + per-proxy concurrency caps** with fair scheduling.
