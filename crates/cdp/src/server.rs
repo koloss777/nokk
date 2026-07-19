@@ -317,10 +317,17 @@ impl Conn {
                 };
                 let info = target_info(&t);
                 self.targets.push(t);
-                let mut out = vec![
-                    ok(id, &session, json!({ "targetId": target_id })),
-                    event("Target.targetCreated", &None, json!({ "targetInfo": info })),
-                ];
+                // Emit the target lifecycle events *before* the createTarget reply.
+                // Real Chrome fires `targetCreated`/`attachedToTarget` before the
+                // command returns, and Playwright's `doCreateNewPage` relies on it:
+                // it reads `_crPages.get(targetId)` the instant the reply arrives, so
+                // the attach event must have populated that map first. (Puppeteer
+                // awaits `targetCreated` separately, so the order is safe for it too.)
+                let mut out = vec![event(
+                    "Target.targetCreated",
+                    &None,
+                    json!({ "targetInfo": info }),
+                )];
                 if auto_attach {
                     out.push(event(
                         "Target.attachedToTarget",
@@ -328,6 +335,7 @@ impl Conn {
                         json!({ "sessionId": session_id, "targetInfo": info, "waitingForDebugger": false }),
                     ));
                 }
+                out.push(ok(id, &session, json!({ "targetId": target_id })));
                 out
             }
             Err(e) => vec![err(id, &session, -32000, &format!("createTarget: {e}"))],
@@ -764,7 +772,9 @@ impl Conn {
                             .collect()
                     })
                     .unwrap_or_default();
-                let expr = format!("({decl}).apply({this_js}, [{}])", args_js.join(","));
+                // Newline-isolate the declaration too — Playwright's function
+                // sources can carry a trailing `//# sourceURL=` comment.
+                let expr = format!("(\n{decl}\n).apply({this_js}, [{}])", args_js.join(","));
                 let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
                     let ro = remote_eval(&ctx, &expr, by_value, await_promise).await;
@@ -862,9 +872,18 @@ async fn remote_eval(
     await_promise: bool,
 ) -> Value {
     let by = if by_value { "true" } else { "false" };
+    // Evaluate the caller's source as a *script* via indirect `eval`, taking its
+    // completion value — exactly what CDP `Runtime.evaluate` does, and in global
+    // scope. Splicing the source inline as a sub-expression (`__pt_wrap((SRC),…)`)
+    // breaks on the statement forms Puppeteer/Playwright actually send: an IIFE
+    // with a trailing `;` becomes `(…;)` (illegal semicolon in parens) and a
+    // trailing `//# sourceURL=` comment swallows the wrapper's `)`. Passing the
+    // source as a string sidesteps both. `(0, eval)` forces the indirect/global
+    // form rather than a scoped direct eval.
+    let src = js_str(expr);
     let js = if await_promise {
         // Resolve the (possibly-Promise) value via the event loop, then wrap it.
-        let setup = format!("globalThis.__cdp = ({expr});");
+        let setup = format!("globalThis.__cdp = (0, eval)({src});");
         if ctx.evaluate(&setup).await.is_err() {
             return json!({ "type": "undefined" });
         }
@@ -875,7 +894,7 @@ async fn remote_eval(
         format!("JSON.stringify(__pt_wrap(globalThis.__cdp, {by}))")
     } else {
         format!(
-            "(() => {{ try {{ return JSON.stringify(__pt_wrap(({expr}), {by})); }} \
+            "(() => {{ try {{ return JSON.stringify(__pt_wrap((0, eval)({src}), {by})); }} \
                catch (e) {{ return JSON.stringify(__pt_wrap(String(e), true)); }} }})()"
         )
     };
@@ -1025,6 +1044,31 @@ mod tests {
         assert!(!tid.is_empty());
         assert!(has_event(&out, "Target.targetCreated"));
         assert_eq!(conn.targets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_target_emits_lifecycle_events_before_the_reply() {
+        // Real Chrome fires `targetCreated`/`attachedToTarget` before the
+        // `createTarget` result. Playwright's `doCreateNewPage` reads
+        // `_crPages.get(targetId)` the instant the reply lands, so the attach
+        // event must have populated that map first — otherwise `newPage()` throws
+        // "reading '_page'". Lock the ordering in.
+        let _s = SERIAL.lock().await;
+        let mut conn = test_conn();
+        conn.auto_attach = true;
+        let out = create_target(&mut conn, 7).await;
+        let idx = |m: &str| {
+            out.iter()
+                .position(|v| v.get("method").and_then(|x| x.as_str()) == Some(m))
+        };
+        let reply = out
+            .iter()
+            .position(|v| v.get("id").and_then(|x| x.as_i64()) == Some(7))
+            .expect("createTarget reply");
+        let created = idx("Target.targetCreated").expect("targetCreated event");
+        let attached = idx("Target.attachedToTarget").expect("attachedToTarget event");
+        assert!(created < reply, "targetCreated must precede the reply");
+        assert!(attached < reply, "attachedToTarget must precede the reply");
     }
 
     #[tokio::test]
