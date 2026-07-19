@@ -19,3 +19,9 @@ serde = { workspace = true }
 # + HTTP/2 fingerprint. Build needs cmake + libclang (see docs/BUILD.md).
 wreq = { workspace = true }
 wreq-util = { workspace = true }
+
+# Persistent, serializable cookie jar for named sessions (warm up once, resume
+# later). `cookie_store` is already in the tree via wreq; pin the same version so
+# there is a single `cookie` crate in the graph and `RawCookie` types match.
+cookie_store = "0.21"
+url = "2"

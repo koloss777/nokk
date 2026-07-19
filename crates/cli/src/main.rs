@@ -68,6 +68,13 @@ struct Cli {
     #[arg(long, value_name = "URL")]
     proxy: Option<String>,
 
+    /// Directory for persistent, named sessions. When set, a Puppeteer browser
+    /// context named via `createBrowserContext` persists its cookie jar (login
+    /// state, `cf_clearance`, …) to `<dir>/<name>.json`, so you can warm a session
+    /// once and resume it in a later run. Unset = sessions are in-memory only.
+    #[arg(long, env = "NOKK_SESSION_STORE", value_name = "DIR")]
+    session_store: Option<std::path::PathBuf>,
+
     /// For `--load`: retry up to N extra times if the response is a Cloudflare
     /// "Just a moment…" challenge (the pass is probabilistic).
     #[arg(long, default_value_t = 0)]
@@ -163,6 +170,7 @@ impl Cli {
             // The CLI always drives real traffic (one-shot fetch/load/eval or the
             // CDP server); only the library test harness stays offline.
             use_real_network: true,
+            session_store: self.session_store.clone(),
             ..Default::default()
         }
     }

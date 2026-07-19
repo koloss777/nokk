@@ -15,10 +15,11 @@
 //! land V8 and the networking stack.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use nokk_net::{
-    Client, ClientConfig, FingerprintClient, HttpClient, NetError, Request, StubClient,
+    Client, ClientConfig, FingerprintClient, HttpClient, NetError, Request, SessionJar, StubClient,
 };
 use nokk_pool::{IsolatePool, PoolError};
 use nokk_stealth::StealthProfile;
@@ -26,7 +27,7 @@ use serde_json::Value;
 
 // Re-export the types callers commonly need, so depending on `nokk`
 // is sufficient to configure and drive an engine.
-pub use nokk_net::{ProxyConfig, ProxyScheme, Response as HttpResponse};
+pub use nokk_net::{CookieRecord, ProxyConfig, ProxyScheme, Response as HttpResponse};
 pub use nokk_pool::{PoolConfig, WorkerId};
 
 /// Errors surfaced by the engine.
@@ -40,6 +41,8 @@ pub enum EngineError {
     Js(String),
     #[error("navigation is not implemented yet (Phase 2)")]
     NavNotImplemented,
+    #[error("session store error: {0}")]
+    Session(String),
 }
 
 /// Top-level engine configuration.
@@ -52,6 +55,10 @@ pub struct EngineConfig {
     /// stub. `false` keeps requests offline — the default so tests never touch
     /// the network implicitly.
     pub use_real_network: bool,
+    /// Directory in which named sessions persist their cookie jars. `None`
+    /// disables on-disk persistence — named sessions are still isolated and
+    /// shared by name for the engine's lifetime, just not saved across runs.
+    pub session_store: Option<PathBuf>,
 }
 
 struct EngineInner {
@@ -64,6 +71,11 @@ struct EngineInner {
     /// Fingerprint clients keyed by proxy, so contexts sharing a proxy share one
     /// connection pool (per-context identity without a client-per-context blow-up).
     client_pool: Mutex<HashMap<String, Client>>,
+    /// Directory where named session jars are persisted (`None` = in-memory only).
+    session_store: Option<PathBuf>,
+    /// Shared, named session cookie jars — one per session name, loaded from the
+    /// store on first use and the source of truth persisted back to disk.
+    sessions: Mutex<HashMap<String, Arc<SessionJar>>>,
     stealth: StealthProfile,
     /// JS run in every new context before any page script: the spoofed
     /// `navigator`/`window`/`screen` environment. Built once from the profile.
@@ -96,6 +108,111 @@ impl EngineInner {
         let mut pool = self.client_pool.lock().unwrap_or_else(|e| e.into_inner());
         Ok(pool.entry(key.to_string()).or_insert(client).clone())
     }
+
+    /// Filesystem path for a named session's jar, or `None` when sessions aren't
+    /// persisted or the name has no filesystem-safe form.
+    fn session_path(&self, name: &str) -> Option<PathBuf> {
+        let store = self.session_store.as_ref()?;
+        let safe = sanitize_session_name(name)?;
+        Some(store.join(format!("{safe}.json")))
+    }
+
+    /// Get-or-load the shared jar for a named session. On first use it is loaded
+    /// from disk (if a store is configured), so a warmed session resumes with its
+    /// cookies intact; subsequent contexts of the same name share the jar.
+    fn session_jar(&self, name: &str) -> Result<Arc<SessionJar>, EngineError> {
+        if let Some(j) = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+        {
+            return Ok(j.clone());
+        }
+        // Load from disk outside the lock (I/O), then re-check on insert so two
+        // first-users of the same session converge on one jar.
+        let jar = match self.session_path(name) {
+            Some(path) => Arc::new(
+                SessionJar::load_file(&path)
+                    .map_err(|e| EngineError::Session(format!("load `{name}`: {e}")))?,
+            ),
+            None => Arc::new(SessionJar::new()),
+        };
+        let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map.entry(name.to_string()).or_insert(jar).clone())
+    }
+
+    /// Build (once, then pooled) a client whose cookie jar *is* the named session
+    /// jar, so its cookies accumulate in the shared, persistable store.
+    fn client_for_session(
+        &self,
+        name: &str,
+        jar: Arc<SessionJar>,
+        proxy: Option<ProxyConfig>,
+    ) -> Result<Client, EngineError> {
+        if !self.use_real_network {
+            return Ok(self.client.clone());
+        }
+        let key = format!("session:{name}");
+        if let Some(c) = self
+            .client_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Ok(c.clone());
+        }
+        let mut cfg = self.client_config.clone();
+        cfg.proxy = proxy;
+        let client = Client::Fingerprint(FingerprintClient::with_session(&cfg, Some(jar))?);
+        let mut pool = self.client_pool.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(pool.entry(key).or_insert(client).clone())
+    }
+
+    /// Persist a named session's jar to the store now (best-effort; logs on
+    /// failure). A no-op when the session isn't persisted or not yet loaded.
+    fn save_session_blocking(&self, name: &str) {
+        let Some(path) = self.session_path(name) else {
+            return;
+        };
+        let Some(jar) = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = jar.save_file(&path) {
+            tracing::warn!(session = name, error = %e, "failed to persist session jar");
+        }
+    }
+}
+
+/// Restrict a session name to a safe single-path-segment filename — no directory
+/// separators or `..`, so a name coming from a CDP client can't escape the store.
+/// Returns `None` when nothing usable remains.
+fn sanitize_session_name(name: &str) -> Option<String> {
+    let mapped: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = mapped.trim_matches('.'); // reject "", ".", ".." and leading dots
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// Pool key for a proxy (used by [`Engine::new_context_with_proxy`] to share one
@@ -119,6 +236,11 @@ pub struct Engine {
 impl Engine {
     /// Build an engine and spawn its worker threads.
     pub fn new(config: EngineConfig) -> Result<Self, EngineError> {
+        if let Some(dir) = &config.session_store {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                EngineError::Session(format!("create store `{}`: {e}", dir.display()))
+            })?;
+        }
         let pool = IsolatePool::new(config.pool);
         let client = if config.use_real_network {
             Client::Fingerprint(FingerprintClient::new(&config.client)?)
@@ -148,6 +270,8 @@ impl Engine {
                 client_config: config.client,
                 use_real_network: config.use_real_network,
                 client_pool: Mutex::new(HashMap::new()),
+                session_store: config.session_store,
+                sessions: Mutex::new(HashMap::new()),
                 stealth: config.stealth,
                 bootstrap,
             }),
@@ -196,6 +320,33 @@ impl Engine {
         proxy: Option<ProxyConfig>,
     ) -> Result<BrowserContext, EngineError> {
         let client = self.inner.client_for(&identity, proxy)?;
+        self.build_context(client, None).await
+    }
+
+    /// Open a context bound to a named, persistent session. Its cookie jar is
+    /// loaded from the session store on first use and shared by every context of
+    /// the same `name`; it is saved back to disk when such a context closes (and
+    /// on demand via [`save_session`](Self::save_session)). Warm a session once
+    /// (log in, clear a challenge) and resume it later — even in a fresh process —
+    /// instead of re-solving each run. With no session store configured the jar
+    /// is in-memory only (still shared by name for the engine's lifetime).
+    pub async fn new_context_with_session(
+        &self,
+        name: String,
+        proxy: Option<ProxyConfig>,
+    ) -> Result<BrowserContext, EngineError> {
+        let jar = self.inner.session_jar(&name)?;
+        let client = self.inner.client_for_session(&name, jar, proxy)?;
+        self.build_context(client, Some(name)).await
+    }
+
+    /// Shared tail of context creation: acquire a slot, place on the least-loaded
+    /// worker, build the V8 context, and wrap it with an optional session name.
+    async fn build_context(
+        &self,
+        client: Client,
+        session: Option<String>,
+    ) -> Result<BrowserContext, EngineError> {
         let permit = self.inner.pool.acquire_context().await?;
         let worker = self.inner.pool.pick_worker();
         let load = self.inner.pool.register_context(worker);
@@ -214,9 +365,29 @@ impl Engine {
             index,
             base_url: std::sync::Mutex::new("about:blank".to_string()),
             requests: std::sync::Mutex::new(Vec::new()),
+            session,
             _permit: permit,
             _load: load,
         })
+    }
+
+    /// Persist a named session's cookie jar to the store immediately (in addition
+    /// to the automatic save when a session context closes). No-op without a
+    /// configured store or if the session hasn't been opened this run.
+    pub fn save_session(&self, name: &str) {
+        self.inner.save_session_blocking(name);
+    }
+
+    /// Snapshot a named session's currently-held cookies — for inspection or CDP
+    /// `Network.getCookies`. Empty if the session isn't loaded.
+    pub fn session_cookies(&self, name: &str) -> Vec<CookieRecord> {
+        self.inner
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .map(|j| j.snapshot())
+            .unwrap_or_default()
     }
 
     /// The stealth injection script for this engine's profile — the code the CDP
@@ -270,12 +441,22 @@ pub struct BrowserContext {
     /// Every network request the engine made for this context, in order — the
     /// built-in interception log (document + external scripts + page fetch/XHR).
     requests: std::sync::Mutex<Vec<NetworkRecord>>,
+    /// Name of the persistent session this context belongs to, if any. On drop
+    /// its cookie jar is flushed to the session store.
+    session: Option<String>,
     _permit: tokio::sync::OwnedSemaphorePermit,
     _load: nokk_pool::ContextLoadGuard,
 }
 
 impl Drop for BrowserContext {
     fn drop(&mut self) {
+        // Flush this context's session jar to disk so a warmed session (cookies
+        // gathered during its navigations) survives the context closing — the
+        // "warm up once, resume later" path. Best-effort; a no-op for non-session
+        // or non-persisted contexts.
+        if let Some(name) = self.session.take() {
+            self.engine.save_session_blocking(&name);
+        }
         // Dispose the V8 context on its owning worker so the isolate reclaims it.
         // Without this, create/close churn (every Puppeteer newPage/close) grows
         // the isolate's context table unbounded — a slow leak on a busy server.
@@ -736,6 +917,108 @@ mod tests {
             .unwrap();
         // A and B each got their own client; A2 reused A's; the default is separate.
         assert_eq!(engine.inner.client_pool.lock().unwrap().len(), 2);
+    }
+
+    /// A unique, empty session-store directory for a test.
+    fn session_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nokk-sess-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn session_engine(store: Option<PathBuf>, real: bool) -> Engine {
+        Engine::new(EngineConfig {
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 8,
+                max_heap_mb: None,
+            },
+            use_real_network: real,
+            session_store: store,
+            ..Default::default()
+        })
+        .expect("engine")
+    }
+
+    #[tokio::test]
+    async fn named_session_resumes_seeded_cookies_from_the_store() {
+        let _serial = serial().await;
+        let dir = session_dir("resume");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Pre-seed the on-disk jar as a *previous* run would have left it.
+        let seeded = nokk_net::SessionJar::new();
+        seeded.add_cookie_str(
+            "sid=warmed; Path=/",
+            &url::Url::parse("https://example.com/").unwrap(),
+        );
+        seeded.save_file(&dir.join("acme.json")).unwrap();
+
+        // A fresh engine opening a context on that session loads the jar back.
+        let engine = session_engine(Some(dir.clone()), false);
+        let _ctx = engine
+            .new_context_with_session("acme".into(), None)
+            .await
+            .unwrap();
+        let cookies = engine.session_cookies("acme");
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].name, "sid");
+        assert_eq!(cookies[0].value, "warmed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_context_writes_the_store() {
+        let _serial = serial().await;
+        let dir = session_dir("write");
+        let engine = session_engine(Some(dir.clone()), false);
+        let path = dir.join("acme.json");
+        assert!(!path.exists());
+        let ctx = engine
+            .new_context_with_session("acme".into(), None)
+            .await
+            .unwrap();
+        drop(ctx); // Drop flushes the jar to disk.
+        assert!(path.exists(), "session jar must be persisted on context close");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn distinct_sessions_get_isolated_clients() {
+        let _serial = serial().await;
+        // Real network so per-session clients are actually built (offline: no request).
+        let engine = session_engine(None, true);
+        let _a = engine
+            .new_context_with_session("alpha".into(), None)
+            .await
+            .unwrap();
+        let _b = engine
+            .new_context_with_session("beta".into(), None)
+            .await
+            .unwrap();
+        let _a2 = engine
+            .new_context_with_session("alpha".into(), None)
+            .await
+            .unwrap();
+        // alpha and beta each got their own session client; alpha2 reused alpha's.
+        assert_eq!(engine.inner.client_pool.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn sanitize_session_name_blocks_traversal() {
+        // Plain names pass through unchanged.
+        assert_eq!(sanitize_session_name("acme").as_deref(), Some("acme"));
+        assert_eq!(sanitize_session_name("acme-prod_1").as_deref(), Some("acme-prod_1"));
+        // Path separators are neutralised and the result stays a single segment.
+        for evil in ["a/../b", "../../etc/passwd", "/abs/path", "a\\b"] {
+            let got = sanitize_session_name(evil).unwrap();
+            assert!(!got.contains('/') && !got.contains('\\'), "{evil} -> {got}");
+            assert_ne!(got, "..");
+        }
+        // Names that reduce to nothing safe are rejected outright.
+        assert_eq!(sanitize_session_name(".."), None);
+        assert_eq!(sanitize_session_name("."), None);
+        assert_eq!(sanitize_session_name(""), None);
     }
 
     #[tokio::test]

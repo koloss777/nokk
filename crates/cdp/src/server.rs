@@ -158,10 +158,22 @@ struct Conn {
     engine: Engine,
     auto_attach: bool,
     targets: Vec<Target>,
-    /// Puppeteer browser contexts (`browser.createBrowserContext`) → the proxy
-    /// each one routes through. Targets created in a context inherit its proxy,
-    /// giving per-identity (IP + cookie jar) isolation.
-    browser_contexts: HashMap<String, Option<ProxyConfig>>,
+    /// Puppeteer browser contexts (`browser.createBrowserContext`) → their config
+    /// (proxy + optional persistent-session name). Targets created in a context
+    /// inherit it, giving per-identity (IP + cookie jar) isolation and, when a
+    /// `sessionName` was supplied, a jar that persists across runs.
+    browser_contexts: HashMap<String, BrowserContextCfg>,
+}
+
+/// Per-browser-context configuration carried from `Target.createBrowserContext`
+/// to the `Target.createTarget` calls made inside it.
+#[derive(Clone, Default)]
+struct BrowserContextCfg {
+    proxy: Option<ProxyConfig>,
+    /// A `sessionName` (non-standard param): routes pages through a named,
+    /// persistent session jar (warm up once, resume later) instead of a
+    /// per-connection in-memory identity.
+    session: Option<String>,
 }
 
 /// Parse a CDP `proxyServer` string (`scheme://[user:pass@]host:port`, scheme
@@ -369,14 +381,27 @@ impl Conn {
             "Target.createBrowserContext" => {
                 // Puppeteer's `browser.createBrowserContext({ proxyServer })`: a new
                 // isolated context (its own proxy + cookie jar). Pages created in it
-                // route through that proxy.
+                // route through that proxy. The non-standard `sessionName` param
+                // (sent via raw CDP) additionally binds it to a named persistent
+                // session, so its cookies survive across runs.
                 let proxy = params
                     .get("proxyServer")
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .and_then(parse_proxy_server);
+                let session_name = params
+                    .get("sessionName")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
                 let bcid = next_id("BC");
-                self.browser_contexts.insert(bcid.clone(), proxy);
+                self.browser_contexts.insert(
+                    bcid.clone(),
+                    BrowserContextCfg {
+                        proxy,
+                        session: session_name,
+                    },
+                );
                 vec![ok(id, &session, json!({ "browserContextId": bcid }))]
             }
             "Target.disposeBrowserContext" => {
@@ -414,15 +439,16 @@ impl Conn {
                     .and_then(|v| v.as_str())
                     .unwrap_or("about:blank")
                     .to_string();
-                // Route this page through its browser context's proxy, if any.
+                // Route this page through its browser context's proxy + session.
                 let browser_context_id = params
                     .get("browserContextId")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                let proxy = browser_context_id
+                let cfg = browser_context_id
                     .as_deref()
                     .and_then(|bc| self.browser_contexts.get(bc).cloned())
-                    .flatten();
+                    .unwrap_or_default();
+                let proxy = cfg.proxy;
                 let target_id = next_id("T");
                 let session_id = next_id("S");
                 let engine = self.engine.clone();
@@ -434,13 +460,17 @@ impl Conn {
                 // isolated (Puppeteer semantics); the default context (empty id)
                 // uses the engine's shared default client.
                 let identity = browser_context_id.clone().unwrap_or_default();
+                let session_name = cfg.session;
                 // Build the context off the read loop; the read loop registers it
-                // and replies via `register_target` once it's ready.
+                // and replies via `register_target` once it's ready. A named
+                // browser context uses a persistent session jar; otherwise the
+                // per-connection identity jar.
                 tokio::spawn(async move {
-                    let result = engine
-                        .new_context_with_identity(identity, proxy)
-                        .await
-                        .map_err(|e| e.to_string());
+                    let result = match session_name {
+                        Some(name) => engine.new_context_with_session(name, proxy).await,
+                        None => engine.new_context_with_identity(identity, proxy).await,
+                    }
+                    .map_err(|e| e.to_string());
                     let _ = reg.send(PendingTarget {
                         id,
                         session,

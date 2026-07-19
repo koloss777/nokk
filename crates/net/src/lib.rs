@@ -11,9 +11,13 @@
 //! bundled [`StubClient`] returns `Unimplemented`.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+mod session;
+pub use session::{CookieRecord, SessionJar};
 
 /// Errors from the network layer.
 #[derive(Debug, thiserror::Error)]
@@ -188,17 +192,32 @@ impl FingerprintClient {
     pub const EMULATION_OS: wreq_util::EmulationOS = wreq_util::EmulationOS::Linux;
 
     pub fn new(config: &ClientConfig) -> Result<Self, NetError> {
+        Self::with_session(config, None)
+    }
+
+    /// Like [`Self::new`], but backs the client's cookie jar with a persistent
+    /// [`SessionJar`] instead of a fresh in-memory one. Cookies set by redirects
+    /// or earlier requests (incl. any `cf_clearance`) accumulate in the shared
+    /// jar, which the caller can save to disk and reload into a later client —
+    /// the basis for warm-up-once, resume-anytime named sessions.
+    pub fn with_session(
+        config: &ClientConfig,
+        session: Option<Arc<SessionJar>>,
+    ) -> Result<Self, NetError> {
         let _ = config.fingerprint; // only ChromeDesktop today; see EMULATION
         let emulation = wreq_util::EmulationOption::builder()
             .emulation(Self::EMULATION)
             .emulation_os(Self::EMULATION_OS)
             .build();
-        let mut builder = wreq::Client::builder()
-            .emulation(emulation)
-            // In-session cookie jar: cookies set by redirects / earlier requests
-            // (incl. any `cf_clearance`) are replayed on later requests from the
-            // same engine. Cross-process persistence is a separate follow-up.
-            .cookie_store(true)
+        let mut builder = wreq::Client::builder().emulation(emulation);
+        builder = match session {
+            // A named/persistent session: cookies live in a jar the caller owns
+            // (and can serialize). Shared across contexts of the same identity.
+            Some(jar) => builder.cookie_provider(jar),
+            // Default: a private in-memory jar, replayed within this engine only.
+            None => builder.cookie_store(true),
+        };
+        builder = builder
             // Follow 3xx redirects like a real browser (wreq defaults to *none*).
             // Without this, navigating to e.g. `google.com` returns the `301
             // Moved` body instead of the destination page. Capped at 10 hops.
