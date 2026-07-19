@@ -37,6 +37,7 @@
     }
     hasChildNodes() { return this.childNodes.length > 0; }
     contains(n) { for (; n; n = n.parentNode) if (n === this) return true; return false; }
+    get isConnected() { for (let n = this; n; n = n.parentNode) if (n.nodeType === DOCUMENT_NODE) return true; return false; }
 
     appendChild(child) { return this.insertBefore(child, null); }
     insertBefore(child, ref) {
@@ -48,12 +49,13 @@
       const i = ref ? this.childNodes.indexOf(ref) : -1;
       if (i < 0) this.childNodes.push(child); else this.childNodes.splice(i, 0, child);
       child.parentNode = this;
+      __markDirty();
       return child;
     }
     removeChild(child) {
       const i = this.childNodes.indexOf(child);
       if (i < 0) throw new Error('NotFoundError: removeChild');
-      this.childNodes.splice(i, 1); child.parentNode = null; return child;
+      this.childNodes.splice(i, 1); child.parentNode = null; __markDirty(); return child;
     }
     replaceChild(nw, old) { this.insertBefore(nw, old); return this.removeChild(old); }
     remove() { if (this.parentNode) this.parentNode.removeChild(this); }
@@ -137,8 +139,8 @@
 
     // Attributes
     getAttribute(n) { const v = this._attrs.get(n.toLowerCase()); return v === undefined ? null : v; }
-    setAttribute(n, v) { this._attrs.set(n.toLowerCase(), String(v)); }
-    removeAttribute(n) { this._attrs.delete(n.toLowerCase()); }
+    setAttribute(n, v) { this._attrs.set(n.toLowerCase(), String(v)); __markDirty(); }
+    removeAttribute(n) { this._attrs.delete(n.toLowerCase()); __markDirty(); }
     hasAttribute(n) { return this._attrs.has(n.toLowerCase()); }
     getAttributeNames() { return [...this._attrs.keys()]; }
     get attributes() { return [...this._attrs].map(([name, value]) => ({ name, value })); }
@@ -173,6 +175,11 @@
     get innerHTML() { return this.childNodes.map(serializeNode).join(''); }
     set innerHTML(html) { this.childNodes = []; for (const n of parseFragment(String(html))) this.appendChild(n); }
     get outerHTML() { return serializeNode(this); }
+    // Rendered text (hidden subtrees excluded, whitespace collapsed) — an
+    // approximation of `innerText` good enough for tools that read it.
+    get innerText() { return __innerText(this); }
+    set innerText(v) { this.textContent = String(v); }
+    get outerText() { return __innerText(this); }
     insertAdjacentHTML(pos, html) {
       const nodes = parseFragment(String(html));
       if (pos === 'beforeend') for (const n of nodes) this.appendChild(n);
@@ -181,10 +188,68 @@
       else if (pos === 'afterend') for (const n of nodes.reverse()) this.parentNode.insertBefore(n, this.nextSibling);
     }
 
-    // Stubs — no layout engine.
-    getBoundingClientRect() { return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 }; }
-    focus() {} blur() {} scrollIntoView() {}
-    click() { this.dispatchEvent(new Event('click', { bubbles: true, cancelable: true })); }
+    // Synthetic layout (no real rendering): rendered elements report a non-empty
+    // box so coordinate + visibility tooling works, hidden/detached ones an empty
+    // one. See __relayout / __boxOf below.
+    getBoundingClientRect() { const r = __rectFromBox(__boxOf(this)); r.toJSON = function () { return this; }; return r; }
+    getClientRects() { const b = __boxOf(this); if (!b) return []; const r = __rectFromBox(b); r.toJSON = function () { return this; }; return [r]; }
+    get parentElement() { const p = this.parentNode; return p && p.nodeType === ELEMENT_NODE ? p : null; }
+    // Layout-metric accessors derived from the synthetic box. `documentElement`'s
+    // client size is the viewport (drivers clamp click boxes to it).
+    get clientWidth() { const d = this.ownerDocument || globalThis.document; if (d && this === d.documentElement) return LAYOUT.W; const b = __boxOf(this); return b ? b.w : 0; }
+    get clientHeight() { const d = this.ownerDocument || globalThis.document; if (d && this === d.documentElement) return LAYOUT.H; const b = __boxOf(this); return b ? b.h : 0; }
+    get clientTop() { return 0; }
+    get clientLeft() { return 0; }
+    get scrollWidth() { return this.clientWidth; }
+    get scrollHeight() { return this.clientHeight; }
+    get scrollTop() { return 0; }
+    get scrollLeft() { return 0; }
+    get offsetWidth() { const b = __boxOf(this); return b ? b.w : 0; }
+    get offsetHeight() { const b = __boxOf(this); return b ? b.h : 0; }
+    get offsetTop() { const b = __boxOf(this); return b ? b.y : 0; }
+    get offsetLeft() { const b = __boxOf(this); return b ? b.x : 0; }
+    get offsetParent() { return __boxOf(this) ? this.parentElement : null; }
+    scrollIntoView() {} scrollIntoViewIfNeeded() {}
+    focus() {
+      const doc = this.ownerDocument || globalThis.document;
+      if (!doc || doc.activeElement === this) return;
+      const prev = doc.activeElement;
+      if (prev && prev !== doc.body && prev.dispatchEvent) prev.dispatchEvent(new Event('blur'));
+      doc.activeElement = this;
+      this.dispatchEvent(new Event('focus'));
+      this.dispatchEvent(new Event('focusin', { bubbles: true }));
+    }
+    blur() {
+      const doc = this.ownerDocument || globalThis.document;
+      if (!doc || doc.activeElement !== this) return;
+      doc.activeElement = doc.body || null;
+      this.dispatchEvent(new Event('blur'));
+    }
+    // Form-field value (reflects the `value` attribute until edited). Generic so
+    // input/textarea typing works; harmless on other elements.
+    get value() { return this._value !== undefined ? this._value : (this.getAttribute('value') || ''); }
+    set value(v) { this._value = String(v); }
+    // Common form-field surface, reflected from attributes — drivers gate `fill`
+    // and `select` on these (an input with no `type`/`disabled`/`readOnly` fails
+    // Playwright's fillability check).
+    get type() { const t = (this.getAttribute('type') || '').toLowerCase(); return this.tagName === 'INPUT' ? (t || 'text') : t; }
+    set type(v) { this.setAttribute('type', v); }
+    get disabled() { return this.hasAttribute('disabled'); }
+    set disabled(v) { if (v) this.setAttribute('disabled', ''); else this.removeAttribute('disabled'); }
+    get readOnly() { return this.hasAttribute('readonly'); }
+    set readOnly(v) { if (v) this.setAttribute('readonly', ''); else this.removeAttribute('readonly'); }
+    get name() { return this.getAttribute('name') || ''; }
+    set name(v) { this.setAttribute('name', v); }
+    get placeholder() { return this.getAttribute('placeholder') || ''; }
+    get checked() { return this._checked !== undefined ? this._checked : this.hasAttribute('checked'); }
+    set checked(v) { this._checked = !!v; }
+    get selectionStart() { return String(this.value || '').length; }
+    get selectionEnd() { return String(this.value || '').length; }
+    select() {}
+    setSelectionRange() {}
+    setRangeText() {}
+    get isContentEditable() { const v = (this.getAttribute('contenteditable') || '').toLowerCase(); return v === '' || v === 'true'; }
+    click() { this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
 
     _shallowClone() { const e = new Element(this.localName); e._attrs = new Map(this._attrs); return e; }
   }
@@ -196,7 +261,10 @@
       this.documentElement = null;
       this.readyState = 'loading';
       this._cookie = '';
+      this.activeElement = null;
     }
+    elementFromPoint(x, y) { return __elementFromPoint(x, y); }
+    elementsFromPoint(x, y) { const e = __elementFromPoint(x, y); return e ? [e] : []; }
     get nodeName() { return '#document'; }
     get head() { return this.documentElement && this.documentElement.getElementsByTagName('head')[0] || null; }
     get body() { return this.documentElement && this.documentElement.getElementsByTagName('body')[0] || null; }
@@ -272,6 +340,45 @@
   class CustomEvent extends Event {
     constructor(type, init) { super(type, init); this.detail = (init && init.detail) || null; }
   }
+  class UIEvent extends Event {
+    constructor(type, init) { super(type, init); init = init || {}; this.detail = init.detail || 0; this.view = globalThis; }
+  }
+  class MouseEvent extends UIEvent {
+    constructor(type, init) {
+      init = init || {}; super(type, init);
+      this.clientX = init.clientX || 0; this.clientY = init.clientY || 0;
+      this.screenX = init.screenX || this.clientX; this.screenY = init.screenY || this.clientY;
+      this.pageX = this.clientX; this.pageY = this.clientY;
+      this.offsetX = init.offsetX || 0; this.offsetY = init.offsetY || 0;
+      this.button = init.button || 0; this.buttons = init.buttons || 0;
+      this.ctrlKey = !!init.ctrlKey; this.shiftKey = !!init.shiftKey; this.altKey = !!init.altKey; this.metaKey = !!init.metaKey;
+      this.relatedTarget = init.relatedTarget || null;
+    }
+    getModifierState(k) { return { Control: this.ctrlKey, Shift: this.shiftKey, Alt: this.altKey, Meta: this.metaKey }[k] || false; }
+  }
+  class PointerEvent extends MouseEvent {
+    constructor(type, init) { init = init || {}; super(type, init); this.pointerId = init.pointerId || 1; this.pointerType = init.pointerType || 'mouse'; this.isPrimary = init.isPrimary !== false; }
+  }
+  class KeyboardEvent extends UIEvent {
+    constructor(type, init) {
+      init = init || {}; super(type, init);
+      this.key = init.key || ''; this.code = init.code || '';
+      this.keyCode = init.keyCode || 0; this.which = init.keyCode || 0; this.charCode = init.charCode || 0;
+      this.location = init.location || 0; this.repeat = !!init.repeat;
+      this.ctrlKey = !!init.ctrlKey; this.shiftKey = !!init.shiftKey; this.altKey = !!init.altKey; this.metaKey = !!init.metaKey;
+    }
+    getModifierState(k) { return { Control: this.ctrlKey, Shift: this.shiftKey, Alt: this.altKey, Meta: this.metaKey }[k] || false; }
+  }
+  class InputEvent extends UIEvent {
+    constructor(type, init) { init = init || {}; super(type, init); this.data = init.data == null ? null : String(init.data); this.inputType = init.inputType || ''; this.isComposing = false; }
+  }
+  class FocusEvent extends UIEvent {
+    constructor(type, init) { init = init || {}; super(type, init); this.relatedTarget = init.relatedTarget || null; }
+  }
+  for (const [n, C] of [['UIEvent', UIEvent], ['MouseEvent', MouseEvent], ['PointerEvent', PointerEvent],
+    ['KeyboardEvent', KeyboardEvent], ['InputEvent', InputEvent], ['FocusEvent', FocusEvent]]) {
+    if (!globalThis[n]) globalThis[n] = C;
+  }
 
   // ---- helpers: classList, dataset, style -----------------------------------
   function makeClassList(el) {
@@ -305,12 +412,12 @@
     const map = new Map();
     return new Proxy({
       getPropertyValue: (p) => map.get(p) || '',
-      setProperty: (p, v) => map.set(p, v),
-      removeProperty: (p) => map.delete(p),
+      setProperty: (p, v) => { map.set(p, v); __markDirty(); },
+      removeProperty: (p) => { map.delete(p); __markDirty(); },
       get cssText() { return [...map].map(([k, v]) => `${k}: ${v}`).join('; '); },
     }, {
       get: (t, p) => p in t ? t[p] : (map.get(dash(String(p))) || ''),
-      set: (t, p, v) => { map.set(dash(String(p)), String(v)); return true; },
+      set: (t, p, v) => { map.set(dash(String(p)), String(v)); __markDirty(); return true; },
     });
   }
 
@@ -505,9 +612,27 @@
   // ---- install globals ------------------------------------------------------
   const document = new Document();
   globalThis.document = document;
+  // Standard Node type constants, on the constructor and the prototype — drivers
+  // check `node.nodeType !== Node.ELEMENT_NODE` before acting on a node.
+  const NODE_TYPES = {
+    ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4,
+    PROCESSING_INSTRUCTION_NODE: 7, COMMENT_NODE: 8, DOCUMENT_NODE: 9,
+    DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11,
+  };
+  Object.assign(Node, NODE_TYPES);
+  Object.assign(Node.prototype, NODE_TYPES);
   globalThis.Node = Node;
   globalThis.Element = Element;
   globalThis.HTMLElement = Element;
+  // Concrete element interfaces alias the generic Element, so their `.prototype`
+  // carries our accessors (notably `value`). Playwright's `fill` sets a field via
+  // the *native* setter it looks up on `HTMLInputElement.prototype`, so that
+  // descriptor must exist there.
+  for (const n of ['HTMLInputElement', 'HTMLTextAreaElement', 'HTMLSelectElement',
+    'HTMLButtonElement', 'HTMLAnchorElement', 'HTMLDivElement', 'HTMLSpanElement',
+    'HTMLParagraphElement', 'HTMLFormElement', 'HTMLOptionElement', 'HTMLLabelElement']) {
+    if (!globalThis[n]) globalThis[n] = Element;
+  }
   globalThis.Text = Text;
   globalThis.Comment = Comment;
   globalThis.Document = Document;
@@ -543,6 +668,7 @@
   // Called after all page scripts have run: fire DOMContentLoaded then load.
   globalThis.__pt_finishLoad = () => {
     document.readyState = 'complete';
+    if (!document.activeElement) document.activeElement = document.body || null;
     document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
     if (globalThis.onload) { try { globalThis.onload(new Event('load')); } catch (_) {} }
     const l = globalThis._listeners && globalThis._listeners['load'];
@@ -609,6 +735,166 @@
       childNodeCount: (n.childNodes || []).length, attributes: attrs
     };
   };
+  // ---- synthetic layout + interaction (no real rendering) ------------------
+  // There is no layout engine, so every rendered element is assigned a unique,
+  // deterministic one-row box in document order. That is enough for the two
+  // things drivers need: (a) a non-empty box + coordinates for visibility and
+  // click-point computation, and (b) a reversible point→element mapping so an
+  // Input mouse event at a computed coordinate hits the intended element.
+  const LAYOUT = { W: 1280, H: 720, ROW: 20 };
+  let __layoutSeq = 0;      // bumped on every DOM mutation
+  let __layoutBuilt = -1;   // __layoutSeq the current boxes were built at
+  let __rows = [];          // row index → element occupying it
+  let __mouseDownEl = null; // element that received the last mousedown
+
+  function __markDirty() { __layoutSeq++; }
+
+  function __isHiddenEl(el) {
+    if (el.hasAttribute && el.hasAttribute('hidden')) return true;
+    const s = el.style;
+    if (s) {
+      const d = String(s.display || '').toLowerCase();
+      const v = String(s.visibility || '').toLowerCase();
+      if (d === 'none' || v === 'hidden' || v === 'collapse') return true;
+    }
+    return false;
+  }
+
+  function __relayout() {
+    if (__layoutBuilt === __layoutSeq) return;
+    __layoutBuilt = __layoutSeq;
+    __rows = [];
+    let row = 0;
+    const walk = (el) => {
+      if (!el || el.nodeType !== ELEMENT_NODE) return;
+      if (__isHiddenEl(el)) return;               // display:none hides the subtree
+      el.__box = { x: 0, y: row * LAYOUT.ROW, w: LAYOUT.W, h: LAYOUT.ROW };
+      el.__boxV = __layoutBuilt;
+      __rows[row] = el;
+      row++;
+      for (const c of el.childNodes) walk(c);
+    };
+    const de = globalThis.document && globalThis.document.documentElement;
+    if (de) walk(de);
+  }
+
+  function __boxOf(el) {
+    if (!el || el.nodeType !== ELEMENT_NODE) return null;
+    __relayout();
+    return el.__boxV === __layoutBuilt ? el.__box : null; // detached/hidden → no box
+  }
+
+  function __rectFromBox(b) {
+    if (!b) return { x: 0, y: 0, left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
+    return { x: b.x, y: b.y, left: b.x, top: b.y, right: b.x + b.w, bottom: b.y + b.h, width: b.w, height: b.h };
+  }
+
+  function __elementFromPoint(x, y) {
+    __relayout();
+    if (y == null || y < 0) return null;
+    const el = __rows[Math.floor(y / LAYOUT.ROW)];
+    return el || null;
+  }
+
+  function __focusableAncestor(el) {
+    for (let e = el; e && e.nodeType === ELEMENT_NODE; e = e.parentNode) {
+      const t = e.tagName;
+      if (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT' || t === 'BUTTON') return e;
+      if (t === 'A' && e.hasAttribute('href')) return e;
+      if (e.hasAttribute('tabindex')) return e;
+      if (e.isContentEditable) return e;
+    }
+    return null;
+  }
+
+  const __quad = (b) => [b.x, b.y, b.x + b.w, b.y, b.x + b.w, b.y + b.h, b.x, b.y + b.h];
+
+  // Visible text of an element: skip hidden subtrees, gather text nodes, collapse
+  // runs of whitespace. Not a full innerText (no per-block newlines) but enough
+  // for reading rendered text.
+  function __innerText(el) {
+    if (!el || el.nodeType !== ELEMENT_NODE || __isHiddenEl(el)) return '';
+    let s = '';
+    for (const c of el.childNodes) {
+      if (c.nodeType === TEXT_NODE) s += c.data;
+      else if (c.nodeType === ELEMENT_NODE && !__isHiddenEl(c)) s += ' ' + __innerText(c);
+    }
+    return s.replace(/\s+/g, ' ').trim();
+  }
+
+  // Called from the CDP layer (server.rs). Nodes are resolved there and passed in.
+  globalThis.__pt_layoutMetrics = () => ({ w: LAYOUT.W, h: LAYOUT.H });
+  globalThis.__pt_boxModel = (n) => {
+    const b = __boxOf(n); if (!b) return null;
+    const q = __quad(b);
+    return { content: q, padding: q, border: q, margin: q, width: b.w, height: b.h };
+  };
+  globalThis.__pt_contentQuads = (n) => { const b = __boxOf(n); return b ? [__quad(b)] : []; };
+  globalThis.__pt_focusNode = (n) => { if (n && n.focus) { n.focus(); return true; } return false; };
+
+  // A mouse action at (x,y): resolve the topmost element there and fire the
+  // matching pointer + mouse events, synthesizing `click` on release over the
+  // same element that received the press (as a real browser does).
+  globalThis.__pt_mouse = (type, x, y, button, clickCount) => {
+    const el = __elementFromPoint(x, y) || (globalThis.document && globalThis.document.body);
+    if (!el) return false;
+    const b = button === 'right' ? 2 : button === 'middle' ? 1 : (button | 0);
+    const base = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: b, detail: clickCount || 1 };
+    if (type === 'mousePressed') {
+      el.dispatchEvent(new PointerEvent('pointerdown', { ...base, buttons: 1 }));
+      el.dispatchEvent(new MouseEvent('mousedown', { ...base, buttons: 1 }));
+      const f = __focusableAncestor(el);
+      if (f) f.focus(); else if (globalThis.document) { const a = globalThis.document.activeElement; if (a && a.blur) a.blur(); }
+      __mouseDownEl = el;
+    } else if (type === 'mouseReleased') {
+      el.dispatchEvent(new PointerEvent('pointerup', base));
+      el.dispatchEvent(new MouseEvent('mouseup', base));
+      if (__mouseDownEl === el) el.dispatchEvent(new MouseEvent('click', base));
+      __mouseDownEl = null;
+    } else if (type === 'mouseMoved') {
+      el.dispatchEvent(new PointerEvent('pointermove', base));
+      el.dispatchEvent(new MouseEvent('mousemove', base));
+    }
+    return true;
+  };
+
+  const __editable = (el) => el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+  function __insertInto(el, text) {
+    if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+      el.value = (el.value || '') + text;
+    } else if (el.isContentEditable) {
+      el.textContent = (el.textContent || '') + text;
+    } else return false;
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
+    return true;
+  }
+  globalThis.__pt_insertText = (text) => {
+    const el = globalThis.document && globalThis.document.activeElement;
+    return __editable(el) ? __insertInto(el, String(text)) : false;
+  };
+
+  // A key action on the focused element. Fires keydown/keyup (+ keypress for a
+  // printable key), and mirrors real editing side effects: printable `text`
+  // is inserted, Backspace deletes the last char, both raising `input`.
+  globalThis.__pt_key = (type, init) => {
+    init = init || {};
+    const doc = globalThis.document;
+    const el = (doc && doc.activeElement) || (doc && doc.body);
+    if (!el) return false;
+    const name = { keyDown: 'keydown', rawKeyDown: 'keydown', keyUp: 'keyup', char: 'keypress' }[type] || type;
+    const ev = { bubbles: true, cancelable: true, key: init.key || '', code: init.code || '', keyCode: init.keyCode || 0 };
+    el.dispatchEvent(new KeyboardEvent(name, ev));
+    if (name === 'keydown') {
+      if (init.text) { if (__editable(el)) __insertInto(el, init.text); }
+      else if (init.key === 'Backspace' && __editable(el)) {
+        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') el.value = String(el.value || '').slice(0, -1);
+        else el.textContent = String(el.textContent || '').slice(0, -1);
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+      }
+    }
+    return true;
+  };
+
   globalThis.__pt_getProps = (id) => {
     const o = __ptObjs.get(id); const out = [];
     if (o != null) {

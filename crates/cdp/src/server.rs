@@ -207,6 +207,22 @@ fn parse_proxy_server(s: &str) -> Option<ProxyConfig> {
     })
 }
 
+/// A JS expression resolving the CDP node referenced by `params` (an `objectId`
+/// handle or a `backendNodeId`/`nodeId`) to its live DOM node, or `null`.
+fn node_ref(params: &Value) -> String {
+    if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
+        format!("__pt_objGet({})", js_str(oid))
+    } else if let Some(bid) = params
+        .get("backendNodeId")
+        .or_else(|| params.get("nodeId"))
+        .and_then(|v| v.as_i64())
+    {
+        format!("__pt_nodeById({bid})")
+    } else {
+        "null".to_string()
+    }
+}
+
 /// A `Target.createTarget` whose context is being built off the read loop. The
 /// engine work runs on a spawned task; the read loop registers the finished
 /// target and sends the reply, so a slow/queued `new_context()` (under worker
@@ -856,6 +872,112 @@ impl Conn {
                     "localName": "", "nodeValue": "", "childNodeCount": 1
                 }}),
             )],
+            // Box model / content quads: the synthetic layout's box for a node, so
+            // Puppeteer/Playwright can compute a clickable point. An empty box
+            // (hidden/detached) → the "not clickable" errors the drivers expect.
+            "DOM.getBoxModel" => {
+                let nref = node_ref(params);
+                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let js = format!("JSON.stringify(__pt_boxModel({nref}))");
+                    let msg = match ctx.evaluate(&js).await {
+                        Ok(Value::String(ref s)) if s != "null" => {
+                            match serde_json::from_str::<Value>(s) {
+                                Ok(model) if !model.is_null() => {
+                                    ok(id, &session, json!({ "model": model }))
+                                }
+                                _ => err(id, &session, -32000, "Could not compute box model."),
+                            }
+                        }
+                        _ => err(id, &session, -32000, "Could not compute box model."),
+                    };
+                    let _ = tx.send(Message::Text(msg.to_string()));
+                });
+                vec![]
+            }
+            "DOM.getContentQuads" => {
+                let nref = node_ref(params);
+                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let js = format!("JSON.stringify(__pt_contentQuads({nref}))");
+                    let quads = match ctx.evaluate(&js).await {
+                        Ok(Value::String(s)) => serde_json::from_str(&s).unwrap_or(json!([])),
+                        _ => json!([]),
+                    };
+                    let _ = tx.send(Message::Text(
+                        ok(id, &session, json!({ "quads": quads })).to_string(),
+                    ));
+                });
+                vec![]
+            }
+            "DOM.focus" => {
+                let nref = node_ref(params);
+                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let _ = ctx.evaluate(&format!("__pt_focusNode({nref})")).await;
+                    let _ = tx.send(Message::Text(ok(id, &session, json!({})).to_string()));
+                });
+                vec![]
+            }
+            "DOM.scrollIntoViewIfNeeded" => vec![ok(id, session, json!({}))],
+            "Page.getLayoutMetrics" => {
+                let vp = json!({ "pageX": 0, "pageY": 0, "clientWidth": 1280, "clientHeight": 720 });
+                let visual = json!({ "offsetX": 0, "offsetY": 0, "pageX": 0, "pageY": 0,
+                    "clientWidth": 1280, "clientHeight": 720, "scale": 1, "zoom": 1 });
+                let content = json!({ "x": 0, "y": 0, "width": 1280, "height": 720 });
+                vec![ok(id, session, json!({
+                    "layoutViewport": vp, "visualViewport": visual, "contentSize": content,
+                    "cssLayoutViewport": vp, "cssVisualViewport": visual, "cssContentSize": content,
+                }))]
+            }
+            // Input domain: translate coordinate/key events into DOM events via the
+            // synthetic layout's point→element hit-test (see __pt_mouse/__pt_key).
+            "Input.dispatchMouseEvent" => {
+                let mtype = params.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let button = params.get("button").and_then(|v| v.as_str()).unwrap_or("left").to_string();
+                let clicks = params.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(1);
+                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let js = format!(
+                        "__pt_mouse({}, {}, {}, {}, {})",
+                        js_str(&mtype), x, y, js_str(&button), clicks
+                    );
+                    let _ = ctx.evaluate(&js).await;
+                    let _ = ctx.run_event_loop().await; // let click handlers settle
+                    let _ = tx.send(Message::Text(ok(id, &session, json!({})).to_string()));
+                });
+                vec![]
+            }
+            "Input.dispatchKeyEvent" => {
+                let ktype = params.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let key = params.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let code = params.get("code").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let kc = params.get("windowsVirtualKeyCode").and_then(|v| v.as_i64()).unwrap_or(0);
+                let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let js = format!(
+                        "__pt_key({}, {{ key: {}, code: {}, keyCode: {}, text: {} }})",
+                        js_str(&ktype), js_str(&key), js_str(&code), kc, js_str(&text)
+                    );
+                    let _ = ctx.evaluate(&js).await;
+                    let _ = ctx.run_event_loop().await;
+                    let _ = tx.send(Message::Text(ok(id, &session, json!({})).to_string()));
+                });
+                vec![]
+            }
+            "Input.insertText" => {
+                let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let _ = ctx.evaluate(&format!("__pt_insertText({})", js_str(&text))).await;
+                    let _ = ctx.run_event_loop().await;
+                    let _ = tx.send(Message::Text(ok(id, &session, json!({})).to_string()));
+                });
+                vec![]
+            }
             // Lenient default: empty result keeps Puppeteer's promise chain alive.
             _ => vec![ok(id, session, json!({}))],
         }
@@ -883,15 +1005,24 @@ async fn remote_eval(
     let src = js_str(expr);
     let js = if await_promise {
         // Resolve the (possibly-Promise) value via the event loop, then wrap it.
-        let setup = format!("globalThis.__cdp = (0, eval)({src});");
+        // The await path spans several `evaluate` calls with event-loop turns in
+        // between, during which *other* concurrently-dispatched commands run on
+        // the same context. A shared global would be clobbered mid-flight (two
+        // overlapping evaluates racing on it), so each call gets a unique slot.
+        let slot = format!("__cdp_{}", IDS.fetch_add(1, Ordering::Relaxed));
+        let setup = format!("globalThis.{slot} = (0, eval)({src});");
         if ctx.evaluate(&setup).await.is_err() {
             return json!({ "type": "undefined" });
         }
         let _ = ctx
-            .evaluate("Promise.resolve(globalThis.__cdp).then(v => { globalThis.__cdp = v; }, e => { globalThis.__cdp = String(e); });")
+            .evaluate(&format!(
+                "Promise.resolve(globalThis.{slot}).then(v => {{ globalThis.{slot} = v; }}, e => {{ globalThis.{slot} = String(e); }});"
+            ))
             .await;
         let _ = ctx.run_event_loop().await;
-        format!("JSON.stringify(__pt_wrap(globalThis.__cdp, {by}))")
+        format!(
+            "(() => {{ const v = globalThis.{slot}; delete globalThis.{slot}; return JSON.stringify(__pt_wrap(v, {by})); }})()"
+        )
     } else {
         format!(
             "(() => {{ try {{ return JSON.stringify(__pt_wrap((0, eval)({src}), {by})); }} \
