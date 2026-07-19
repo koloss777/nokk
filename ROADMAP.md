@@ -94,7 +94,18 @@ Keep in JS (the advantage is real):
   `<script>document.write(x)</script>` idiom populates in place instead of no-op'ing.
   (Dynamically written `<script>` tags are inserted but not executed.)
 - ⬜ **`window`-targeted `DOMContentLoaded`** and a more complete event path.
-- ⬜ **Playwright compatibility** (`newPage`, its CDP dialect).
+- 🟡 **Playwright compatibility** (`chromium.connectOverCDP`). The core surface works:
+  `newPage`, `goto`, `evaluate` (with args), `$eval`/`$$eval`, `getAttribute`, `textContent`,
+  `content`, `locator.count`, `waitForSelector({ state: 'attached' })`. Two Chrome-accuracy
+  fixes made it connect: (1) `Target.createTarget` now emits `targetCreated`/`attachedToTarget`
+  **before** the reply (Playwright's `newPage` reads `_crPages` the instant the reply lands);
+  (2) `Runtime.evaluate`/`callFunctionOn` now run the source as a *script* via indirect `eval`
+  instead of splicing it as a sub-expression — Playwright's IIFE-with-trailing-`;` and
+  `//# sourceURL=` forms broke the old wrapping. Both also make Puppeteer more correct.
+  **Still open:** visibility/actionability-gated ops (`click`, `isVisible`, `innerText`,
+  `boundingBox`, default `waitForSelector({ state: 'visible' })`) — Playwright's injected script
+  computes visibility from a real box model and `DOM.getBoxModel`, which a non-rendering engine
+  lacks; needs a layout/box-model approximation and the `Input` domain.
 
 ## Scaling & concurrency (Phase 7)
 
