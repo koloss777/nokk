@@ -1155,6 +1155,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interaction_click_and_type_via_synthetic_layout() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        let html = r#"<!DOCTYPE html><html><head><title>i</title></head><body>
+            <button id="btn">go</button><div id="out">idle</div>
+            <input id="inp" type="text" value="">
+            <script>
+              document.getElementById('btn').addEventListener('click', function () {
+                document.getElementById('out').textContent = 'clicked';
+              });
+            </script></body></html>"#;
+        ctx.load_html("https://example.com/", html).await.unwrap();
+
+        // Rendered elements report a non-empty synthetic box and are connected.
+        assert_eq!(
+            ctx.evaluate("document.getElementById('btn').getBoundingClientRect().width > 0")
+                .await
+                .unwrap(),
+            Value::String("true".into())
+        );
+        assert_eq!(
+            ctx.evaluate("document.getElementById('btn').isConnected")
+                .await
+                .unwrap(),
+            Value::String("true".into())
+        );
+
+        // A synthetic mouse press+release at the button's centre hit-tests back to
+        // it and fires its click handler.
+        let click = "(() => { const r = document.getElementById('btn').getBoundingClientRect(); \
+            const x = r.x + r.width / 2, y = r.y + r.height / 2; \
+            __pt_mouse('mousePressed', x, y, 'left', 1); __pt_mouse('mouseReleased', x, y, 'left', 1); \
+            return document.getElementById('out').textContent; })()";
+        assert_eq!(
+            ctx.evaluate(click).await.unwrap(),
+            Value::String("clicked".into())
+        );
+
+        // Focusing the input and inserting text updates its value and fires input.
+        let typing = "(() => { __pt_focusNode(document.getElementById('inp')); \
+            __pt_insertText('hi'); return document.getElementById('inp').value; })()";
+        assert_eq!(
+            ctx.evaluate(typing).await.unwrap(),
+            Value::String("hi".into())
+        );
+    }
+
+    #[tokio::test]
     async fn intl_is_shimmed_and_does_not_crash() {
         let _serial = serial().await;
         let engine = engine(1, 2);

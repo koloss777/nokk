@@ -94,18 +94,27 @@ Keep in JS (the advantage is real):
   `<script>document.write(x)</script>` idiom populates in place instead of no-op'ing.
   (Dynamically written `<script>` tags are inserted but not executed.)
 - ⬜ **`window`-targeted `DOMContentLoaded`** and a more complete event path.
-- 🟡 **Playwright compatibility** (`chromium.connectOverCDP`). The core surface works:
-  `newPage`, `goto`, `evaluate` (with args), `$eval`/`$$eval`, `getAttribute`, `textContent`,
-  `content`, `locator.count`, `waitForSelector({ state: 'attached' })`. Two Chrome-accuracy
-  fixes made it connect: (1) `Target.createTarget` now emits `targetCreated`/`attachedToTarget`
-  **before** the reply (Playwright's `newPage` reads `_crPages` the instant the reply lands);
-  (2) `Runtime.evaluate`/`callFunctionOn` now run the source as a *script* via indirect `eval`
-  instead of splicing it as a sub-expression — Playwright's IIFE-with-trailing-`;` and
-  `//# sourceURL=` forms broke the old wrapping. Both also make Puppeteer more correct.
-  **Still open:** visibility/actionability-gated ops (`click`, `isVisible`, `innerText`,
-  `boundingBox`, default `waitForSelector({ state: 'visible' })`) — Playwright's injected script
-  computes visibility from a real box model and `DOM.getBoxModel`, which a non-rendering engine
-  lacks; needs a layout/box-model approximation and the `Input` domain.
+- 🟡 **Playwright compatibility** (`chromium.connectOverCDP`) — the read *and* interaction
+  surface works: `newPage`, `goto`, `evaluate` (with args), `$eval`/`$$eval`, `getAttribute`,
+  `textContent`, `content`, `count`, `waitForSelector` (incl. default `visible`), `isVisible`,
+  `boundingBox`, **`click`**, and **`fill`**. Connecting took two Chrome-accuracy fixes:
+  (1) `Target.createTarget` emits `targetCreated`/`attachedToTarget` **before** the reply
+  (Playwright reads `_crPages` the instant it lands); (2) `Runtime.evaluate`/`callFunctionOn`
+  run the source as a *script* via indirect `eval` (its IIFE-with-trailing-`;` and
+  `//# sourceURL=` forms broke inline splicing). Interaction took the synthetic layout + `Input`
+  domain below. A concurrency race was also fixed: overlapping `awaitPromise` evaluates shared
+  one global and clobbered each other — each now gets a unique result slot.
+  **Still open:** `page.innerText` via the locator API times out (the `$eval`/`textContent`
+  paths work), and Playwright's full actionability (stability/occlusion) is only approximated.
+- ✅ **Interaction: synthetic layout + `Input` domain.** With no renderer, every rendered
+  element gets a deterministic one-row box (`getBoundingClientRect`/`getClientRects`/`offset*`/
+  `clientWidth/Height`), and `document.elementFromPoint` reverses a coordinate back to an
+  element. On top of that: CDP `DOM.getBoxModel`/`getContentQuads`/`focus`,
+  `Page.getLayoutMetrics`, and `Input.dispatchMouseEvent`/`dispatchKeyEvent`/`insertText`, which
+  hit-test a point to an element and fire real DOM `pointer`/`mouse`/`keyboard`/`input` events
+  (plus `focus`/`activeElement`, `MouseEvent`/`KeyboardEvent`/… constructors, `isConnected`,
+  `Node` type constants, and the form-field surface `value`/`type`/`disabled`/…). Verified live:
+  Puppeteer `click`+`type` and Playwright `click`+`fill`+`isVisible` drive a real page.
 
 ## Scaling & concurrency (Phase 7)
 
