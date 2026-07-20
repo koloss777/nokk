@@ -63,7 +63,17 @@ would flag today. Closing them is the top priority — coherence is the whole po
   (while staying callable), `webdriver` false and not an own property, `[native code]` for
   every page-visible function and accessor, and intact `instanceof` chains. Verified to
   *fail* on reintroduced drift, so hardening can't silently regress.
-- ⬜ **`performance.now()` / `timeOrigin` / `performance.timing`** coherent with wall clock.
+- ✅ **`performance` coherent with the wall clock.** Was a bare object with
+  `timeOrigin === 0` and `now()` pinned to the virtual-timer clock — trivially caught by
+  the standard cross-check. Now a real `Performance` instance (no own properties,
+  `[object Performance]`, `instanceof`) whose `timeOrigin` is the context's epoch ms and
+  whose `now()` is a monotonic, 0.1 ms-coarsened `DOMHighResTimeStamp` off the same clock,
+  so `timeOrigin + now()` tracks `Date.now()` exactly. Adds ordered legacy
+  `timing`/`navigation` milestones, Chrome's `memory`, and the `getEntries*`/`mark`/
+  `measure` surface; `requestAnimationFrame` now passes a real high-res timestamp.
+  Regression-tested (verified to fail on `timeOrigin === 0`).
+  (Collapsed virtual-time timers still don't advance the shared clock — a page that times
+  its own `setTimeout` sees it fire early; that is inherent to the virtual-time design.)
 
 ## Architecture: move detectable surfaces to native (Rust)
 

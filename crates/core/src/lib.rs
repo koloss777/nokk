@@ -1285,6 +1285,88 @@ mod tests {
         );
     }
 
+    /// `performance` must agree with the wall clock and look like Chrome's. The
+    /// old shim was a bare object with `timeOrigin === 0` and a `now()` frozen at
+    /// the virtual-timer clock — trivially detectable, since real Chrome satisfies
+    /// `timeOrigin + now() ≈ Date.now()`.
+    #[tokio::test]
+    async fn performance_is_coherent_with_the_wall_clock() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+
+        let p = probe(
+            &ctx,
+            r#"JSON.stringify({
+              own: Object.getOwnPropertyNames(performance),
+              timingOwn: Object.getOwnPropertyNames(performance.timing),
+              tag: Object.prototype.toString.call(performance),
+              isInstance: performance instanceof Performance,
+              timeOrigin: performance.timeOrigin,
+              skew: Math.abs(performance.timeOrigin + performance.now() - Date.now()),
+              monotonic: (() => { const a = performance.now(); return performance.now() >= a; })(),
+              ordered: (t => t.loadEventEnd >= t.domComplete && t.domComplete >= t.domInteractive
+                        && t.domInteractive >= t.responseEnd && t.responseEnd >= t.requestStart
+                        && t.requestStart >= t.navigationStart)(performance.timing),
+              navigationStartAtOrigin: performance.timing.navigationStart === performance.timeOrigin,
+              navType: performance.navigation.type,
+              heapLimit: performance.memory.jsHeapSizeLimit,
+              entriesIsArray: Array.isArray(performance.getEntries()),
+              natives: {
+                now: performance.now.toString(),
+                Performance: Performance.toString(),
+                timeOriginGetter: Object.getOwnPropertyDescriptor(Performance.prototype, 'timeOrigin').get.toString()
+              }
+            })"#,
+        )
+        .await;
+
+        // Like every other object we hand out, state lives on the prototype.
+        for key in ["own", "timingOwn"] {
+            let leaked = p[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("probe missing {key}"));
+            assert!(
+                leaked.is_empty(),
+                "{key} exposes own properties: {leaked:?}"
+            );
+        }
+        assert_eq!(p["tag"], "[object Performance]");
+        assert_eq!(p["isInstance"], true);
+
+        // `timeOrigin` is a real epoch timestamp, not 0, and the pair tracks the
+        // wall clock — the cross-check a fingerprinter actually runs.
+        let origin = p["timeOrigin"].as_f64().expect("timeOrigin is a number");
+        assert!(
+            (1.7e12..4.0e12).contains(&origin),
+            "timeOrigin is not a plausible epoch ms: {origin}"
+        );
+        let skew = p["skew"].as_f64().expect("skew is a number");
+        assert!(
+            skew < 50.0,
+            "timeOrigin + now() drifts from Date.now() by {skew}ms"
+        );
+        assert_eq!(p["monotonic"], true, "performance.now() went backwards");
+
+        // Legacy navigation timing: present, ordered, anchored at the origin.
+        assert_eq!(
+            p["ordered"], true,
+            "performance.timing milestones are out of order"
+        );
+        assert_eq!(p["navigationStartAtOrigin"], true);
+        assert_eq!(p["navType"], 0);
+        assert!(
+            p["heapLimit"].as_f64().unwrap_or(0.0) > 0.0,
+            "performance.memory missing"
+        );
+        assert_eq!(p["entriesIsArray"], true);
+
+        for (name, src) in p["natives"].as_object().expect("natives object") {
+            let src = src.as_str().unwrap_or_default();
+            assert!(src.contains("[native code]"), "{name} is not masked: {src}");
+        }
+    }
+
     #[tokio::test]
     async fn interaction_click_and_type_via_synthetic_layout() {
         let _serial = serial().await;
