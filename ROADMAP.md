@@ -57,6 +57,18 @@ would flag today. Closing them is the top priority — coherence is the whole po
   behind prototype accessors named so `toString` reads `function get nodeType() {
   [native code] }`. `document`'s `defaultView`/`visibilityState`/`hidden`/`currentScript`
   moved to the prototype too, and the DOM's event constructors are now masked as native.
+- ✅ **Canvas output depends on what was drawn.** `toDataURL()` returned one fixed
+  string and `getImageData` fixed noise, so an empty canvas and an elaborate drawing
+  hashed *identically* — and canvas fingerprinting is precisely a differential probe
+  (draw, hash, compare), so that was caught instantly. The 2D context now keeps a real
+  pixel buffer: `fillRect`/`clearRect`/`putImageData` render exactly (fill red, read the
+  pixel back, get red), and operations we cannot rasterise — text, paths, images — stamp a
+  deterministic pattern over the area they cover, derived from the draw-operation log plus
+  the per-session seed. So different drawings differ, an identical drawing stays stable
+  (which fingerprint consistency needs), and results vary across sessions the way device
+  text rendering does. `toDataURL` is a genuine PNG, encoded natively in Rust. Verified
+  against the canonical BrowserLeaks canvas routine. (Text/paths are still not truly
+  rasterised: a probe checking specific glyph pixels would see synthesised content.)
 - ✅ **Fingerprint regression tests** — a probe asserts the whole surface: no own
   properties on DOM/event/document/navigator instances, no `__pt_*` bridge global
   reachable via `getOwnPropertyNames`/`ownKeys`/`getOwnPropertyDescriptor`/`hasOwnProperty`

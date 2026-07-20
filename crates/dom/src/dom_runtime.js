@@ -269,6 +269,13 @@
     get name() { return this.getAttribute('name') || ''; }
     set name(v) { this.setAttribute('name', v); }
     get placeholder() { return this.getAttribute('placeholder') || ''; }
+    // Reflected dimension attributes. Without these, `canvas.width = 200` would
+    // create an *own* property on the element (real ones are prototype
+    // accessors), which is exactly the tell we hide everywhere else.
+    get width() { const v = parseInt(this.getAttribute('width'), 10); return Number.isFinite(v) ? v : (this.tagName === 'CANVAS' ? 300 : 0); }
+    set width(v) { this.setAttribute('width', String(Math.max(0, v | 0))); }
+    get height() { const v = parseInt(this.getAttribute('height'), 10); return Number.isFinite(v) ? v : (this.tagName === 'CANVAS' ? 150 : 0); }
+    set height(v) { this.setAttribute('height', String(Math.max(0, v | 0))); }
     get checked() { return this.__ptChecked !== undefined ? this.__ptChecked : this.hasAttribute('checked'); }
     set checked(v) { this.__ptChecked = !!v; }
     get selectionStart() { return String(this.value || '').length; }

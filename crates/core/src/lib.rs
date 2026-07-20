@@ -1469,6 +1469,96 @@ mod tests {
         assert_eq!(p["rejects"], "NotSupportedError");
     }
 
+    /// Canvas fingerprinting is differential: draw something, hash `toDataURL()`,
+    /// compare. This used to return one fixed string, so an empty canvas and an
+    /// elaborate drawing hashed identically — the probe catches that instantly.
+    /// The output now derives from what was actually drawn, solid fills are
+    /// rendered exactly, and an identical drawing still hashes the same (which
+    /// fingerprint stability requires).
+    #[tokio::test]
+    async fn canvas_output_depends_on_what_was_drawn() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+
+        let p = probe(
+            &ctx,
+            r#"(() => {
+              const mk = (draw) => {
+                const c = document.createElement('canvas');
+                c.width = 200; c.height = 50;
+                draw(c.getContext('2d'));
+                return c;
+              };
+              const a = mk(g => { g.fillStyle = '#ff0000'; g.fillRect(0,0,100,50); g.fillText('hello', 10, 20); });
+              const b = mk(g => { g.fillStyle = '#0000ff'; g.fillRect(0,0,10,10); g.fillText('COMPLETELY different', 2, 40); });
+              const again = mk(g => { g.fillStyle = '#ff0000'; g.fillRect(0,0,100,50); g.fillText('hello', 10, 20); });
+              const blank = mk(() => {});
+              const filled = a.getContext('2d').getImageData(5, 5, 1, 1).data;
+              const untouched = a.getContext('2d').getImageData(199, 49, 1, 1).data;
+              return JSON.stringify({
+                differ: a.toDataURL() !== b.toDataURL(),
+                blankDiffers: blank.toDataURL() !== a.toDataURL(),
+                stable: a.toDataURL() === again.toDataURL(),
+                isPng: a.toDataURL().slice(0, 22) === 'data:image/png;base64,',
+                grows: a.toDataURL().length > blank.toDataURL().length,
+                filledPixel: Array.from(filled),
+                untouchedPixel: Array.from(untouched),
+                dims: [a.width, a.height],
+                canvasOwn: Object.getOwnPropertyNames(a)
+              });
+            })()"#,
+        )
+        .await;
+
+        // The property the probe actually tests.
+        assert_eq!(
+            p["differ"], true,
+            "two different drawings produced the same canvas hash"
+        );
+        assert_eq!(
+            p["blankDiffers"], true,
+            "an empty canvas hashed the same as a drawn one"
+        );
+        // ...without losing the stability a real fingerprint has.
+        assert_eq!(
+            p["stable"], true,
+            "the same drawing hashed differently twice"
+        );
+
+        // A real PNG of the canvas, whose size tracks its content.
+        assert_eq!(p["isPng"], true, "toDataURL is not a PNG data URL");
+        assert_eq!(
+            p["grows"], true,
+            "drawn canvas did not encode larger than a blank one"
+        );
+        assert_eq!(
+            p["dims"],
+            serde_json::json!([200, 50]),
+            "canvas dimensions not reflected"
+        );
+
+        // Solid fills are rendered exactly: filling red and reading the pixel back
+        // returns red, and an untouched corner stays transparent.
+        assert_eq!(
+            p["filledPixel"],
+            serde_json::json!([255, 0, 0, 255]),
+            "fillRect did not render its colour"
+        );
+        assert_eq!(
+            p["untouchedPixel"],
+            serde_json::json!([0, 0, 0, 0]),
+            "an undrawn pixel was not transparent"
+        );
+
+        // Setting width/height and taking a context must not leave own properties.
+        let leaked = p["canvasOwn"].as_array().expect("canvasOwn");
+        assert!(
+            leaked.is_empty(),
+            "canvas exposes own properties: {leaked:?}"
+        );
+    }
+
     #[tokio::test]
     async fn interaction_click_and_type_via_synthetic_layout() {
         let _serial = serial().await;
