@@ -1559,6 +1559,93 @@ mod tests {
         );
     }
 
+    /// WebGL fingerprinting renders a scene and reads it back. Every GL call used
+    /// to be a no-op, so `readPixels` returned zeroes regardless and two different
+    /// scenes compared equal — the same differential tell the 2D canvas had. The
+    /// identity strings (vendor/renderer/ANGLE) were already right; this pins both.
+    #[tokio::test]
+    async fn webgl_readback_reflects_what_was_rendered() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+
+        let p = probe(
+            &ctx,
+            r#"(() => {
+              const mk = (r, g, b) => {
+                const c = document.createElement('canvas'); c.width = 64; c.height = 64;
+                const gl = c.getContext('webgl');
+                gl.clearColor(r, g, b, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+                const out = new Uint8Array(16);
+                gl.readPixels(0, 0, 2, 2, gl.RGBA, gl.UNSIGNED_BYTE, out);
+                return { canvas: c, gl, px: Array.from(out) };
+              };
+              const red = mk(1, 0, 0), blue = mk(0, 0, 1), red2 = mk(1, 0, 0);
+              const blank = document.createElement('canvas'); blank.width = 64; blank.height = 64;
+              const dbg = red.gl.getExtension('WEBGL_debug_renderer_info');
+              return JSON.stringify({
+                redPixels: red.px.slice(0, 4),
+                differ: red.px.join() !== blue.px.join(),
+                stable: red.px.join() === red2.px.join(),
+                notBlank: red.canvas.toDataURL() !== blank.toDataURL(),
+                vendor: red.gl.getParameter(red.gl.VENDOR),
+                renderer: red.gl.getParameter(red.gl.RENDERER),
+                unmasked: dbg ? red.gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : null,
+                maxTexture: red.gl.getParameter(red.gl.MAX_TEXTURE_SIZE),
+                extensions: (red.gl.getSupportedExtensions() || []).length,
+                // A canvas keeps one context type, as in a real browser.
+                conflictingContext: red.canvas.getContext('2d'),
+                canvasOwn: Object.getOwnPropertyNames(red.canvas)
+              });
+            })()"#,
+        )
+        .await;
+
+        // Clearing to red must read back red — the readback tracks the render.
+        assert_eq!(
+            p["redPixels"],
+            serde_json::json!([255, 0, 0, 255]),
+            "clearColor+clear did not show up in readPixels"
+        );
+        assert_eq!(
+            p["differ"], true,
+            "two differently-cleared contexts read back identically"
+        );
+        assert_eq!(
+            p["stable"], true,
+            "the same render read back differently twice"
+        );
+        assert_eq!(
+            p["notBlank"], true,
+            "a rendered WebGL canvas encoded the same as a blank one"
+        );
+
+        // The identity surface a fingerprinter reads stays Chrome-shaped.
+        assert_eq!(p["vendor"], "WebKit");
+        assert_eq!(p["renderer"], "WebKit WebGL");
+        assert!(
+            p["unmasked"].as_str().unwrap_or_default().contains("ANGLE"),
+            "UNMASKED_RENDERER_WEBGL is not an ANGLE string: {:?}",
+            p["unmasked"]
+        );
+        assert_eq!(p["maxTexture"], 16384);
+        assert!(
+            p["extensions"].as_u64().unwrap_or(0) > 20,
+            "implausibly few WebGL extensions"
+        );
+
+        // Asking for a conflicting context type yields null, not a second context.
+        assert!(
+            p["conflictingContext"].is_null(),
+            "canvas handed out a second context type"
+        );
+        let leaked = p["canvasOwn"].as_array().expect("canvasOwn");
+        assert!(
+            leaked.is_empty(),
+            "canvas exposes own properties: {leaked:?}"
+        );
+    }
+
     #[tokio::test]
     async fn interaction_click_and_type_via_synthetic_layout() {
         let _serial = serial().await;
