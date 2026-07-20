@@ -49,9 +49,21 @@ would flag today. Closing them is the top priority — coherence is the whole po
   named access + iterator), entries are `Plugin`/`MimeType`; `connection.type` (mobile-only)
   removed. Methods read native (#1). Regression-tested. (Canvas/WebGL method-on-prototype
   placement still open.)
+- ✅ **DOM instances expose no own properties.** A real node, event or `document`
+  reports `Object.getOwnPropertyNames(…) === []` — ours were leaking their guts
+  (`nodeType`, `childNodes`, `parentNode`, `ownerDocument`, `_listeners`, `tagName`,
+  `localName`, `_attrs`, `style`, and every `Event`/`MouseEvent` field). All state now
+  lives in `__pt`-prefixed backing fields (which the introspection filter already hides)
+  behind prototype accessors named so `toString` reads `function get nodeType() {
+  [native code] }`. `document`'s `defaultView`/`visibilityState`/`hidden`/`currentScript`
+  moved to the prototype too, and the DOM's event constructors are now masked as native.
+- ✅ **Fingerprint regression tests** — a probe asserts the whole surface: no own
+  properties on DOM/event/document/navigator instances, no `__pt_*` bridge global
+  reachable via `getOwnPropertyNames`/`ownKeys`/`getOwnPropertyDescriptor`/`hasOwnProperty`
+  (while staying callable), `webdriver` false and not an own property, `[native code]` for
+  every page-visible function and accessor, and intact `instanceof` chains. Verified to
+  *fail* on reintroduced drift, so hardening can't silently regress.
 - ⬜ **`performance.now()` / `timeOrigin` / `performance.timing`** coherent with wall clock.
-- ⬜ **Fingerprint regression tests** — snapshot the JS fingerprint and fail the build on
-  drift, so hardening never silently regresses.
 
 ## Architecture: move detectable surfaces to native (Rust)
 

@@ -563,7 +563,10 @@ impl Conn {
             }
 
             // ---- session-scoped domains ----
-            _ => self.dispatch_session(id, method, &params, &session, tx).await,
+            _ => {
+                self.dispatch_session(id, method, &params, &session, tx)
+                    .await
+            }
         }
     }
 
@@ -717,7 +720,9 @@ impl Conn {
                         )
                     };
                     let nav_result = match &nav_error {
-                        Some(e) => json!({ "frameId": target_id, "loaderId": loader, "errorText": e }),
+                        Some(e) => {
+                            json!({ "frameId": target_id, "loaderId": loader, "errorText": e })
+                        }
                         None => json!({ "frameId": target_id, "loaderId": loader }),
                     };
                     let frame = json!({
@@ -727,12 +732,18 @@ impl Conn {
                     let mut out = vec![
                         ok(id, &session, nav_result),
                         ev("Page.frameStartedLoading", json!({ "frameId": target_id })),
-                        ev("Page.frameNavigated", json!({ "frame": frame, "type": "Navigation" })),
+                        ev(
+                            "Page.frameNavigated",
+                            json!({ "frame": frame, "type": "Navigation" }),
+                        ),
                         ev("Runtime.executionContextsCleared", json!({})),
-                        ev("Runtime.executionContextCreated", json!({ "context": {
-                            "id": new_ctx, "origin": url, "name": "", "uniqueId": format!("{new_ctx}.1"),
-                            "auxData": { "isDefault": true, "type": "default", "frameId": target_id }
-                        }})),
+                        ev(
+                            "Runtime.executionContextCreated",
+                            json!({ "context": {
+                                "id": new_ctx, "origin": url, "name": "", "uniqueId": format!("{new_ctx}.1"),
+                                "auxData": { "isDefault": true, "type": "default", "frameId": target_id }
+                            }}),
+                        ),
                     ];
                     for (name, nid) in &iso_worlds {
                         out.push(ev("Runtime.executionContextCreated", json!({ "context": {
@@ -745,7 +756,10 @@ impl Conn {
                     out.push(ev("Page.domContentEventFired", json!({ "timestamp": 0.0 })));
                     out.push(lifecycle("load"));
                     out.push(ev("Page.loadEventFired", json!({ "timestamp": 0.0 })));
-                    out.push(ev("Page.frameStoppedLoading", json!({ "frameId": target_id })));
+                    out.push(ev(
+                        "Page.frameStoppedLoading",
+                        json!({ "frameId": target_id }),
+                    ));
                     for m in out {
                         let _ = tx.send(Message::Text(m.to_string()));
                     }
@@ -753,20 +767,42 @@ impl Conn {
                 vec![]
             }
             "Runtime.evaluate" => {
-                let expr = params.get("expression").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let by_value = params.get("returnByValue").and_then(|v| v.as_bool()).unwrap_or(false);
-                let await_promise = params.get("awaitPromise").and_then(|v| v.as_bool()).unwrap_or(false);
-                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                let expr = params
+                    .get("expression")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let by_value = params
+                    .get("returnByValue")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let await_promise = params
+                    .get("awaitPromise")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let (ctx, session, tx) =
+                    (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
                     let ro = remote_eval(&ctx, &expr, by_value, await_promise).await;
-                    let _ = tx.send(Message::Text(ok(id, &session, json!({ "result": ro })).to_string()));
+                    let _ = tx.send(Message::Text(
+                        ok(id, &session, json!({ "result": ro })).to_string(),
+                    ));
                 });
                 vec![]
             }
             "Runtime.callFunctionOn" => {
-                let decl = params.get("functionDeclaration").and_then(|v| v.as_str()).unwrap_or("");
-                let by_value = params.get("returnByValue").and_then(|v| v.as_bool()).unwrap_or(false);
-                let await_promise = params.get("awaitPromise").and_then(|v| v.as_bool()).unwrap_or(false);
+                let decl = params
+                    .get("functionDeclaration")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let by_value = params
+                    .get("returnByValue")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let await_promise = params
+                    .get("awaitPromise")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 // `this` is the handle's object (by objectId) or the global.
                 let this_js = match params.get("objectId").and_then(|v| v.as_str()) {
                     Some(oid) => format!("__pt_objGet({})", js_str(oid)),
@@ -791,37 +827,54 @@ impl Conn {
                 // Newline-isolate the declaration too — Playwright's function
                 // sources can carry a trailing `//# sourceURL=` comment.
                 let expr = format!("(\n{decl}\n).apply({this_js}, [{}])", args_js.join(","));
-                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                let (ctx, session, tx) =
+                    (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
                     let ro = remote_eval(&ctx, &expr, by_value, await_promise).await;
-                    let _ = tx.send(Message::Text(ok(id, &session, json!({ "result": ro })).to_string()));
+                    let _ = tx.send(Message::Text(
+                        ok(id, &session, json!({ "result": ro })).to_string(),
+                    ));
                 });
                 vec![]
             }
             "Runtime.getProperties" => {
-                let oid = params.get("objectId").and_then(|v| v.as_str()).map(str::to_string);
-                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                let oid = params
+                    .get("objectId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let (ctx, session, tx) =
+                    (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
                     let props = match oid {
                         Some(oid) => {
                             let js = format!("JSON.stringify(__pt_getProps({}))", js_str(&oid));
                             match ctx.evaluate(&js).await {
-                                Ok(Value::String(s)) => serde_json::from_str(&s).unwrap_or(json!([])),
+                                Ok(Value::String(s)) => {
+                                    serde_json::from_str(&s).unwrap_or(json!([]))
+                                }
                                 _ => json!([]),
                             }
                         }
                         None => json!([]),
                     };
-                    let _ = tx.send(Message::Text(ok(id, &session, json!({ "result": props })).to_string()));
+                    let _ = tx.send(Message::Text(
+                        ok(id, &session, json!({ "result": props })).to_string(),
+                    ));
                 });
                 vec![]
             }
             "Runtime.releaseObject" => {
-                let oid = params.get("objectId").and_then(|v| v.as_str()).map(str::to_string);
-                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                let oid = params
+                    .get("objectId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let (ctx, session, tx) =
+                    (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
                     if let Some(oid) = oid {
-                        let _ = ctx.evaluate(&format!("__pt_release({})", js_str(&oid))).await;
+                        let _ = ctx
+                            .evaluate(&format!("__pt_release({})", js_str(&oid)))
+                            .await;
                     }
                     let _ = tx.send(Message::Text(ok(id, &session, json!({})).to_string()));
                 });
@@ -829,38 +882,54 @@ impl Conn {
             }
             "Runtime.releaseObjectGroup" => vec![ok(id, session, json!({}))],
             "DOM.describeNode" => {
-                let oid = params.get("objectId").and_then(|v| v.as_str()).map(str::to_string);
-                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                let oid = params
+                    .get("objectId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let (ctx, session, tx) =
+                    (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
                     let node = match oid {
                         Some(oid) => {
-                            let js = format!("JSON.stringify(__pt_describe(__pt_objGet({})))", js_str(&oid));
+                            let js = format!(
+                                "JSON.stringify(__pt_describe(__pt_objGet({})))",
+                                js_str(&oid)
+                            );
                             match ctx.evaluate(&js).await {
-                                Ok(Value::String(s)) => serde_json::from_str(&s).unwrap_or(Value::Null),
+                                Ok(Value::String(s)) => {
+                                    serde_json::from_str(&s).unwrap_or(Value::Null)
+                                }
                                 _ => Value::Null,
                             }
                         }
                         None => Value::Null,
                     };
-                    let _ = tx.send(Message::Text(ok(id, &session, json!({ "node": node })).to_string()));
+                    let _ = tx.send(Message::Text(
+                        ok(id, &session, json!({ "node": node })).to_string(),
+                    ));
                 });
                 vec![]
             }
             "DOM.resolveNode" => {
                 let bid = params.get("backendNodeId").and_then(|v| v.as_i64());
-                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                let (ctx, session, tx) =
+                    (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
                     let obj = match bid {
                         Some(bid) => {
-                            let js = format!("JSON.stringify(__pt_wrap(__pt_nodeById({bid}), false))");
+                            let js =
+                                format!("JSON.stringify(__pt_wrap(__pt_nodeById({bid}), false))");
                             match ctx.evaluate(&js).await {
-                                Ok(Value::String(s)) => serde_json::from_str(&s).unwrap_or(json!({ "type": "undefined" })),
+                                Ok(Value::String(s)) => serde_json::from_str(&s)
+                                    .unwrap_or(json!({ "type": "undefined" })),
                                 _ => json!({ "type": "undefined" }),
                             }
                         }
                         None => json!({ "type": "undefined" }),
                     };
-                    let _ = tx.send(Message::Text(ok(id, &session, json!({ "object": obj })).to_string()));
+                    let _ = tx.send(Message::Text(
+                        ok(id, &session, json!({ "object": obj })).to_string(),
+                    ));
                 });
                 vec![]
             }
@@ -877,7 +946,8 @@ impl Conn {
             // (hidden/detached) → the "not clickable" errors the drivers expect.
             "DOM.getBoxModel" => {
                 let nref = node_ref(params);
-                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                let (ctx, session, tx) =
+                    (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
                     let js = format!("JSON.stringify(__pt_boxModel({nref}))");
                     let msg = match ctx.evaluate(&js).await {
@@ -897,7 +967,8 @@ impl Conn {
             }
             "DOM.getContentQuads" => {
                 let nref = node_ref(params);
-                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                let (ctx, session, tx) =
+                    (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
                     let js = format!("JSON.stringify(__pt_contentQuads({nref}))");
                     let quads = match ctx.evaluate(&js).await {
@@ -912,7 +983,8 @@ impl Conn {
             }
             "DOM.focus" => {
                 let nref = node_ref(params);
-                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                let (ctx, session, tx) =
+                    (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
                     let _ = ctx.evaluate(&format!("__pt_focusNode({nref})")).await;
                     let _ = tx.send(Message::Text(ok(id, &session, json!({})).to_string()));
@@ -921,28 +993,49 @@ impl Conn {
             }
             "DOM.scrollIntoViewIfNeeded" => vec![ok(id, session, json!({}))],
             "Page.getLayoutMetrics" => {
-                let vp = json!({ "pageX": 0, "pageY": 0, "clientWidth": 1280, "clientHeight": 720 });
+                let vp =
+                    json!({ "pageX": 0, "pageY": 0, "clientWidth": 1280, "clientHeight": 720 });
                 let visual = json!({ "offsetX": 0, "offsetY": 0, "pageX": 0, "pageY": 0,
                     "clientWidth": 1280, "clientHeight": 720, "scale": 1, "zoom": 1 });
                 let content = json!({ "x": 0, "y": 0, "width": 1280, "height": 720 });
-                vec![ok(id, session, json!({
-                    "layoutViewport": vp, "visualViewport": visual, "contentSize": content,
-                    "cssLayoutViewport": vp, "cssVisualViewport": visual, "cssContentSize": content,
-                }))]
+                vec![ok(
+                    id,
+                    session,
+                    json!({
+                        "layoutViewport": vp, "visualViewport": visual, "contentSize": content,
+                        "cssLayoutViewport": vp, "cssVisualViewport": visual, "cssContentSize": content,
+                    }),
+                )]
             }
             // Input domain: translate coordinate/key events into DOM events via the
             // synthetic layout's point→element hit-test (see __pt_mouse/__pt_key).
             "Input.dispatchMouseEvent" => {
-                let mtype = params.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let mtype = params
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let button = params.get("button").and_then(|v| v.as_str()).unwrap_or("left").to_string();
-                let clicks = params.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(1);
-                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                let button = params
+                    .get("button")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("left")
+                    .to_string();
+                let clicks = params
+                    .get("clickCount")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(1);
+                let (ctx, session, tx) =
+                    (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
                     let js = format!(
                         "__pt_mouse({}, {}, {}, {}, {})",
-                        js_str(&mtype), x, y, js_str(&button), clicks
+                        js_str(&mtype),
+                        x,
+                        y,
+                        js_str(&button),
+                        clicks
                     );
                     let _ = ctx.evaluate(&js).await;
                     let _ = ctx.run_event_loop().await; // let click handlers settle
@@ -951,16 +1044,40 @@ impl Conn {
                 vec![]
             }
             "Input.dispatchKeyEvent" => {
-                let ktype = params.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let key = params.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let code = params.get("code").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let kc = params.get("windowsVirtualKeyCode").and_then(|v| v.as_i64()).unwrap_or(0);
-                let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                let ktype = params
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let key = params
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let code = params
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let kc = params
+                    .get("windowsVirtualKeyCode")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let text = params
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let (ctx, session, tx) =
+                    (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
                     let js = format!(
                         "__pt_key({}, {{ key: {}, code: {}, keyCode: {}, text: {} }})",
-                        js_str(&ktype), js_str(&key), js_str(&code), kc, js_str(&text)
+                        js_str(&ktype),
+                        js_str(&key),
+                        js_str(&code),
+                        kc,
+                        js_str(&text)
                     );
                     let _ = ctx.evaluate(&js).await;
                     let _ = ctx.run_event_loop().await;
@@ -969,10 +1086,17 @@ impl Conn {
                 vec![]
             }
             "Input.insertText" => {
-                let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                let text = params
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let (ctx, session, tx) =
+                    (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
-                    let _ = ctx.evaluate(&format!("__pt_insertText({})", js_str(&text))).await;
+                    let _ = ctx
+                        .evaluate(&format!("__pt_insertText({})", js_str(&text)))
+                        .await;
                     let _ = ctx.run_event_loop().await;
                     let _ = tx.send(Message::Text(ok(id, &session, json!({})).to_string()));
                 });
@@ -1156,9 +1280,18 @@ mod tests {
         assert_eq!(p.username.as_deref(), Some("user"));
         assert_eq!(p.password.as_deref(), Some("pass"));
         // scheme optional -> http; socks5; no-auth
-        assert_eq!(super::parse_proxy_server("host:3128").unwrap().scheme, ProxyScheme::Http);
-        assert_eq!(super::parse_proxy_server("socks5://h:1080").unwrap().scheme, ProxyScheme::Socks5);
-        assert!(super::parse_proxy_server("host:3128").unwrap().username.is_none());
+        assert_eq!(
+            super::parse_proxy_server("host:3128").unwrap().scheme,
+            ProxyScheme::Http
+        );
+        assert_eq!(
+            super::parse_proxy_server("socks5://h:1080").unwrap().scheme,
+            ProxyScheme::Socks5
+        );
+        assert!(super::parse_proxy_server("host:3128")
+            .unwrap()
+            .username
+            .is_none());
         assert!(super::parse_proxy_server("ftp://h:1").is_none());
         assert!(super::parse_proxy_server("no-port").is_none());
     }
@@ -1232,7 +1365,11 @@ mod tests {
         let mut conn = test_conn();
         create_target(&mut conn, 1).await;
         let out = conn
-            .dispatch(&cmd(2, "Target.getTargets", json!({})), &sink(), &reg_sink())
+            .dispatch(
+                &cmd(2, "Target.getTargets", json!({})),
+                &sink(),
+                &reg_sink(),
+            )
             .await;
         let infos = response(&out, 2)["result"]["targetInfos"]
             .as_array()

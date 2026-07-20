@@ -304,7 +304,10 @@ async fn main() -> Result<()> {
     } else {
         cli.host
     };
-    println!("CDP server on ws://{advertise}:{}/devtools/browser/nokk", cli.port);
+    println!(
+        "CDP server on ws://{advertise}:{}/devtools/browser/nokk",
+        cli.port
+    );
     println!("  Puppeteer: puppeteer.connect({{ browserWSEndpoint: 'ws://{advertise}:{}/devtools/browser/nokk' }})", cli.port);
     nokk_cdp::serve(engine, nokk_cdp::ServerConfig { addr }).await?;
     Ok(())

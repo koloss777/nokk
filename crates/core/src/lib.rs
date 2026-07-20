@@ -979,7 +979,10 @@ mod tests {
             .await
             .unwrap();
         drop(ctx); // Drop flushes the jar to disk.
-        assert!(path.exists(), "session jar must be persisted on context close");
+        assert!(
+            path.exists(),
+            "session jar must be persisted on context close"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1008,7 +1011,10 @@ mod tests {
     fn sanitize_session_name_blocks_traversal() {
         // Plain names pass through unchanged.
         assert_eq!(sanitize_session_name("acme").as_deref(), Some("acme"));
-        assert_eq!(sanitize_session_name("acme-prod_1").as_deref(), Some("acme-prod_1"));
+        assert_eq!(
+            sanitize_session_name("acme-prod_1").as_deref(),
+            Some("acme-prod_1")
+        );
         // Path separators are neutralised and the result stays a single segment.
         for evil in ["a/../b", "../../etc/passwd", "/abs/path", "a\\b"] {
             let got = sanitize_session_name(evil).unwrap();
@@ -1151,6 +1157,131 @@ mod tests {
         assert_eq!(
             ctx.evaluate("document.readyState").await.unwrap(),
             Value::String("complete".into())
+        );
+    }
+
+    /// Evaluate a JS expression that yields a JSON string, and parse it.
+    async fn probe(ctx: &BrowserContext, js: &str) -> Value {
+        match ctx.evaluate(js).await.expect("probe evaluated") {
+            Value::String(s) => serde_json::from_str(&s).expect("probe returned JSON"),
+            other => panic!("probe did not return a JSON string: {other:?}"),
+        }
+    }
+
+    /// Fingerprint regression guard. The page-visible surface must carry no trace
+    /// of the engine, and this pins every property that has bitten us: an own
+    /// property on a DOM instance (real nodes have none), a `__pt_*` bridge global
+    /// reachable through any introspection route, or a function whose `toString`
+    /// leaks JS source instead of `[native code]`. Any drift fails the build.
+    #[tokio::test]
+    async fn fingerprint_surface_exposes_no_engine_tells() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+        let html = r#"<!DOCTYPE html><html><head><title>f</title></head><body>
+            <button id="btn">go</button><input id="inp" value=""></body></html>"#;
+        ctx.load_html("https://example.com/", html).await.unwrap();
+
+        let p = probe(
+            &ctx,
+            r#"JSON.stringify({
+              bodyOwn: Object.getOwnPropertyNames(document.body),
+              btnOwn: Object.getOwnPropertyNames(document.getElementById('btn')),
+              inpOwn: (() => { const i = document.getElementById('inp');
+                i.value = 'x'; i.getBoundingClientRect();
+                return Object.getOwnPropertyNames(i); })(),
+              textOwn: Object.getOwnPropertyNames(document.createTextNode('t')),
+              evtOwn: Object.getOwnPropertyNames(new MouseEvent('click', { bubbles: true })),
+              docOwn: Object.getOwnPropertyNames(document),
+              navOwn: Object.getOwnPropertyNames(navigator),
+              navKeys: Object.keys(navigator),
+              gopnPt: Object.getOwnPropertyNames(globalThis).filter(k => k.indexOf('__pt') === 0 || k === '__out'),
+              ownKeysPt: Reflect.ownKeys(globalThis).filter(k => typeof k === 'string' && (k.indexOf('__pt') === 0 || k === '__out')),
+              protoPt: [].concat(
+                Object.getOwnPropertyNames(Node.prototype),
+                Object.getOwnPropertyNames(Element.prototype),
+                Object.getOwnPropertyNames(Event.prototype)).filter(k => k.indexOf('__pt') === 0),
+              hasOwnPt: Object.prototype.hasOwnProperty.call(globalThis, '__pt_wrap'),
+              gopdHidden: Object.getOwnPropertyDescriptor(globalThis, '__pt_wrap') === undefined,
+              callable: typeof __pt_wrap,
+              webdriver: navigator.webdriver,
+              webdriverOwn: Object.prototype.hasOwnProperty.call(navigator, 'webdriver'),
+              natives: {
+                querySelector: document.querySelector.toString(),
+                getBoundingClientRect: Element.prototype.getBoundingClientRect.toString(),
+                addEventListener: Node.prototype.addEventListener.toString(),
+                MouseEvent: MouseEvent.toString(),
+                KeyboardEvent: KeyboardEvent.toString(),
+                nodeTypeGetter: Object.getOwnPropertyDescriptor(Node.prototype, 'nodeType').get.toString(),
+                styleGetter: Object.getOwnPropertyDescriptor(Element.prototype, 'style').get.toString(),
+                uaGetter: Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent').get.toString(),
+                toStringItself: Function.prototype.toString.toString()
+              },
+              instanceOf: [document.body instanceof Element, document.body instanceof Node,
+                new MouseEvent('x') instanceof Event, navigator instanceof Navigator]
+            })"#,
+        )
+        .await;
+
+        // A real DOM node / event / document exposes no own properties — ours must
+        // keep its state in hidden (__pt-prefixed, filtered) backing fields.
+        for key in [
+            "bodyOwn", "btnOwn", "inpOwn", "textOwn", "evtOwn", "docOwn", "navOwn", "navKeys",
+        ] {
+            let leaked = p[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("probe missing {key}"));
+            assert!(
+                leaked.is_empty(),
+                "{key} exposes own properties: {leaked:?}"
+            );
+        }
+
+        // The Rust<->JS bridge is invisible through every introspection route...
+        for key in ["gopnPt", "ownKeysPt", "protoPt"] {
+            let leaked = p[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("probe missing {key}"));
+            assert!(
+                leaked.is_empty(),
+                "{key} leaked engine internals: {leaked:?}"
+            );
+        }
+        assert_eq!(
+            p["hasOwnPt"], false,
+            "hasOwnProperty revealed a bridge global"
+        );
+        assert_eq!(
+            p["gopdHidden"], true,
+            "getOwnPropertyDescriptor revealed a bridge global"
+        );
+        // ...yet stays callable by bare name, which the driver relies on.
+        assert_eq!(
+            p["callable"], "function",
+            "bridge global is no longer callable"
+        );
+
+        // The classic tell, and that it is a prototype getter rather than an own prop.
+        assert_eq!(p["webdriver"], false);
+        assert_eq!(
+            p["webdriverOwn"], false,
+            "webdriver must not be an own property"
+        );
+
+        // Everything page-visible must report as native code.
+        for (name, src) in p["natives"].as_object().expect("natives object") {
+            let src = src.as_str().unwrap_or_default();
+            assert!(
+                src.contains("[native code]"),
+                "{name} leaks JS source instead of [native code]: {src}"
+            );
+        }
+
+        // Prototype chains still hold (masking must not break identity).
+        assert_eq!(
+            p["instanceOf"],
+            serde_json::json!([true, true, true, true]),
+            "instanceof relationships broken"
         );
     }
 
