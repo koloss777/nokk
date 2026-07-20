@@ -157,7 +157,10 @@ pub fn bootstrap_script(profile: &StealthProfile) -> String {
     let intl = INTL_SHIM_TEMPLATE
         .replace("__TZ__", &quoted(&profile.timezone))
         .replace("__LANG0__", &lang0)
-        .replace("__TZ_OFFSET__", &profile.timezone_offset_minutes.to_string())
+        .replace(
+            "__TZ_OFFSET__",
+            &profile.timezone_offset_minutes.to_string(),
+        )
         .replace("__TZ_DST__", &quoted(&profile.timezone_dst))
         .replace("__TZ_NAME_STD__", &quoted(&profile.timezone_name_std))
         .replace("__TZ_NAME_DST__", &quoted(&profile.timezone_name_dst));
@@ -973,8 +976,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   });
 
   try {
-    Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
-    Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+    // On the *prototype*, not the instance: a real `document` has no own
+    // properties, so defining these on it would be a tell.
+    const dproto = (globalThis.Document && globalThis.Document.prototype) || document;
+    Object.defineProperty(dproto, 'visibilityState', { get: () => 'visible', configurable: true });
+    Object.defineProperty(dproto, 'hidden', { get: () => false, configurable: true });
   } catch (e) {}
 
   if (!globalThis.TextDecoder) {
@@ -1043,7 +1049,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   for (const C of [globalThis.Node, globalThis.Element, globalThis.HTMLElement,
     globalThis.Document, globalThis.Event, globalThis.Navigator, globalThis.Screen,
     globalThis.Location, globalThis.History, globalThis.Date, globalThis.Plugin,
-    globalThis.MimeType, globalThis.PluginArray, globalThis.MimeTypeArray]) {
+    globalThis.MimeType, globalThis.PluginArray, globalThis.MimeTypeArray,
+    // Event interfaces the DOM runtime defines (an unmasked one leaks its whole
+    // class body through `toString()` — an obvious tell).
+    globalThis.CustomEvent, globalThis.UIEvent, globalThis.MouseEvent,
+    globalThis.PointerEvent, globalThis.KeyboardEvent, globalThis.InputEvent,
+    globalThis.FocusEvent, globalThis.Text, globalThis.Comment]) {
     if (C) { mask(C, C.name); if (C.prototype) maskProto(C.prototype); }
   }
 

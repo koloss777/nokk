@@ -19,11 +19,16 @@
   // ---- Node -----------------------------------------------------------------
   class Node {
     constructor(type) {
-      this.nodeType = type;
-      this.childNodes = [];
-      this.parentNode = null;
-      this.ownerDocument = globalThis.document || null;
-      this._listeners = Object.create(null);
+      // Backing fields are __pt-prefixed (and therefore filtered out of every
+      // introspection route by the stealth layer); the standard names are
+      // prototype accessors defined below. A real DOM node has *no* own
+      // properties — `Object.getOwnPropertyNames(document.body)` is `[]` — so
+      // storing these directly on the instance would be an instant tell.
+      this.__ptType = type;
+      this.__ptKids = [];
+      this.__ptParent = null;
+      this.__ptDoc = globalThis.document || null;
+      this.__ptLis = Object.create(null);
     }
     get firstChild() { return this.childNodes[0] || null; }
     get lastChild() { return this.childNodes[this.childNodes.length - 1] || null; }
@@ -60,7 +65,7 @@
     replaceChild(nw, old) { this.insertBefore(nw, old); return this.removeChild(old); }
     remove() { if (this.parentNode) this.parentNode.removeChild(this); }
     cloneNode(deep) {
-      const c = this._shallowClone();
+      const c = this.__ptShallowClone();
       if (deep) for (const ch of this.childNodes) c.appendChild(ch.cloneNode(true));
       return c;
     }
@@ -77,12 +82,12 @@
     addEventListener(type, fn, opts) {
       if (!fn) return;
       const cap = !!(opts && (opts === true || opts.capture));
-      (this._listeners[type] || (this._listeners[type] = [])).push({ fn, cap });
+      (this.__ptLis[type] || (this.__ptLis[type] = [])).push({ fn, cap });
     }
     removeEventListener(type, fn, opts) {
       const cap = !!(opts && (opts === true || opts.capture));
-      const l = this._listeners[type]; if (!l) return;
-      this._listeners[type] = l.filter(e => !(e.fn === fn && e.cap === cap));
+      const l = this.__ptLis[type]; if (!l) return;
+      this.__ptLis[type] = l.filter(e => !(e.fn === fn && e.cap === cap));
     }
     dispatchEvent(event) {
       event.target = this;
@@ -90,60 +95,83 @@
       const path = []; for (let n = this; n; n = n.parentNode) path.push(n);
       // Capture phase (root -> target), then bubble (target -> root).
       const fire = (node) => {
-        const l = node._listeners[event.type]; if (!l) return;
+        const l = node.__ptLis[event.type]; if (!l) return;
         for (const { fn } of l.slice()) {
-          if (event._stopImmediate) break;
+          if (event.__ptStopImm) break;
           event.currentTarget = node;
           try { fn.call(node, event); } catch (e) { /* page handler threw */ }
         }
       };
-      for (let i = path.length - 1; i >= 1; i--) { if (event._stop) break; if (path[i]._listeners[event.type]) { event.eventPhase = 1; fireCapture(path[i], event); } }
-      event.eventPhase = 2; if (!event._stop) fire(this);
-      if (event.bubbles) for (let i = 1; i < path.length; i++) { if (event._stop) break; event.eventPhase = 3; fire(path[i]); }
+      for (let i = path.length - 1; i >= 1; i--) { if (event.__ptStop) break; if (path[i].__ptLis[event.type]) { event.eventPhase = 1; fireCapture(path[i], event); } }
+      event.eventPhase = 2; if (!event.__ptStop) fire(this);
+      if (event.bubbles) for (let i = 1; i < path.length; i++) { if (event.__ptStop) break; event.eventPhase = 3; fire(path[i]); }
       return !event.defaultPrevented;
     }
   }
   function fireCapture(node, event) {
-    const l = node._listeners[event.type]; if (!l) return;
-    for (const e of l.slice()) { if (!e.cap) continue; if (event._stopImmediate) break; event.currentTarget = node; try { e.fn.call(node, event); } catch (_) {} }
+    const l = node.__ptLis[event.type]; if (!l) return;
+    for (const e of l.slice()) { if (!e.cap) continue; if (event.__ptStopImm) break; event.currentTarget = node; try { e.fn.call(node, event); } catch (_) {} }
   }
+
+  // Expose the standard node properties as prototype accessors over the hidden
+  // backing fields, so instances stay free of own properties (see constructor).
+  const accessor = (name, get, set) => {
+    // Real accessors report `function get <name>() { [native code] }`; an
+    // anonymous function would read `function ()` and stand out.
+    try { Object.defineProperty(get, 'name', { value: 'get ' + name, configurable: true }); } catch (e) {}
+    try { Object.defineProperty(set, 'name', { value: 'set ' + name, configurable: true }); } catch (e) {}
+    return { get, set, configurable: true, enumerable: false };
+  };
+  Object.defineProperties(Node.prototype, {
+    nodeType: accessor('nodeType', function () { return this.__ptType; }, function (v) { this.__ptType = v; }),
+    childNodes: accessor('childNodes', function () { return this.__ptKids; }, function (v) { this.__ptKids = v; }),
+    parentNode: accessor('parentNode', function () { return this.__ptParent; }, function (v) { this.__ptParent = v; }),
+    ownerDocument: accessor('ownerDocument', function () { return this.__ptDoc; }, function (v) { this.__ptDoc = v; }),
+  });
 
   // ---- CharacterData: Text / Comment ---------------------------------------
   class Text extends Node {
-    constructor(data) { super(TEXT_NODE); this.data = String(data); }
+    constructor(data) { super(TEXT_NODE); this.__ptData = String(data); }
+    get data() { return this.__ptData; }
+    set data(v) { this.__ptData = String(v); }
     get nodeName() { return '#text'; }
     get nodeValue() { return this.data; }
     set nodeValue(v) { this.data = String(v); }
     get textContent() { return this.data; }
     set textContent(v) { this.data = String(v); }
-    _shallowClone() { return new Text(this.data); }
+    __ptShallowClone() { return new Text(this.data); }
   }
   class Comment extends Node {
-    constructor(data) { super(COMMENT_NODE); this.data = String(data); }
+    constructor(data) { super(COMMENT_NODE); this.__ptData = String(data); }
+    get data() { return this.__ptData; }
+    set data(v) { this.__ptData = String(v); }
     get nodeName() { return '#comment'; }
     get nodeValue() { return this.data; }
     get textContent() { return ''; }
-    _shallowClone() { return new Comment(this.data); }
+    __ptShallowClone() { return new Comment(this.data); }
   }
 
   // ---- Element --------------------------------------------------------------
   class Element extends Node {
     constructor(tag) {
       super(ELEMENT_NODE);
-      this.tagName = String(tag).toUpperCase();
-      this.localName = String(tag).toLowerCase();
-      this._attrs = new Map();
-      this.style = makeStyle();
+      this.__ptTag = String(tag).toUpperCase();
+      this.__ptLocal = String(tag).toLowerCase();
+      this.__ptAttrs = new Map();
+      this.__ptStyle = makeStyle();
     }
     get nodeName() { return this.tagName; }
+    get tagName() { return this.__ptTag; }
+    get localName() { return this.__ptLocal; }
+    get style() { return this.__ptStyle; }
 
     // Attributes
-    getAttribute(n) { const v = this._attrs.get(n.toLowerCase()); return v === undefined ? null : v; }
-    setAttribute(n, v) { this._attrs.set(n.toLowerCase(), String(v)); __markDirty(); }
-    removeAttribute(n) { this._attrs.delete(n.toLowerCase()); __markDirty(); }
-    hasAttribute(n) { return this._attrs.has(n.toLowerCase()); }
-    getAttributeNames() { return [...this._attrs.keys()]; }
-    get attributes() { return [...this._attrs].map(([name, value]) => ({ name, value })); }
+    getAttribute(n) { const v = this.__ptAttrs.get(n.toLowerCase()); return v === undefined ? null : v; }
+    setAttribute(n, v) { this.__ptAttrs.set(n.toLowerCase(), String(v)); __markDirty(); }
+    removeAttribute(n) { this.__ptAttrs.delete(n.toLowerCase()); __markDirty(); }
+    hasAttribute(n) { return this.__ptAttrs.has(n.toLowerCase()); }
+    getAttributeNames() { return [...this.__ptAttrs.keys()]; }
+    get attributes() { return [...this.__ptAttrs].map(([name, value]) => ({ name, value })); }
 
     get id() { return this.getAttribute('id') || ''; }
     set id(v) { this.setAttribute('id', v); }
@@ -227,8 +255,8 @@
     }
     // Form-field value (reflects the `value` attribute until edited). Generic so
     // input/textarea typing works; harmless on other elements.
-    get value() { return this._value !== undefined ? this._value : (this.getAttribute('value') || ''); }
-    set value(v) { this._value = String(v); }
+    get value() { return this.__ptValue !== undefined ? this.__ptValue : (this.getAttribute('value') || ''); }
+    set value(v) { this.__ptValue = String(v); }
     // Common form-field surface, reflected from attributes — drivers gate `fill`
     // and `select` on these (an input with no `type`/`disabled`/`readOnly` fails
     // Playwright's fillability check).
@@ -241,8 +269,8 @@
     get name() { return this.getAttribute('name') || ''; }
     set name(v) { this.setAttribute('name', v); }
     get placeholder() { return this.getAttribute('placeholder') || ''; }
-    get checked() { return this._checked !== undefined ? this._checked : this.hasAttribute('checked'); }
-    set checked(v) { this._checked = !!v; }
+    get checked() { return this.__ptChecked !== undefined ? this.__ptChecked : this.hasAttribute('checked'); }
+    set checked(v) { this.__ptChecked = !!v; }
     get selectionStart() { return String(this.value || '').length; }
     get selectionEnd() { return String(this.value || '').length; }
     select() {}
@@ -251,18 +279,32 @@
     get isContentEditable() { const v = (this.getAttribute('contenteditable') || '').toLowerCase(); return v === '' || v === 'true'; }
     click() { this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
 
-    _shallowClone() { const e = new Element(this.localName); e._attrs = new Map(this._attrs); return e; }
+    __ptShallowClone() { const e = new Element(this.localName); e.__ptAttrs = new Map(this.__ptAttrs); return e; }
   }
 
   // ---- Document -------------------------------------------------------------
   class Document extends Node {
     constructor() {
       super(DOCUMENT_NODE);
-      this.documentElement = null;
-      this.readyState = 'loading';
-      this._cookie = '';
-      this.activeElement = null;
+      this.__ptDocEl = null;
+      this.__ptReady = 'loading';
+      this.__ptCookie = '';
+      this.__ptActive = null;
+      this.__ptView = null;
+      this.__ptCurScript = null;
     }
+    get defaultView() { return this.__ptView; }
+    set defaultView(v) { this.__ptView = v; }
+    get currentScript() { return this.__ptCurScript; }
+    set currentScript(v) { this.__ptCurScript = v; }
+    get visibilityState() { return 'visible'; }
+    get hidden() { return false; }
+    get documentElement() { return this.__ptDocEl; }
+    set documentElement(v) { this.__ptDocEl = v; }
+    get readyState() { return this.__ptReady; }
+    set readyState(v) { this.__ptReady = v; }
+    get activeElement() { return this.__ptActive; }
+    set activeElement(v) { this.__ptActive = v; }
     elementFromPoint(x, y) { return __elementFromPoint(x, y); }
     elementsFromPoint(x, y) { const e = __elementFromPoint(x, y); return e ? [e] : []; }
     get nodeName() { return '#document'; }
@@ -274,16 +316,16 @@
       if (!t) { t = this.createElement('title'); (this.head || this.documentElement || this).appendChild(t); }
       t.textContent = String(v);
     }
-    get cookie() { return this._cookie; }
+    get cookie() { return this.__ptCookie; }
     set cookie(v) {
       const pair = String(v).split(';')[0];
       const eq = pair.indexOf('=');
       if (eq < 0) return;
       const name = pair.slice(0, eq).trim();
-      const jar = this._cookie ? this._cookie.split('; ') : [];
+      const jar = this.__ptCookie ? this.__ptCookie.split('; ') : [];
       const kept = jar.filter(c => c.split('=')[0] !== name);
       kept.push(pair.trim());
-      this._cookie = kept.join('; ');
+      this.__ptCookie = kept.join('; ');
     }
 
     createElement(tag) { const e = new Element(tag); e.ownerDocument = this; return e; }
@@ -318,63 +360,124 @@
     writeln(...args) { this.write(args.join('') + '\n'); }
     open() { return this; }
     close() {}
-    _shallowClone() { return new Document(); }
+    __ptShallowClone() { return new Document(); }
   }
 
   // ---- Event ----------------------------------------------------------------
+  // Event state lives in one hidden bag (`__ptE`) exposed through prototype
+  // accessors: a real `new MouseEvent('click')` reports no own properties, so
+  // assigning fields to the instance would be an obvious tell.
+  const evtAccessors = (Ctor, names) => {
+    for (const n of names) {
+      const get = function () { return this.__ptE[n]; };
+      const set = function (v) { this.__ptE[n] = v; };
+      try { Object.defineProperty(get, 'name', { value: 'get ' + n, configurable: true }); } catch (e) {}
+      try { Object.defineProperty(set, 'name', { value: 'set ' + n, configurable: true }); } catch (e) {}
+      Object.defineProperty(Ctor.prototype, n, { get, set, configurable: true, enumerable: false });
+    }
+  };
+
   class Event {
     constructor(type, init) {
       init = init || {};
-      this.type = type;
-      this.bubbles = !!init.bubbles;
-      this.cancelable = !!init.cancelable;
-      this.defaultPrevented = false;
-      this.target = null; this.currentTarget = null; this.eventPhase = 0;
-      this.timeStamp = 0;
-      this._stop = false; this._stopImmediate = false;
+      this.__ptE = {
+        type, bubbles: !!init.bubbles, cancelable: !!init.cancelable,
+        defaultPrevented: false, target: null, currentTarget: null,
+        eventPhase: 0, timeStamp: 0, isTrusted: true,
+      };
+      this.__ptStop = false; this.__ptStopImm = false;
     }
-    preventDefault() { if (this.cancelable) this.defaultPrevented = true; }
-    stopPropagation() { this._stop = true; }
-    stopImmediatePropagation() { this._stop = true; this._stopImmediate = true; }
+    preventDefault() { if (this.cancelable) this.__ptE.defaultPrevented = true; }
+    stopPropagation() { this.__ptStop = true; }
+    stopImmediatePropagation() { this.__ptStop = true; this.__ptStopImm = true; }
+    composedPath() { const p = []; for (let n = this.target; n; n = n.parentNode) p.push(n); return p; }
   }
+  evtAccessors(Event, ['type', 'bubbles', 'cancelable', 'defaultPrevented', 'target',
+    'currentTarget', 'eventPhase', 'timeStamp', 'isTrusted']);
+
   class CustomEvent extends Event {
-    constructor(type, init) { super(type, init); this.detail = (init && init.detail) || null; }
+    constructor(type, init) { super(type, init); this.__ptE.detail = (init && init.detail) || null; }
   }
+  evtAccessors(CustomEvent, ['detail']);
+
   class UIEvent extends Event {
-    constructor(type, init) { super(type, init); init = init || {}; this.detail = init.detail || 0; this.view = globalThis; }
+    constructor(type, init) {
+      super(type, init); init = init || {};
+      this.__ptE.detail = init.detail || 0;
+      this.__ptE.view = globalThis;
+    }
   }
+  evtAccessors(UIEvent, ['detail', 'view']);
+
+  const MODS = ['ctrlKey', 'shiftKey', 'altKey', 'metaKey'];
+  const modifierState = function (k) {
+    return { Control: this.ctrlKey, Shift: this.shiftKey, Alt: this.altKey, Meta: this.metaKey }[k] || false;
+  };
+
   class MouseEvent extends UIEvent {
     constructor(type, init) {
-      init = init || {}; super(type, init);
-      this.clientX = init.clientX || 0; this.clientY = init.clientY || 0;
-      this.screenX = init.screenX || this.clientX; this.screenY = init.screenY || this.clientY;
-      this.pageX = this.clientX; this.pageY = this.clientY;
-      this.offsetX = init.offsetX || 0; this.offsetY = init.offsetY || 0;
-      this.button = init.button || 0; this.buttons = init.buttons || 0;
-      this.ctrlKey = !!init.ctrlKey; this.shiftKey = !!init.shiftKey; this.altKey = !!init.altKey; this.metaKey = !!init.metaKey;
-      this.relatedTarget = init.relatedTarget || null;
+      super(type, init); init = init || {};
+      const x = init.clientX || 0, y = init.clientY || 0;
+      Object.assign(this.__ptE, {
+        clientX: x, clientY: y,
+        screenX: init.screenX || x, screenY: init.screenY || y,
+        pageX: x, pageY: y,
+        offsetX: init.offsetX || 0, offsetY: init.offsetY || 0,
+        button: init.button || 0, buttons: init.buttons || 0,
+        ctrlKey: !!init.ctrlKey, shiftKey: !!init.shiftKey,
+        altKey: !!init.altKey, metaKey: !!init.metaKey,
+        relatedTarget: init.relatedTarget || null,
+      });
     }
-    getModifierState(k) { return { Control: this.ctrlKey, Shift: this.shiftKey, Alt: this.altKey, Meta: this.metaKey }[k] || false; }
+    getModifierState(k) { return modifierState.call(this, k); }
   }
+  evtAccessors(MouseEvent, ['clientX', 'clientY', 'screenX', 'screenY', 'pageX', 'pageY',
+    'offsetX', 'offsetY', 'button', 'buttons', 'relatedTarget'].concat(MODS));
+
   class PointerEvent extends MouseEvent {
-    constructor(type, init) { init = init || {}; super(type, init); this.pointerId = init.pointerId || 1; this.pointerType = init.pointerType || 'mouse'; this.isPrimary = init.isPrimary !== false; }
+    constructor(type, init) {
+      super(type, init); init = init || {};
+      Object.assign(this.__ptE, {
+        pointerId: init.pointerId || 1,
+        pointerType: init.pointerType || 'mouse',
+        isPrimary: init.isPrimary !== false,
+      });
+    }
   }
+  evtAccessors(PointerEvent, ['pointerId', 'pointerType', 'isPrimary']);
+
   class KeyboardEvent extends UIEvent {
     constructor(type, init) {
-      init = init || {}; super(type, init);
-      this.key = init.key || ''; this.code = init.code || '';
-      this.keyCode = init.keyCode || 0; this.which = init.keyCode || 0; this.charCode = init.charCode || 0;
-      this.location = init.location || 0; this.repeat = !!init.repeat;
-      this.ctrlKey = !!init.ctrlKey; this.shiftKey = !!init.shiftKey; this.altKey = !!init.altKey; this.metaKey = !!init.metaKey;
+      super(type, init); init = init || {};
+      Object.assign(this.__ptE, {
+        key: init.key || '', code: init.code || '',
+        keyCode: init.keyCode || 0, which: init.keyCode || 0, charCode: init.charCode || 0,
+        location: init.location || 0, repeat: !!init.repeat,
+        ctrlKey: !!init.ctrlKey, shiftKey: !!init.shiftKey,
+        altKey: !!init.altKey, metaKey: !!init.metaKey,
+      });
     }
-    getModifierState(k) { return { Control: this.ctrlKey, Shift: this.shiftKey, Alt: this.altKey, Meta: this.metaKey }[k] || false; }
+    getModifierState(k) { return modifierState.call(this, k); }
   }
+  evtAccessors(KeyboardEvent, ['key', 'code', 'keyCode', 'which', 'charCode',
+    'location', 'repeat'].concat(MODS));
+
   class InputEvent extends UIEvent {
-    constructor(type, init) { init = init || {}; super(type, init); this.data = init.data == null ? null : String(init.data); this.inputType = init.inputType || ''; this.isComposing = false; }
+    constructor(type, init) {
+      super(type, init); init = init || {};
+      Object.assign(this.__ptE, {
+        data: init.data == null ? null : String(init.data),
+        inputType: init.inputType || '', isComposing: false,
+      });
+    }
   }
+  evtAccessors(InputEvent, ['data', 'inputType', 'isComposing']);
+
   class FocusEvent extends UIEvent {
-    constructor(type, init) { init = init || {}; super(type, init); this.relatedTarget = init.relatedTarget || null; }
+    constructor(type, init) { super(type, init); this.__ptE.relatedTarget = (init && init.relatedTarget) || null; }
   }
+  evtAccessors(FocusEvent, ['relatedTarget']);
+
   for (const [n, C] of [['UIEvent', UIEvent], ['MouseEvent', MouseEvent], ['PointerEvent', PointerEvent],
     ['KeyboardEvent', KeyboardEvent], ['InputEvent', InputEvent], ['FocusEvent', FocusEvent]]) {
     if (!globalThis[n]) globalThis[n] = C;
@@ -639,7 +742,7 @@
   globalThis.Event = Event;
   globalThis.CustomEvent = CustomEvent;
   globalThis.DocumentFragment = Node;
-  document.defaultView = globalThis;
+  document.__ptView = globalThis;
 
   // <script> nodes in document order, so the loader can point `currentScript` at
   // the one it is about to run (for document.write positioning).
@@ -671,17 +774,17 @@
     if (!document.activeElement) document.activeElement = document.body || null;
     document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
     if (globalThis.onload) { try { globalThis.onload(new Event('load')); } catch (_) {} }
-    const l = globalThis._listeners && globalThis._listeners['load'];
+    const l = globalThis.__ptLis && globalThis.__ptLis['load'];
     globalThis.dispatchEvent && globalThis.dispatchEvent(new Event('load'));
   };
 
   // window is an EventTarget too.
   if (!globalThis.addEventListener) {
-    globalThis._listeners = Object.create(null);
+    globalThis.__ptLis = Object.create(null);
     globalThis.addEventListener = Node.prototype.addEventListener.bind(globalThis);
     globalThis.removeEventListener = Node.prototype.removeEventListener.bind(globalThis);
     globalThis.dispatchEvent = (ev) => {
-      const l = globalThis._listeners[ev.type]; if (l) for (const { fn } of l.slice()) { try { fn.call(globalThis, ev); } catch (_) {} }
+      const l = globalThis.__ptLis[ev.type]; if (l) for (const { fn } of l.slice()) { try { fn.call(globalThis, ev); } catch (_) {} }
       return true;
     };
   }
@@ -768,8 +871,8 @@
     const walk = (el) => {
       if (!el || el.nodeType !== ELEMENT_NODE) return;
       if (__isHiddenEl(el)) return;               // display:none hides the subtree
-      el.__box = { x: 0, y: row * LAYOUT.ROW, w: LAYOUT.W, h: LAYOUT.ROW };
-      el.__boxV = __layoutBuilt;
+      el.__ptBox = { x: 0, y: row * LAYOUT.ROW, w: LAYOUT.W, h: LAYOUT.ROW };
+      el.__ptBoxV = __layoutBuilt;
       __rows[row] = el;
       row++;
       for (const c of el.childNodes) walk(c);
@@ -781,7 +884,7 @@
   function __boxOf(el) {
     if (!el || el.nodeType !== ELEMENT_NODE) return null;
     __relayout();
-    return el.__boxV === __layoutBuilt ? el.__box : null; // detached/hidden → no box
+    return el.__ptBoxV === __layoutBuilt ? el.__ptBox : null; // detached/hidden → no box
   }
 
   function __rectFromBox(b) {

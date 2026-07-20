@@ -42,8 +42,8 @@ impl SessionJar {
     pub fn load_file(path: &Path) -> std::io::Result<Self> {
         match std::fs::File::open(path) {
             Ok(f) => {
-                let store = cookie_store::serde::json::load(std::io::BufReader::new(f))
-                    .map_err(|e| {
+                let store =
+                    cookie_store::serde::json::load(std::io::BufReader::new(f)).map_err(|e| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
                     })?;
                 Ok(Self(RwLock::new(store)))
@@ -200,7 +200,11 @@ mod tests {
     #[test]
     fn snapshot_reflects_stored_cookies() {
         let jar = SessionJar::new();
-        set_cookie(&jar, "https://example.com/", "sid=abc; Path=/; Secure; HttpOnly");
+        set_cookie(
+            &jar,
+            "https://example.com/",
+            "sid=abc; Path=/; Secure; HttpOnly",
+        );
         let snap = jar.snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].name, "sid");
