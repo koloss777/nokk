@@ -85,9 +85,17 @@ no readable source). Where JS is the advantage (control of the environment, iter
 speed, no FFI overhead), keep it.
 
 Move to native (Rust):
-- ⬜ **`crypto.subtle` (WebCrypto)** — replace the JS shim with real Rust crypto
-  (aes-gcm/sha2/hmac/pbkdf2/hkdf), so it is correct, fast, and native-looking. (This is
-  what obscura does.)
+- ✅ **`crypto.subtle` (WebCrypto) is real.** There was no shim at all —
+  `crypto.subtle` was simply *absent*, which every browser on a secure origin exposes, and
+  `getRandomValues` was a seeded xorshift rather than randomness. V8 contexts now host
+  native Rust bindings ([`natives.rs`](crates/pool/src/natives.rs), the first use of this
+  mechanism): SHA-1/256/384/512, HMAC, PBKDF2, HKDF, AES-GCM, AES-CBC and OS randomness.
+  On top of them the JS layer exposes real `Crypto`/`SubtleCrypto`/`CryptoKey` interfaces
+  (`digest`, `importKey`/`exportKey`, `sign`/`verify`, `encrypt`/`decrypt`,
+  `deriveBits`/`deriveKey`, `generateKey`) — promise-based, correct `[object …]` tags, no
+  own properties, `[native code]`, and spec-shaped rejections. Pinned by known-answer
+  vectors, so a page that digests a known input and checks the result sees what Chrome
+  would; verified live in a page using `crypto.subtle` + `TextEncoder`.
 - ⬜ **Hot / most-probed DOM + graphics methods as native functions** — at minimum the
   ones fingerprinters read (`getContext`, `getParameter`, `toDataURL`, `getImageData`,
   `querySelector`), so `Function.prototype.toString` on them is `[native code]` without

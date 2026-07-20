@@ -22,6 +22,7 @@ use std::thread::JoinHandle;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
 mod isolate;
+mod natives;
 
 pub use isolate::Isolate;
 

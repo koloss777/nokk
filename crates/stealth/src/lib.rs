@@ -165,7 +165,7 @@ pub fn bootstrap_script(profile: &StealthProfile) -> String {
         .replace("__TZ_NAME_STD__", &quoted(&profile.timezone_name_std))
         .replace("__TZ_NAME_DST__", &quoted(&profile.timezone_name_dst));
 
-    format!("{env}\n{intl}\n{TIMERS_TEMPLATE}\n{PERFORMANCE_TEMPLATE}\n{FETCH_TEMPLATE}")
+    format!("{env}\n{intl}\n{TIMERS_TEMPLATE}\n{PERFORMANCE_TEMPLATE}\n{CRYPTO_TEMPLATE}\n{FETCH_TEMPLATE}")
 }
 
 /// The environment template. Placeholders (`__UA__`, …) are substituted by
@@ -540,6 +540,158 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   globalThis.PerformanceTiming = PerformanceTiming;
   globalThis.PerformanceNavigation = PerformanceNavigation;
   globalThis.performance = new Performance();
+})();"#;
+
+/// WebCrypto, backed by the native Rust primitives installed on every context
+/// (see `nokk-pool`'s `natives` module). `crypto.subtle` was previously absent
+/// entirely — an instant tell, since every browser on a secure origin exposes it —
+/// and `getRandomValues` was a seeded xorshift rather than real randomness.
+/// Results are genuine, so a page that digests a known input and checks the answer
+/// sees what Chrome would.
+const CRYPTO_TEMPLATE: &str = r#"(() => {
+  const N = globalThis;
+  const u8 = (d) => {
+    if (d instanceof Uint8Array) return d;
+    if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
+    if (d instanceof ArrayBuffer) return new Uint8Array(d);
+    return new Uint8Array(0);
+  };
+  // WebCrypto hands back ArrayBuffers, not views.
+  const buf = (a) => a.buffer.slice(a.byteOffset, a.byteOffset + a.byteLength);
+  const fail = (name, msg) => { const e = new Error(msg || name); e.name = name; return Promise.reject(e); };
+  const nameOf = (a) => String(typeof a === 'string' ? a : (a && a.name) || '').toUpperCase();
+  const hashOf = (a) => { const h = a && a.hash; return String(typeof h === 'string' ? h : (h && h.name) || 'SHA-256').toUpperCase(); };
+  const norm = (a) => {
+    const o = { name: nameOf(a) };
+    if (a && typeof a === 'object') {
+      if (a.hash) o.hash = { name: hashOf(a) };
+      if (a.length != null) o.length = a.length;
+    }
+    return o;
+  };
+
+  // Key material lives in a side table so a CryptoKey has no own properties.
+  const KEYS = new WeakMap();
+  class CryptoKey {}
+  const keyGetter = (field) => {
+    const get = function () { const r = KEYS.get(this); return r ? r[field] : undefined; };
+    try { Object.defineProperty(get, 'name', { value: 'get ' + field, configurable: true }); } catch (e) {}
+    return { get, configurable: true, enumerable: true };
+  };
+  Object.defineProperties(CryptoKey.prototype, {
+    type: keyGetter('type'), extractable: keyGetter('extractable'),
+    algorithm: keyGetter('algorithm'), usages: keyGetter('usages'),
+  });
+  try { Object.defineProperty(CryptoKey.prototype, Symbol.toStringTag, { value: 'CryptoKey', configurable: true }); } catch (e) {}
+
+  const mkKey = (raw, algorithm, extractable, usages) => {
+    const k = new CryptoKey();
+    KEYS.set(k, { raw, algorithm, extractable: !!extractable, usages: (usages || []).slice(), type: 'secret' });
+    return k;
+  };
+  const raw = (k) => { const r = KEYS.get(k); return r ? r.raw : null; };
+
+  class SubtleCrypto {
+    digest(alg, data) {
+      const out = __pt_digest(nameOf(alg), u8(data));
+      return out ? Promise.resolve(buf(out)) : fail('NotSupportedError', 'Unrecognized digest algorithm');
+    }
+    importKey(format, keyData, algorithm, extractable, usages) {
+      if (String(format).toLowerCase() !== 'raw') return fail('NotSupportedError', 'Only raw import is supported');
+      return Promise.resolve(mkKey(u8(keyData).slice(), norm(algorithm), extractable, usages));
+    }
+    exportKey(format, key) {
+      const r = KEYS.get(key);
+      if (!r) return fail('InvalidAccessError', 'Not a CryptoKey');
+      if (String(format).toLowerCase() !== 'raw') return fail('NotSupportedError', 'Only raw export is supported');
+      if (!r.extractable) return fail('InvalidAccessError', 'Key is not extractable');
+      return Promise.resolve(buf(r.raw));
+    }
+    generateKey(algorithm, extractable, usages) {
+      const a = norm(algorithm);
+      const bits = a.length || (a.name === 'HMAC' ? 256 : 128);
+      const bytes = __pt_randomBytes(Math.max(1, Math.ceil(bits / 8)));
+      if (!bytes) return fail('OperationError', 'Key generation failed');
+      return Promise.resolve(mkKey(bytes, a, extractable, usages));
+    }
+    sign(alg, key, data) {
+      const k = raw(key);
+      if (!k) return fail('InvalidAccessError', 'Not a CryptoKey');
+      if (nameOf(alg) !== 'HMAC') return fail('NotSupportedError', 'Only HMAC signing is supported');
+      const r = KEYS.get(key);
+      const out = __pt_hmac(hashOf(r.algorithm), k, u8(data));
+      return out ? Promise.resolve(buf(out)) : fail('OperationError', 'Signing failed');
+    }
+    verify(alg, key, signature, data) {
+      return this.sign(alg, key, data).then((expected) => {
+        const a = u8(expected), b = u8(signature);
+        if (a.length !== b.length) return false;
+        let diff = 0;
+        for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+        return diff === 0;
+      });
+    }
+    encrypt(alg, key, data) { return this.__op(true, alg, key, data); }
+    decrypt(alg, key, data) { return this.__op(false, alg, key, data); }
+    __op(enc, alg, key, data) {
+      const k = raw(key);
+      if (!k) return fail('InvalidAccessError', 'Not a CryptoKey');
+      const n = nameOf(alg);
+      let out = null;
+      if (n === 'AES-GCM') out = __pt_aesgcm(enc, k, u8(alg && alg.iv), u8(alg && alg.additionalData), u8(data));
+      else if (n === 'AES-CBC') out = __pt_aescbc(enc, k, u8(alg && alg.iv), u8(data));
+      else return fail('NotSupportedError', 'Unrecognized cipher');
+      return out ? Promise.resolve(buf(out)) : fail('OperationError', enc ? 'Encryption failed' : 'Decryption failed');
+    }
+    deriveBits(alg, key, length) {
+      const k = raw(key);
+      if (!k) return fail('InvalidAccessError', 'Not a CryptoKey');
+      const bytes = Math.max(0, Math.ceil((length || 0) / 8));
+      const n = nameOf(alg);
+      let out = null;
+      if (n === 'PBKDF2') out = __pt_pbkdf2(hashOf(alg), k, u8(alg && alg.salt), alg && alg.iterations || 1, bytes);
+      else if (n === 'HKDF') out = __pt_hkdf(hashOf(alg), k, u8(alg && alg.salt), u8(alg && alg.info), bytes);
+      else return fail('NotSupportedError', 'Unrecognized derivation');
+      return out ? Promise.resolve(buf(out)) : fail('OperationError', 'Derivation failed');
+    }
+    deriveKey(alg, key, derivedAlg, extractable, usages) {
+      const a = norm(derivedAlg);
+      const bits = a.length || (a.name === 'HMAC' ? 256 : 128);
+      return this.deriveBits(alg, key, bits)
+        .then((b) => mkKey(new Uint8Array(b), a, extractable, usages));
+    }
+  }
+  try { Object.defineProperty(SubtleCrypto.prototype, Symbol.toStringTag, { value: 'SubtleCrypto', configurable: true }); } catch (e) {}
+
+  const subtle = new SubtleCrypto();
+
+  class Crypto {
+    getRandomValues(view) {
+      if (!ArrayBuffer.isView(view)) { const e = new Error('Argument is not a TypedArray'); e.name = 'TypeMismatchError'; throw e; }
+      if (view.byteLength > 65536) { const e = new Error('Requested too many bytes'); e.name = 'QuotaExceededError'; throw e; }
+      const r = __pt_randomBytes(view.byteLength);
+      if (r) new Uint8Array(view.buffer, view.byteOffset, view.byteLength).set(r);
+      return view;
+    }
+    randomUUID() {
+      const b = __pt_randomBytes(16);
+      b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+      const h = Array.from(b).map((x) => x.toString(16).padStart(2, '0')).join('');
+      return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
+    }
+  }
+  Object.defineProperty(Crypto.prototype, 'subtle', {
+    get: (() => { const g = function () { return subtle; };
+      try { Object.defineProperty(g, 'name', { value: 'get subtle', configurable: true }); } catch (e) {}
+      return g; })(),
+    configurable: true, enumerable: true,
+  });
+  try { Object.defineProperty(Crypto.prototype, Symbol.toStringTag, { value: 'Crypto', configurable: true }); } catch (e) {}
+
+  N.Crypto = Crypto;
+  N.SubtleCrypto = SubtleCrypto;
+  N.CryptoKey = CryptoKey;
+  N.crypto = new Crypto();
 })();"#;
 
 const FETCH_TEMPLATE: &str = r#"(() => {
@@ -1032,19 +1184,6 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   if (!globalThis.localStorage) globalThis.localStorage = makeStorage();
   if (!globalThis.sessionStorage) globalThis.sessionStorage = makeStorage();
 
-  if (!globalThis.crypto || !globalThis.crypto.getRandomValues) {
-    let s = (SEED >>> 0) || 123456789;
-    const rnd = () => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return s >>> 0; };
-    globalThis.crypto = globalThis.crypto || {};
-    globalThis.crypto.getRandomValues = (arr) => { for (let i = 0; i < arr.length; i++) arr[i] = rnd(); return arr; };
-    globalThis.crypto.randomUUID = () => {
-      const b = []; for (let i = 0; i < 16; i++) b.push((rnd() & 0xff));
-      b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
-      const h = b.map((x) => x.toString(16).padStart(2, '0')).join('');
-      return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
-    };
-  }
-
   globalThis.IntersectionObserver = globalThis.IntersectionObserver || class IntersectionObserver {
     constructor(cb) { this._cb = cb; }
     observe(el) { const cb = this._cb, self = this; setTimeout(() => { try { cb([{ target: el, isIntersecting: true, intersectionRatio: 1, boundingClientRect: {}, intersectionRect: {}, rootBounds: null, time: 0 }], self); } catch (e) {} }, 0); }
@@ -1148,7 +1287,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     globalThis.CustomEvent, globalThis.UIEvent, globalThis.MouseEvent,
     globalThis.PointerEvent, globalThis.KeyboardEvent, globalThis.InputEvent,
     globalThis.FocusEvent, globalThis.Text, globalThis.Comment,
-    globalThis.Performance, globalThis.PerformanceTiming, globalThis.PerformanceNavigation]) {
+    globalThis.Performance, globalThis.PerformanceTiming, globalThis.PerformanceNavigation,
+    globalThis.Crypto, globalThis.SubtleCrypto, globalThis.CryptoKey]) {
     if (C) { mask(C, C.name); if (C.prototype) maskProto(C.prototype); }
   }
 
