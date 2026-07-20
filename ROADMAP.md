@@ -69,6 +69,15 @@ would flag today. Closing them is the top priority — coherence is the whole po
   text rendering does. `toDataURL` is a genuine PNG, encoded natively in Rust. Verified
   against the canonical BrowserLeaks canvas routine. (Text/paths are still not truly
   rasterised: a probe checking specific glyph pixels would see synthesised content.)
+- ✅ **WebGL readback reflects what was rendered.** Every GL call was a no-op, so
+  `readPixels` returned zeroes whatever the scene was and two different renders compared
+  equal — the same differential tell as the 2D canvas, and WebGL fingerprints are probed
+  just as often. The context now shares the canvas pixel surface: `clearColor`+`clear`
+  render exactly (clear to red, read back red), draws stamp a pattern keyed by the shader
+  source, geometry and uniforms behind them, and `readPixels`/`toDataURL` read that buffer.
+  A canvas also keeps the first context type it was given, so asking for a conflicting one
+  returns `null` as a real browser does. The identity surface (vendor/renderer, ANGLE
+  `UNMASKED_*`, `MAX_*`, extensions) was already Chrome-shaped and is now pinned too.
 - ✅ **Fingerprint regression tests** — a probe asserts the whole surface: no own
   properties on DOM/event/document/navigator instances, no `__pt_*` bridge global
   reachable via `getOwnPropertyNames`/`ownKeys`/`getOwnPropertyDescriptor`/`hasOwnProperty`

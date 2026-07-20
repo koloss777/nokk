@@ -893,15 +893,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     return [0, 0, 0, 255];
   };
 
-  const make2DContext = (canvas) => {
+  // A canvas-backed pixel surface, shared by the 2D and WebGL contexts: both have
+  // to answer readback probes with something that actually reflects the drawing.
+  const makeSurface = (canvas) => {
     let W = -1, H = -1, px = new Uint8ClampedArray(0);
     let ops = 2166136261 >>> 0;                 // FNV-1a over every draw call
-    let bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;     // current path bounding box
-
-    const note = (s) => {
-      s = String(s);
-      for (let i = 0; i < s.length; i++) { ops ^= s.charCodeAt(i); ops = Math.imul(ops, 16777619) >>> 0; }
-    };
     const sync = () => {
       const w = Math.max(0, canvas.width | 0), h = Math.max(0, canvas.height | 0);
       if (w !== W || h !== H) { W = w; H = h; px = new Uint8ClampedArray(w * h * 4); }
@@ -913,24 +909,52 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       if (h < 0) { y += h; h = -h; }
       return [Math.max(0, x), Math.max(0, y), Math.min(W, x + w), Math.min(H, y + h)];
     };
-    const solid = (x, y, w, h, rgba) => {
-      sync(); const [x0, y0, x1, y1] = clip(x, y, w, h);
-      for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) {
-        const i = (yy * W + xx) * 4;
-        px[i] = rgba[0]; px[i + 1] = rgba[1]; px[i + 2] = rgba[2]; px[i + 3] = rgba[3];
-      }
+    return {
+      note(s) {
+        s = String(s);
+        for (let i = 0; i < s.length; i++) { ops ^= s.charCodeAt(i); ops = Math.imul(ops, 16777619) >>> 0; }
+      },
+      // Exact rendering, for the operations we can honour precisely.
+      solid(x, y, w, h, rgba) {
+        sync(); const [x0, y0, x1, y1] = clip(x, y, w, h);
+        for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) {
+          const i = (yy * W + xx) * 4;
+          px[i] = rgba[0]; px[i + 1] = rgba[1]; px[i + 2] = rgba[2]; px[i + 3] = rgba[3];
+        }
+      },
+      // Everything we cannot rasterise: a deterministic pattern keyed by the
+      // operation log and the session seed, so different input gives different
+      // pixels and identical input repeats exactly.
+      stamp(x, y, w, h) {
+        sync(); const [x0, y0, x1, y1] = clip(x, y, w, h);
+        for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) {
+          let v = (ops ^ Math.imul(xx + 1, 2654435761) ^ Math.imul(yy + 1, 40503) ^ SEED) >>> 0;
+          v = Math.imul(v ^ (v >>> 15), 2246822519) >>> 0;
+          v = (v ^ (v >>> 13)) >>> 0;
+          const i = (yy * W + xx) * 4;
+          px[i] = v & 0xff; px[i + 1] = (v >>> 8) & 0xff; px[i + 2] = (v >>> 16) & 0xff;
+          px[i + 3] = 255 - ((v >>> 24) & 0x3f);
+        }
+      },
+      read(x, y, w, h, dst) {
+        sync();
+        for (let yy = 0; yy < h; yy++) for (let xx = 0; xx < w; xx++) {
+          const sx = (x | 0) + xx, sy = (y | 0) + yy, di = (yy * w + xx) * 4;
+          if (sx < 0 || sy < 0 || sx >= W || sy >= H) continue;
+          const si = (sy * W + sx) * 4;
+          dst[di] = px[si]; dst[di + 1] = px[si + 1]; dst[di + 2] = px[si + 2]; dst[di + 3] = px[si + 3];
+        }
+        return dst;
+      },
+      pixels() { sync(); return { w: W, h: H, data: px }; },
     };
-    const stamp = (x, y, w, h) => {
-      sync(); const [x0, y0, x1, y1] = clip(x, y, w, h);
-      for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) {
-        let v = (ops ^ Math.imul(xx + 1, 2654435761) ^ Math.imul(yy + 1, 40503) ^ SEED) >>> 0;
-        v = Math.imul(v ^ (v >>> 15), 2246822519) >>> 0;
-        v = (v ^ (v >>> 13)) >>> 0;
-        const i = (yy * W + xx) * 4;
-        px[i] = v & 0xff; px[i + 1] = (v >>> 8) & 0xff; px[i + 2] = (v >>> 16) & 0xff;
-        px[i + 3] = 255 - ((v >>> 24) & 0x3f);
-      }
-    };
+  };
+
+  const make2DContext = (canvas) => {
+    const S = makeSurface(canvas);
+    const note = S.note, solid = S.solid, stamp = S.stamp;
+    let bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;     // current path bounding box
+
     const pathPoint = (x, y) => {
       x = +x || 0; y = +y || 0;
       if (bx1 <= bx0 && by1 <= by0) { bx0 = x; by0 = y; bx1 = x; by1 = y; }
@@ -988,8 +1012,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       },
       putImageData(data, x, y) {
         note('putImageData|' + [x, y, data && data.width, data && data.height]);
-        sync();
         if (!data || !data.data) return;
+        const p = S.pixels(), W = p.w, H = p.h, px = p.data;
         const dw = data.width | 0, dh = data.height | 0;
         for (let yy = 0; yy < dh; yy++) for (let xx = 0; xx < dw; xx++) {
           const tx = (x | 0) + xx, ty = (y | 0) + yy;
@@ -1005,16 +1029,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         return { width: w, actualBoundingBoxLeft: 0, actualBoundingBoxRight: w, actualBoundingBoxAscent: 8, actualBoundingBoxDescent: 2, fontBoundingBoxAscent: 9, fontBoundingBoxDescent: 2 };
       },
       getImageData(x, y, w, h) {
-        sync();
         w = w | 0; h = h | 0;
-        const out = new Uint8ClampedArray(Math.max(0, w * h * 4));
-        for (let yy = 0; yy < h; yy++) for (let xx = 0; xx < w; xx++) {
-          const sx = (x | 0) + xx, sy = (y | 0) + yy;
-          const di = (yy * w + xx) * 4;
-          if (sx < 0 || sy < 0 || sx >= W || sy >= H) continue;
-          const si = (sy * W + sx) * 4;
-          out[di] = px[si]; out[di + 1] = px[si + 1]; out[di + 2] = px[si + 2]; out[di + 3] = px[si + 3];
-        }
+        const out = S.read(x, y, w, h, new Uint8ClampedArray(Math.max(0, w * h * 4)));
         return { data: out, width: w, height: h, colorSpace: 'srgb' };
       },
       createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(0, (w | 0) * (h | 0) * 4)), width: w | 0, height: h | 0, colorSpace: 'srgb' }; },
@@ -1023,7 +1039,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       createPattern() { note('pattern'); return {}; },
       getContextAttributes() { return { alpha: true, colorSpace: 'srgb', desynchronized: false, willReadFrequently: false }; },
       // Hidden (filtered) accessor the canvas element uses to encode itself.
-      __ptPixels() { sync(); return { w: W, h: H, data: px }; },
+      __ptPixels() { return S.pixels(); },
     }));
   };
 
@@ -1093,6 +1109,48 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       getShaderPrecisionFormat(){ return { rangeMin: 127, rangeMax: 127, precision: 23 }; },
       getContextAttributes_: null,
     });
+    // WebGL fingerprinting renders a scene and reads it back (readPixels, or
+    // toDataURL on the canvas). With every call a no-op the readback was all
+    // zeroes no matter what was drawn, so two different scenes compared equal —
+    // the same differential tell the 2D context had. Back it with the shared
+    // surface: clears are exact, draws stamp a pattern keyed by the shader
+    // source, geometry and uniforms that produced them.
+    const S = makeSurface(canvas);
+    let clearRGBA = [0, 0, 0, 0];
+    Object.assign(gl, {
+      clearColor(r, g, b, a) {
+        S.note('clearColor|' + [r, g, b, a]);
+        const q = (v) => Math.max(0, Math.min(255, Math.round((+v || 0) * 255)));
+        clearRGBA = [q(r), q(g), q(b), q(a)];
+      },
+      clear(mask) {
+        S.note('clear|' + mask);
+        if ((mask | 0) & C.COLOR_BUFFER_BIT) { const p = S.pixels(); S.solid(0, 0, p.w, p.h, clearRGBA); }
+      },
+      viewport(x, y, w, h) { S.note('viewport|' + [x, y, w, h]); },
+      shaderSource(sh, src) { S.note('shaderSource|' + src); },
+      bufferData(target, data) { S.note('bufferData|' + [target, data && (data.length || data.byteLength)]); },
+      uniform1f(l, v) { S.note('uniform1f|' + v); },
+      uniform2f(l, a, b) { S.note('uniform2f|' + [a, b]); },
+      uniform3f(l, a, b, c2) { S.note('uniform3f|' + [a, b, c2]); },
+      uniform4f(l, a, b, c2, d) { S.note('uniform4f|' + [a, b, c2, d]); },
+      drawArrays(mode, first, count) {
+        S.note('drawArrays|' + [mode, first, count]);
+        const p = S.pixels(); S.stamp(0, 0, p.w, p.h);
+      },
+      drawElements(mode, count, type, offset) {
+        S.note('drawElements|' + [mode, count, type, offset]);
+        const p = S.pixels(); S.stamp(0, 0, p.w, p.h);
+      },
+      readPixels(x, y, w, h, format, type, dst) {
+        S.note('readPixels|' + [x, y, w, h, format, type]);
+        w = w | 0; h = h | 0;
+        if (dst && dst.length >= w * h * 4) S.read(x, y, w, h, dst);
+        return dst;
+      },
+      __ptPixels() { return S.pixels(); },
+    });
+
     // No-op the GL calls a fingerprinter drives before reading parameters.
     for (const m of ['viewport','clearColor','clear','enable','disable','createShader','shaderSource',
       'compileShader','getShaderParameter','createProgram','attachShader','linkProgram','getProgramParameter',
@@ -1108,16 +1166,21 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // --- patch canvas element methods -------------------------------------
   const proto = globalThis.HTMLElement && globalThis.HTMLElement.prototype;
   if (proto) {
-    proto.getContext = mask(function getContext(type){
+    proto.getContext = mask(function getContext(type) {
       if (this.localName !== 'canvas') return null;
-      if (type === '2d') return this.__ptC2d || (this.__ptC2d = make2DContext(this));
-      if (type === 'webgl' || type === 'experimental-webgl') return this.__ptGl1 || (this.__ptGl1 = makeGL(this, 1));
-      if (type === 'webgl2') return this.__ptGl2 || (this.__ptGl2 = makeGL(this, 2));
-      return null;
+      // A canvas keeps the first context type it was given; a real browser
+      // returns null for a conflicting request rather than a second context.
+      const t = type === 'experimental-webgl' ? 'webgl' : String(type);
+      if (this.__ptCtxType && this.__ptCtxType !== t) return null;
+      if (t !== '2d' && t !== 'webgl' && t !== 'webgl2') return null;
+      this.__ptCtxType = t;
+      if (t === '2d') return this.__ptC2d || (this.__ptC2d = make2DContext(this));
+      if (t === 'webgl') return this.__ptGl1 || (this.__ptGl1 = makeGL(this, 1));
+      return this.__ptGl2 || (this.__ptGl2 = makeGL(this, 2));
     }, 'getContext');
     proto.toDataURL = mask(function toDataURL() {
       if (this.localName !== 'canvas') return 'data:,';
-      const g = this.__ptC2d || this.getContext('2d');
+      const g = this.__ptC2d || this.__ptGl1 || this.__ptGl2 || this.getContext('2d');
       const p = g && g.__ptPixels ? g.__ptPixels() : null;
       if (!p || !p.w || !p.h) return 'data:,';
       return __pt_pngDataUrl(p.w, p.h, p.data) || 'data:,';
