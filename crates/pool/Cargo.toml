@@ -17,3 +17,14 @@ thiserror = { workspace = true }
 # Embedded JavaScript engine (Phase 1). Uses a prebuilt V8 static library, so it
 # does not compile V8 from source. One `v8::OwnedIsolate` lives per worker thread.
 v8 = "137"
+
+# Native WebCrypto primitives exposed to each context (see src/natives.rs).
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+pbkdf2 = { workspace = true }
+hkdf = { workspace = true }
+aes = { workspace = true }
+aes-gcm = { workspace = true }
+cbc = { workspace = true }
+getrandom = { workspace = true }

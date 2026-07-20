@@ -179,6 +179,9 @@ impl Isolate {
             let context = v8::Context::new(scope, v8::ContextOptions::default());
             let global = v8::Global::new(scope, context);
             let scope = &mut v8::ContextScope::new(scope, context);
+            // Native bindings must exist before the bootstrap runs — the JS
+            // WebCrypto layer is built on top of them.
+            crate::natives::install(scope);
             run_script(scope, bootstrap)?;
             global
         };

@@ -1367,6 +1367,108 @@ mod tests {
         }
     }
 
+    /// WebCrypto must be *real*: `crypto.subtle` was previously absent altogether
+    /// (an instant tell — every browser on a secure origin has it) and
+    /// `getRandomValues` was a seeded xorshift. It is now backed by native Rust
+    /// primitives, so a page that digests a known input and checks the answer sees
+    /// what Chrome would. Known-answer vectors pin correctness; the shape checks
+    /// pin that it still looks native.
+    #[tokio::test]
+    async fn webcrypto_is_real_and_looks_native() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+
+        // SubtleCrypto is promise-based, so drive the event loop before reading.
+        ctx.evaluate(
+            r#"globalThis.__t = {};
+            (async () => {
+              const hex = (b) => Array.from(new Uint8Array(b)).map(x => x.toString(16).padStart(2,'0')).join('');
+              const abc = new Uint8Array([97,98,99]);
+              const S = crypto.subtle;
+              __t.sha256 = hex(await S.digest('SHA-256', abc));
+              __t.sha1 = hex(await S.digest('SHA-1', abc));
+              const hk = await S.importKey('raw', new Uint8Array([107,101,121]), { name:'HMAC', hash:'SHA-256' }, true, ['sign','verify']);
+              const sig = await S.sign('HMAC', hk, abc);
+              __t.verifyOk = await S.verify('HMAC', hk, sig, abc);
+              __t.verifyBad = await S.verify('HMAC', hk, new Uint8Array(32), abc);
+              const ak = await S.importKey('raw', new Uint8Array(16), 'AES-GCM', true, ['encrypt','decrypt']);
+              const iv = crypto.getRandomValues(new Uint8Array(12));
+              const ct = await S.encrypt({ name:'AES-GCM', iv }, ak, abc);
+              __t.gcmRoundTrip = hex(await S.decrypt({ name:'AES-GCM', iv }, ak, ct));
+              const pk = await S.importKey('raw', new Uint8Array([112,119]), 'PBKDF2', false, ['deriveBits']);
+              __t.pbkdf2Bytes = (await S.deriveBits({ name:'PBKDF2', hash:'SHA-256', salt:new Uint8Array(8), iterations:10 }, pk, 256)).byteLength;
+              const gk = await S.generateKey({ name:'AES-GCM', length:256 }, true, ['encrypt']);
+              __t.generatedBytes = (await S.exportKey('raw', gk)).byteLength;
+              __t.keyOwn = Object.getOwnPropertyNames(gk);
+              __t.cryptoOwn = Object.getOwnPropertyNames(crypto);
+              __t.tags = [Object.prototype.toString.call(crypto),
+                          Object.prototype.toString.call(crypto.subtle),
+                          Object.prototype.toString.call(gk)];
+              __t.isSubtle = crypto.subtle instanceof SubtleCrypto;
+              __t.uuid = crypto.randomUUID();
+              __t.randomNonZero = crypto.getRandomValues(new Uint32Array(8)).some(x => x !== 0);
+              __t.distinct = crypto.randomUUID() !== crypto.randomUUID();
+              __t.natives = { digest: S.digest.toString(), getRandomValues: crypto.getRandomValues.toString() };
+              __t.rejects = await S.digest('MD5', abc).then(() => 'resolved', e => e.name);
+            })().catch(e => { __t.err = String(e); });"#,
+        )
+        .await
+        .unwrap();
+        ctx.run_event_loop().await.ok();
+        let p = probe(&ctx, "JSON.stringify(__t)").await;
+
+        assert!(p.get("err").is_none(), "WebCrypto threw: {:?}", p["err"]);
+
+        // Known-answer vectors — a fake implementation cannot produce these.
+        assert_eq!(
+            p["sha256"],
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(p["sha1"], "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(p["verifyOk"], true, "HMAC did not verify its own signature");
+        assert_eq!(p["verifyBad"], false, "HMAC verified a bogus signature");
+        assert_eq!(p["gcmRoundTrip"], "616263", "AES-GCM did not round-trip");
+        assert_eq!(p["pbkdf2Bytes"], 32);
+        assert_eq!(p["generatedBytes"], 32);
+
+        // Randomness is real, not a seeded PRNG.
+        assert_eq!(
+            p["randomNonZero"], true,
+            "getRandomValues produced all zeroes"
+        );
+        assert_eq!(p["distinct"], true, "randomUUID repeated itself");
+        let uuid = p["uuid"].as_str().unwrap_or_default();
+        assert_eq!(uuid.len(), 36, "randomUUID is malformed: {uuid}");
+        assert_eq!(&uuid[14..15], "4", "randomUUID is not version 4: {uuid}");
+
+        // ...and it still looks like a browser's.
+        for key in ["keyOwn", "cryptoOwn"] {
+            let leaked = p[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("probe missing {key}"));
+            assert!(
+                leaked.is_empty(),
+                "{key} exposes own properties: {leaked:?}"
+            );
+        }
+        assert_eq!(
+            p["tags"],
+            serde_json::json!([
+                "[object Crypto]",
+                "[object SubtleCrypto]",
+                "[object CryptoKey]"
+            ])
+        );
+        assert_eq!(p["isSubtle"], true);
+        for (name, src) in p["natives"].as_object().expect("natives object") {
+            let src = src.as_str().unwrap_or_default();
+            assert!(src.contains("[native code]"), "{name} is not masked: {src}");
+        }
+        // Unsupported algorithms reject the way the spec says, not silently.
+        assert_eq!(p["rejects"], "NotSupportedError");
+    }
+
     #[tokio::test]
     async fn interaction_click_and_type_via_synthetic_layout() {
         let _serial = serial().await;
