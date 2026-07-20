@@ -36,6 +36,7 @@ pub fn install(scope: &mut v8::HandleScope) {
     bind(scope, "__pt_hkdf", hkdf_derive);
     bind(scope, "__pt_aesgcm", aes_gcm_op);
     bind(scope, "__pt_aescbc", aes_cbc_op);
+    bind(scope, "__pt_pngDataUrl", png_data_url);
 }
 
 fn bind(scope: &mut v8::HandleScope, name: &str, cb: impl v8::MapFnTo<v8::FunctionCallback>) {
@@ -310,6 +311,59 @@ fn aes_cbc_op(
     };
     match out {
         Some(bytes) => set_bytes(scope, &mut rv, &bytes),
+        None => rv.set_null(),
+    }
+}
+
+/// `__pt_pngDataUrl(width, height, rgba)` — encode raw RGBA pixels as a real PNG
+/// and return it as a `data:` URL.
+///
+/// Canvas fingerprinting hashes `toDataURL()`, so the value has to be a genuine
+/// PNG *of the pixels the page drew*: returning a constant made every drawing —
+/// including an empty canvas — hash identically, which a differential probe
+/// spots immediately. Encoding here also keeps the expensive part out of JS.
+fn png_data_url(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let width = arg_usize(scope, args.get(0)) as u32;
+    let height = arg_usize(scope, args.get(1)) as u32;
+    let rgba = arg_bytes(args.get(2));
+
+    // Guard against absurd allocations from a hostile page.
+    if width == 0 || height == 0 || width > 8192 || height > 8192 {
+        rv.set_null();
+        return;
+    }
+    let expected = width as usize * height as usize * 4;
+    if rgba.len() != expected {
+        rv.set_null();
+        return;
+    }
+
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let Ok(mut writer) = encoder.write_header() else {
+            rv.set_null();
+            return;
+        };
+        if writer.write_image_data(&rgba).is_err() {
+            rv.set_null();
+            return;
+        }
+    }
+
+    use base64::Engine as _;
+    let url = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&out)
+    );
+    match v8::String::new(scope, &url) {
+        Some(s) => rv.set(s.into()),
         None => rv.set_null(),
     }
 }

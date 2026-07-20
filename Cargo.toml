@@ -55,6 +55,9 @@ aes = "0.8"
 aes-gcm = "0.10"
 cbc = { version = "0.1", features = ["alloc"] }
 getrandom = "0.2"
+# Real PNG encoding for canvas output (see pool/src/natives.rs).
+png = "0.17"
+base64 = "0.22"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

@@ -866,25 +866,166 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     'wcPgncvXrx48eLFgwcPggcRBEEEQdQqiLZq09TUJk2TZpMdD5Nkk2yyu9nZ3dnk+8Fjs7Mzs+/N7' +
     'OzM7MJEBEREREREREREREREREREREREREREREREREREREREREREREREREREREZE/AZUqlQGVAZUBlQ' +
     'GVAZUBlQGVAZUBlQGVAZUBlQGVAZUBlQPUb+AXcBu4Dj4EnwFPgGfAceAG8BF4Br4E3wFvgHfAe+A';
-  const make2DContext = (canvas) => maskProto(Object.assign(Object.create(globalThis.CanvasRenderingContext2D.prototype), {
-    canvas,
-    fillStyle: '#000000', strokeStyle: '#000000', font: '10px sans-serif',
-    globalAlpha: 1.0, lineWidth: 1.0, textBaseline: 'alphabetic', textAlign: 'start',
-    shadowColor: 'rgba(0, 0, 0, 0)', shadowBlur: 0, globalCompositeOperation: 'source-over',
-    fillRect(){}, clearRect(){}, strokeRect(){}, fillText(){}, strokeText(){},
-    beginPath(){}, closePath(){}, moveTo(){}, lineTo(){}, arc(){}, arcTo(){}, rect(){},
-    bezierCurveTo(){}, quadraticCurveTo(){}, ellipse(){}, fill(){}, stroke(){}, clip(){},
-    save(){}, restore(){}, translate(){}, scale(){}, rotate(){}, setTransform(){}, transform(){}, resetTransform(){},
-    drawImage(){}, putImageData(){}, setLineDash(){}, getLineDash(){ return []; },
-    isPointInPath(){ return false; },
-    measureText(t){ const w = String(t).length * 6.7; return { width: w, actualBoundingBoxLeft: 0, actualBoundingBoxRight: w, actualBoundingBoxAscent: 8, actualBoundingBoxDescent: 2, fontBoundingBoxAscent: 9, fontBoundingBoxDescent: 2 }; },
-    getImageData(x, y, w, h){ w = w|0; h = h|0; const d = new Uint8ClampedArray(Math.max(0, w * h * 4)); for (let i = 0; i < d.length; i++) d[i] = seededByte(i); return { data: d, width: w, height: h, colorSpace: 'srgb' }; },
-    createImageData(w, h){ return { data: new Uint8ClampedArray(Math.max(0, (w|0) * (h|0) * 4)), width: w|0, height: h|0 }; },
-    createLinearGradient(){ return { addColorStop(){} }; },
-    createRadialGradient(){ return { addColorStop(){} }; },
-    createPattern(){ return {}; },
-    getContextAttributes(){ return { alpha: true, colorSpace: 'srgb', desynchronized: false, willReadFrequently: false }; },
-  }));
+  // Canvas fingerprinting hashes `toDataURL()` / `getImageData()`, and the
+  // standard probe is differential: draw something, hash it, compare. Returning a
+  // fixed value (as this did) makes an empty canvas and an elaborate drawing hash
+  // identically — caught instantly. So the context keeps a real pixel buffer:
+  // solid fills are rendered exactly, and operations we cannot rasterise (text,
+  // paths, images) stamp a deterministic pattern derived from the operation log
+  // plus the per-session seed. Different drawings therefore differ, an identical
+  // drawing is stable, and results vary across sessions the way device text
+  // rendering does.
+  const parseColor = (c) => {
+    c = String(c == null ? '#000000' : c).trim().toLowerCase();
+    const named = { black: [0,0,0,255], white: [255,255,255,255], red: [255,0,0,255],
+      lime: [0,255,0,255], green: [0,128,0,255], blue: [0,0,255,255],
+      yellow: [255,255,0,255], transparent: [0,0,0,0] };
+    if (named[c]) return named[c].slice();
+    let m = /^#([0-9a-f]{3})$/.exec(c);
+    if (m) return [parseInt(m[1][0] + m[1][0], 16), parseInt(m[1][1] + m[1][1], 16), parseInt(m[1][2] + m[1][2], 16), 255];
+    m = /^#([0-9a-f]{6})$/.exec(c);
+    if (m) return [parseInt(m[1].slice(0,2), 16), parseInt(m[1].slice(2,4), 16), parseInt(m[1].slice(4,6), 16), 255];
+    m = /^rgba?\(([^)]+)\)$/.exec(c);
+    if (m) {
+      const p = m[1].split(',').map((x) => parseFloat(x));
+      return [p[0] | 0, p[1] | 0, p[2] | 0, p.length > 3 ? Math.round(Math.max(0, Math.min(1, p[3])) * 255) : 255];
+    }
+    return [0, 0, 0, 255];
+  };
+
+  const make2DContext = (canvas) => {
+    let W = -1, H = -1, px = new Uint8ClampedArray(0);
+    let ops = 2166136261 >>> 0;                 // FNV-1a over every draw call
+    let bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;     // current path bounding box
+
+    const note = (s) => {
+      s = String(s);
+      for (let i = 0; i < s.length; i++) { ops ^= s.charCodeAt(i); ops = Math.imul(ops, 16777619) >>> 0; }
+    };
+    const sync = () => {
+      const w = Math.max(0, canvas.width | 0), h = Math.max(0, canvas.height | 0);
+      if (w !== W || h !== H) { W = w; H = h; px = new Uint8ClampedArray(w * h * 4); }
+    };
+    const clip = (x, y, w, h) => {
+      x = Math.round(+x || 0); y = Math.round(+y || 0);
+      w = Math.round(+w || 0); h = Math.round(+h || 0);
+      if (w < 0) { x += w; w = -w; }
+      if (h < 0) { y += h; h = -h; }
+      return [Math.max(0, x), Math.max(0, y), Math.min(W, x + w), Math.min(H, y + h)];
+    };
+    const solid = (x, y, w, h, rgba) => {
+      sync(); const [x0, y0, x1, y1] = clip(x, y, w, h);
+      for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) {
+        const i = (yy * W + xx) * 4;
+        px[i] = rgba[0]; px[i + 1] = rgba[1]; px[i + 2] = rgba[2]; px[i + 3] = rgba[3];
+      }
+    };
+    const stamp = (x, y, w, h) => {
+      sync(); const [x0, y0, x1, y1] = clip(x, y, w, h);
+      for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) {
+        let v = (ops ^ Math.imul(xx + 1, 2654435761) ^ Math.imul(yy + 1, 40503) ^ SEED) >>> 0;
+        v = Math.imul(v ^ (v >>> 15), 2246822519) >>> 0;
+        v = (v ^ (v >>> 13)) >>> 0;
+        const i = (yy * W + xx) * 4;
+        px[i] = v & 0xff; px[i + 1] = (v >>> 8) & 0xff; px[i + 2] = (v >>> 16) & 0xff;
+        px[i + 3] = 255 - ((v >>> 24) & 0x3f);
+      }
+    };
+    const pathPoint = (x, y) => {
+      x = +x || 0; y = +y || 0;
+      if (bx1 <= bx0 && by1 <= by0) { bx0 = x; by0 = y; bx1 = x; by1 = y; }
+      bx0 = Math.min(bx0, x); by0 = Math.min(by0, y); bx1 = Math.max(bx1, x); by1 = Math.max(by1, y);
+    };
+    const paintPath = () => { stamp(bx0 - 1, by0 - 1, (bx1 - bx0) + 2, (by1 - by0) + 2); };
+    const textBox = function (t, x, y) {
+      const w = this.measureText(t).width;
+      const size = parseFloat(this.font) || 10;
+      stamp(x, y - size, w, size * 1.3);
+    };
+
+    return maskProto(Object.assign(Object.create(globalThis.CanvasRenderingContext2D.prototype), {
+      canvas,
+      fillStyle: '#000000', strokeStyle: '#000000', font: '10px sans-serif',
+      globalAlpha: 1.0, lineWidth: 1.0, textBaseline: 'alphabetic', textAlign: 'start',
+      shadowColor: 'rgba(0, 0, 0, 0)', shadowBlur: 0, globalCompositeOperation: 'source-over',
+
+      fillRect(x, y, w, h) { note('fillRect|' + [x, y, w, h, this.fillStyle]); solid(x, y, w, h, parseColor(this.fillStyle)); },
+      clearRect(x, y, w, h) { note('clearRect|' + [x, y, w, h]); solid(x, y, w, h, [0, 0, 0, 0]); },
+      strokeRect(x, y, w, h) {
+        note('strokeRect|' + [x, y, w, h, this.strokeStyle, this.lineWidth]);
+        const lw = Math.max(1, this.lineWidth | 0);
+        stamp(x, y, w, lw); stamp(x, (+y || 0) + (+h || 0) - lw, w, lw);
+        stamp(x, y, lw, h); stamp((+x || 0) + (+w || 0) - lw, y, lw, h);
+      },
+      fillText(t, x, y) { note('fillText|' + [t, x, y, this.font, this.fillStyle, this.textAlign, this.textBaseline]); textBox.call(this, t, +x || 0, +y || 0); },
+      strokeText(t, x, y) { note('strokeText|' + [t, x, y, this.font, this.strokeStyle]); textBox.call(this, t, +x || 0, +y || 0); },
+
+      beginPath() { note('beginPath'); bx0 = by0 = bx1 = by1 = 0; },
+      closePath() { note('closePath'); },
+      moveTo(x, y) { note('moveTo|' + [x, y]); pathPoint(x, y); },
+      lineTo(x, y) { note('lineTo|' + [x, y]); pathPoint(x, y); },
+      rect(x, y, w, h) { note('rect|' + [x, y, w, h]); pathPoint(x, y); pathPoint((+x || 0) + (+w || 0), (+y || 0) + (+h || 0)); },
+      arc(x, y, r) { note('arc|' + [x, y, r]); pathPoint((+x || 0) - (+r || 0), (+y || 0) - (+r || 0)); pathPoint((+x || 0) + (+r || 0), (+y || 0) + (+r || 0)); },
+      arcTo(x1, y1, x2, y2) { note('arcTo|' + [x1, y1, x2, y2]); pathPoint(x1, y1); pathPoint(x2, y2); },
+      ellipse(x, y, rx, ry) { note('ellipse|' + [x, y, rx, ry]); pathPoint((+x || 0) - (+rx || 0), (+y || 0) - (+ry || 0)); pathPoint((+x || 0) + (+rx || 0), (+y || 0) + (+ry || 0)); },
+      bezierCurveTo(a, b, c, d, e, f) { note('bezierCurveTo|' + [a, b, c, d, e, f]); pathPoint(a, b); pathPoint(e, f); },
+      quadraticCurveTo(a, b, c, d) { note('quadraticCurveTo|' + [a, b, c, d]); pathPoint(a, b); pathPoint(c, d); },
+      fill() { note('fill|' + this.fillStyle); paintPath(); },
+      stroke() { note('stroke|' + [this.strokeStyle, this.lineWidth]); paintPath(); },
+      clip() { note('clip'); },
+
+      save() { note('save'); }, restore() { note('restore'); },
+      translate(x, y) { note('translate|' + [x, y]); }, scale(x, y) { note('scale|' + [x, y]); },
+      rotate(a) { note('rotate|' + a); },
+      setTransform() { note('setTransform|' + [].slice.call(arguments)); },
+      transform() { note('transform|' + [].slice.call(arguments)); },
+      resetTransform() { note('resetTransform'); },
+      setLineDash(d) { note('setLineDash|' + d); }, getLineDash() { return []; },
+
+      drawImage(img, x, y, w, h) {
+        note('drawImage|' + [x, y, w, h, img && (img.src || img.localName)]);
+        stamp(x || 0, y || 0, w || (img && img.width) || 32, h || (img && img.height) || 32);
+      },
+      putImageData(data, x, y) {
+        note('putImageData|' + [x, y, data && data.width, data && data.height]);
+        sync();
+        if (!data || !data.data) return;
+        const dw = data.width | 0, dh = data.height | 0;
+        for (let yy = 0; yy < dh; yy++) for (let xx = 0; xx < dw; xx++) {
+          const tx = (x | 0) + xx, ty = (y | 0) + yy;
+          if (tx < 0 || ty < 0 || tx >= W || ty >= H) continue;
+          const si = (yy * dw + xx) * 4, di = (ty * W + tx) * 4;
+          px[di] = data.data[si]; px[di + 1] = data.data[si + 1];
+          px[di + 2] = data.data[si + 2]; px[di + 3] = data.data[si + 3];
+        }
+      },
+      isPointInPath() { return false; },
+      measureText(t) {
+        const w = String(t).length * 6.7;
+        return { width: w, actualBoundingBoxLeft: 0, actualBoundingBoxRight: w, actualBoundingBoxAscent: 8, actualBoundingBoxDescent: 2, fontBoundingBoxAscent: 9, fontBoundingBoxDescent: 2 };
+      },
+      getImageData(x, y, w, h) {
+        sync();
+        w = w | 0; h = h | 0;
+        const out = new Uint8ClampedArray(Math.max(0, w * h * 4));
+        for (let yy = 0; yy < h; yy++) for (let xx = 0; xx < w; xx++) {
+          const sx = (x | 0) + xx, sy = (y | 0) + yy;
+          const di = (yy * w + xx) * 4;
+          if (sx < 0 || sy < 0 || sx >= W || sy >= H) continue;
+          const si = (sy * W + sx) * 4;
+          out[di] = px[si]; out[di + 1] = px[si + 1]; out[di + 2] = px[si + 2]; out[di + 3] = px[si + 3];
+        }
+        return { data: out, width: w, height: h, colorSpace: 'srgb' };
+      },
+      createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(0, (w | 0) * (h | 0) * 4)), width: w | 0, height: h | 0, colorSpace: 'srgb' }; },
+      createLinearGradient() { note('linearGradient'); return { addColorStop() {} }; },
+      createRadialGradient() { note('radialGradient'); return { addColorStop() {} }; },
+      createPattern() { note('pattern'); return {}; },
+      getContextAttributes() { return { alpha: true, colorSpace: 'srgb', desynchronized: false, willReadFrequently: false }; },
+      // Hidden (filtered) accessor the canvas element uses to encode itself.
+      __ptPixels() { sync(); return { w: W, h: H, data: px }; },
+    }));
+  };
 
   // --- WebGL ------------------------------------------------------------
   const GL_EXTS = ['ANGLE_instanced_arrays','EXT_blend_minmax','EXT_color_buffer_half_float',
@@ -969,15 +1110,23 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   if (proto) {
     proto.getContext = mask(function getContext(type){
       if (this.localName !== 'canvas') return null;
-      if (type === '2d') return this.__c2d || (this.__c2d = make2DContext(this));
-      if (type === 'webgl' || type === 'experimental-webgl') return this.__gl1 || (this.__gl1 = makeGL(this, 1));
-      if (type === 'webgl2') return this.__gl2 || (this.__gl2 = makeGL(this, 2));
+      if (type === '2d') return this.__ptC2d || (this.__ptC2d = make2DContext(this));
+      if (type === 'webgl' || type === 'experimental-webgl') return this.__ptGl1 || (this.__ptGl1 = makeGL(this, 1));
+      if (type === 'webgl2') return this.__ptGl2 || (this.__ptGl2 = makeGL(this, 2));
       return null;
     }, 'getContext');
-    // Vary the tail per session so the canvas hash isn't a single fixed value.
-    const CANVAS_OUT = CANVAS_PNG.slice(0, -8) + ('0000000' + SEED.toString(36)).slice(-8);
-    proto.toDataURL = mask(function toDataURL(){ return this.localName === 'canvas' ? CANVAS_OUT : 'data:,'; }, 'toDataURL');
-    proto.toBlob = mask(function toBlob(cb){ if (typeof cb === 'function') cb({ size: 8192, type: 'image/png' }); }, 'toBlob');
+    proto.toDataURL = mask(function toDataURL() {
+      if (this.localName !== 'canvas') return 'data:,';
+      const g = this.__ptC2d || this.getContext('2d');
+      const p = g && g.__ptPixels ? g.__ptPixels() : null;
+      if (!p || !p.w || !p.h) return 'data:,';
+      return __pt_pngDataUrl(p.w, p.h, p.data) || 'data:,';
+    }, 'toDataURL');
+    proto.toBlob = mask(function toBlob(cb) {
+      if (typeof cb !== 'function') return;
+      const url = this.toDataURL();
+      cb({ size: Math.max(0, url.length - 22), type: 'image/png' });
+    }, 'toBlob');
   }
 
   // --- Image (new Image(); img.src = ... fires onload) ------------------
