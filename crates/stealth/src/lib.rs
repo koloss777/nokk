@@ -165,7 +165,7 @@ pub fn bootstrap_script(profile: &StealthProfile) -> String {
         .replace("__TZ_NAME_STD__", &quoted(&profile.timezone_name_std))
         .replace("__TZ_NAME_DST__", &quoted(&profile.timezone_name_dst));
 
-    format!("{env}\n{intl}\n{TIMERS_TEMPLATE}\n{FETCH_TEMPLATE}")
+    format!("{env}\n{intl}\n{TIMERS_TEMPLATE}\n{PERFORMANCE_TEMPLATE}\n{FETCH_TEMPLATE}")
 }
 
 /// The environment template. Placeholders (`__UA__`, …) are substituted by
@@ -416,14 +416,14 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   globalThis.clearTimeout = (id) => { const t = q.get(id); if (t) t.cancelled = true; q.delete(id); };
   globalThis.clearInterval = globalThis.clearTimeout;
   globalThis.queueMicrotask = (fn) => { Promise.resolve().then(fn); };
-  globalThis.requestAnimationFrame = (fn) => add(() => fn(clock), 16, false, []);
+  globalThis.requestAnimationFrame = (fn) =>
+    add(() => fn(globalThis.performance ? globalThis.performance.now() : clock), 16, false, []);
   globalThis.cancelAnimationFrame = globalThis.clearTimeout;
   globalThis.setImmediate = (fn, ...args) => add(fn, 0, false, args);
   globalThis.clearImmediate = globalThis.clearTimeout;
 
-  if (!globalThis.performance) globalThis.performance = {};
-  globalThis.performance.now = () => clock;
-  if (globalThis.performance.timeOrigin === undefined) globalThis.performance.timeOrigin = 0;
+  // `performance` is defined by PERFORMANCE_TEMPLATE (wall-clock coherent); a
+  // frame callback receives the same high-res timestamp a real browser passes.
 
   // Run the single earliest pending timer, advancing the virtual clock to its
   // due time. Returns 1 if a timer ran, 0 if the queue is empty. Microtasks
@@ -449,6 +449,99 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
 /// request on the (Chrome-fingerprinted, cookie-sharing) network client, and
 /// settles the Promise via `__pt_fetchResolve`/`__pt_fetchReject`. Bodies are
 /// treated as UTF-8 text (fine for HTML/JSON/challenge payloads).
+/// `performance`, coherent with the wall clock. A bare `{ now: () => 0 }` with
+/// `timeOrigin === 0` is an instant tell: real Chrome satisfies
+/// `timeOrigin + now() ≈ Date.now()`, exposes a `Performance` *instance* (whose
+/// own-property list is empty — everything lives on the prototype), reports a
+/// coarsened monotonic `now()`, and carries the legacy `timing`/`navigation`
+/// blocks plus Chrome's `memory`.
+const PERFORMANCE_TEMPLATE: &str = r#"(() => {
+  const ORIGIN = Date.now();
+
+  // DOMHighResTimeStamp: 0.1 ms granularity (Chrome coarsens it against timing
+  // attacks) and never decreasing. Derived from the same clock as `Date.now()`,
+  // so `timeOrigin + now()` tracks it exactly.
+  let last = 0;
+  const nowMs = () => {
+    const coarse = Math.round(Math.max(0, Date.now() - ORIGIN) * 10) / 10;
+    if (coarse > last) last = coarse;
+    return last;
+  };
+
+  // Plausible, correctly ordered navigation milestones anchored at the origin.
+  const T = (d) => ORIGIN + d;
+  const TIMING = {
+    navigationStart: T(0), unloadEventStart: 0, unloadEventEnd: 0,
+    redirectStart: 0, redirectEnd: 0,
+    fetchStart: T(1), domainLookupStart: T(2), domainLookupEnd: T(6),
+    connectStart: T(6), secureConnectionStart: T(12), connectEnd: T(24),
+    requestStart: T(25), responseStart: T(70), responseEnd: T(78),
+    domLoading: T(80), domInteractive: T(150),
+    domContentLoadedEventStart: T(151), domContentLoadedEventEnd: T(160),
+    domComplete: T(190), loadEventStart: T(191), loadEventEnd: T(196),
+  };
+  const NAVIGATION = { type: 0, redirectCount: 0 };
+  // Chrome quantises these; absent `performance.memory` under a Chrome UA is
+  // itself a tell.
+  const MEMORY = { jsHeapSizeLimit: 2172649472, totalJSHeapSize: 12800000, usedJSHeapSize: 10600000 };
+
+  // Expose a value bag as enumerable prototype getters, so instances stay free
+  // of own properties (matching every other DOM object we hand out).
+  const onProto = (proto, bag) => {
+    for (const k of Object.keys(bag)) {
+      const get = function () { return bag[k]; };
+      try { Object.defineProperty(get, 'name', { value: 'get ' + k, configurable: true }); } catch (e) {}
+      Object.defineProperty(proto, k, { get, configurable: true, enumerable: true });
+    }
+  };
+  const tag = (proto, name) => {
+    try { Object.defineProperty(proto, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {}
+  };
+
+  class PerformanceTiming { toJSON() { return Object.assign({}, TIMING); } }
+  onProto(PerformanceTiming.prototype, TIMING);
+  tag(PerformanceTiming.prototype, 'PerformanceTiming');
+
+  class PerformanceNavigation { toJSON() { return Object.assign({}, NAVIGATION); } }
+  onProto(PerformanceNavigation.prototype, NAVIGATION);
+  onProto(PerformanceNavigation.prototype, { TYPE_NAVIGATE: 0, TYPE_RELOAD: 1, TYPE_BACK_FORWARD: 2, TYPE_RESERVED: 255 });
+  tag(PerformanceNavigation.prototype, 'PerformanceNavigation');
+
+  class MemoryInfo {}
+  onProto(MemoryInfo.prototype, MEMORY);
+  tag(MemoryInfo.prototype, 'MemoryInfo');
+
+  const timing = new PerformanceTiming();
+  const navigation = new PerformanceNavigation();
+  const memory = new MemoryInfo();
+
+  class Performance {
+    now() { return nowMs(); }
+    getEntries() { return []; }
+    getEntriesByType() { return []; }
+    getEntriesByName() { return []; }
+    mark() { return undefined; }
+    measure() { return undefined; }
+    clearMarks() {}
+    clearMeasures() {}
+    clearResourceTimings() {}
+    setResourceTimingBufferSize() {}
+    addEventListener() {}
+    removeEventListener() {}
+    dispatchEvent() { return true; }
+    toJSON() {
+      return { timeOrigin: ORIGIN, timing: timing.toJSON(), navigation: navigation.toJSON() };
+    }
+  }
+  onProto(Performance.prototype, { timeOrigin: ORIGIN, timing, navigation, memory });
+  tag(Performance.prototype, 'Performance');
+
+  globalThis.Performance = Performance;
+  globalThis.PerformanceTiming = PerformanceTiming;
+  globalThis.PerformanceNavigation = PerformanceNavigation;
+  globalThis.performance = new Performance();
+})();"#;
+
 const FETCH_TEMPLATE: &str = r#"(() => {
   let fid = 1;
   const pending = new Map(); // id -> {resolve, reject, url}
@@ -1054,7 +1147,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // class body through `toString()` — an obvious tell).
     globalThis.CustomEvent, globalThis.UIEvent, globalThis.MouseEvent,
     globalThis.PointerEvent, globalThis.KeyboardEvent, globalThis.InputEvent,
-    globalThis.FocusEvent, globalThis.Text, globalThis.Comment]) {
+    globalThis.FocusEvent, globalThis.Text, globalThis.Comment,
+    globalThis.Performance, globalThis.PerformanceTiming, globalThis.PerformanceNavigation]) {
     if (C) { mask(C, C.name); if (C.prototype) maskProto(C.prototype); }
   }
 
