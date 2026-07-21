@@ -224,10 +224,46 @@ ceiling.
 
 ## Packaging & release (Phase 9)
 
+Already shipping:
 - 🟡 Prebuilt Linux binary + Docker image (`ghcr.io`), built by the tag-triggered
   [release workflow](.github/workflows/release.yml). (macOS/Windows binaries: planned.)
-- ⬜ Publish crates to crates.io.
-- ⬜ Getting-started guide and API docs on docs.rs.
+
+### Distribution channels
+
+nokk is driven over CDP, so it is useful to every scraping ecosystem, not just Rust.
+The plan is to meet users in the registry they already use. Roughly by
+value-to-effort:
+
+- ⬜ **crates.io** (Rust, native). Publish the workspace crates in dependency order
+  (`nokk-net`/`nokk-pool`/`nokk-dom`/`nokk-stealth` → `nokk-cdp` → `nokk` → `nokk-cli`),
+  each with complete `description`/`license`/`repository`/`keywords`/`readme`. First step
+  is to **claim the `nokk` / `nokk-*` names** (they are global and permanent) with an alpha
+  publish, even before the API settles. Unlocks `cargo add nokk` and free docs.rs.
+  *Build note: pulls prebuilt `v8` + BoringSSL, so consumers still need cmake/libclang —
+  document it.*
+- ⬜ **docs.rs** (Rust API docs). Free and automatic once on crates.io; needs the public
+  API documented and a `[package.metadata.docs.rs]` config for the heavy build deps.
+- ⬜ **npm** (Node) — likely the **highest-value** channel, since the primary driver is
+  Puppeteer/Playwright (JS). Ship a package that bundles/downloads the right prebuilt
+  binary per platform and exposes `launch()` → a `browserWSEndpoint` to `puppeteer.connect`
+  / `chromium.connectOverCDP`. `npx nokk` starts the server.
+- ⬜ **PyPI** (`pip`) — Python is the other huge scraping audience. A `pip install nokk`
+  that bundles the binary, launches the CDP server, and hands back an endpoint for
+  `playwright`/`pyppeteer` to connect to (thin wrapper; native PyO3 bindings are a heavier
+  follow-up). Built + published with `maturin`/`cibuildwheel`.
+- ⬜ **cargo-binstall** — near-free once on crates.io + GitHub Releases: `cargo binstall
+  nokk` fetches the prebuilt binary instead of compiling. Needs the release-artifact
+  naming `binstall` expects.
+- ⬜ **Docker Hub** mirror of the GHCR images (wider discovery than GHCR alone).
+- ⬜ **Homebrew** tap/formula (macOS/Linux CLI): `brew install nokk` — after macOS binaries
+  exist.
+- ⬜ **AUR / Debian** packaging — lower priority, community-driven.
+
+Cross-cutting prerequisites: macOS + Windows prebuilt binaries in the release workflow
+(most non-Docker channels need them), and a stable CLI/endpoint contract the wrappers can
+depend on.
+
+- ⬜ Getting-started guide (README expansion + per-channel quickstarts).
 
 ---
 
