@@ -513,10 +513,46 @@ impl BrowserContext {
     /// [`load_html`](Self::load_html) it. Requires real networking (the stub
     /// client reports [`EngineError::NavNotImplemented`]).
     pub async fn navigate(&self, url: &str) -> Result<(), EngineError> {
-        // Use the post-redirect URL as the document base, so `window.location`
-        // and relative-URL resolution reflect where we actually landed.
-        let (final_url, html) = self.fetch_text(url, "document").await?;
-        self.load_html(&final_url, &html).await
+        // Follow client-side `<meta http-equiv="refresh">` redirects, not just the
+        // HTTP ones the network layer already follows. Some gates (e.g. Google's
+        // "enable JavaScript" handoff) bounce through a meta-refresh that also sets
+        // a cookie; the in-session jar carries the cookie across hops, so following
+        // the chain lands on the real page. Capped to avoid a refresh loop.
+        const MAX_META_HOPS: usize = 6;
+        let mut current = url.to_string();
+        for _ in 0..MAX_META_HOPS {
+            // Use the post-redirect URL as the document base, so `window.location`
+            // and relative-URL resolution reflect where we actually landed.
+            let (final_url, html) = self.fetch_text(&current, "document").await?;
+            self.load_html(&final_url, &html).await?;
+            match self.meta_refresh_target(&final_url).await {
+                Some(next) if next != final_url && next != current => current = next,
+                _ => return Ok(()),
+            }
+        }
+        Ok(())
+    }
+
+    /// The absolute URL a `<meta http-equiv="refresh" content="N;url=…">` in the
+    /// current document points to (resolved against `base`), or `None` if there is
+    /// no such tag or it only reloads the same page.
+    async fn meta_refresh_target(&self, base: &str) -> Option<String> {
+        let js = r#"(() => {
+          const metas = document.getElementsByTagName('meta');
+          for (let k = 0; k < metas.length; k++) {
+            const m = metas[k];
+            if ((m.getAttribute('http-equiv') || '').toLowerCase() !== 'refresh') continue;
+            const c = m.getAttribute('content') || '';
+            const i = c.toLowerCase().indexOf('url=');
+            if (i < 0) continue;
+            return c.slice(i + 4).trim().replace(/^['"]/, '').replace(/['"]$/, '');
+          }
+          return '';
+        })()"#;
+        match self.evaluate(js).await {
+            Ok(Value::String(s)) if !s.is_empty() => resolve_url(base, &s),
+            _ => None,
+        }
     }
 
     /// Build the DOM from `html`, then run its scripts in document order and fire
@@ -1721,6 +1757,58 @@ mod tests {
         assert_eq!(p["tags"][0], "[object AudioContext]");
         assert_eq!(p["tags"][1], "function");
         assert_eq!(p["tags"][2], "function");
+    }
+
+    #[tokio::test]
+    async fn inner_text_excludes_script_and_style() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        let html = r#"<!DOCTYPE html><html><head><title>t</title><style>.x{color:red}</style></head>
+            <body>Visible text<script>var s='HIDDEN_SCRIPT';</script><style>p{margin:0}</style><p>More</p></body></html>"#;
+        ctx.load_html("https://example.com/", html).await.unwrap();
+        match ctx.evaluate("document.body.innerText").await.unwrap() {
+            Value::String(s) => {
+                assert!(
+                    s.contains("Visible text") && s.contains("More"),
+                    "missing visible text: {s}"
+                );
+                assert!(
+                    !s.contains("HIDDEN_SCRIPT"),
+                    "script text leaked into innerText: {s}"
+                );
+                assert!(
+                    !s.contains("margin") && !s.contains("color"),
+                    "style text leaked into innerText: {s}"
+                );
+            }
+            v => panic!("expected string, got {v:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn meta_refresh_target_is_detected() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        // Capital `Refresh` exercises the case-insensitive match the nav loop uses.
+        let html = r#"<!DOCTYPE html><html><head>
+            <meta http-equiv="Refresh" content="0; url=/next?x=1">
+            </head><body>Please enable JavaScript</body></html>"#;
+        ctx.load_html("https://example.com/search", html)
+            .await
+            .unwrap();
+        let detect = r#"(() => {
+          const metas = document.getElementsByTagName('meta');
+          for (let k = 0; k < metas.length; k++) { const m = metas[k];
+            if ((m.getAttribute('http-equiv')||'').toLowerCase() !== 'refresh') continue;
+            const c = m.getAttribute('content')||''; const i = c.toLowerCase().indexOf('url=');
+            if (i < 0) continue; return c.slice(i+4).trim().replace(/^['"]/,'').replace(/['"]$/,'');
+          } return ''; })()"#;
+        assert_eq!(
+            ctx.evaluate(detect).await.unwrap(),
+            Value::String("/next?x=1".into())
+        );
     }
 
     #[tokio::test]

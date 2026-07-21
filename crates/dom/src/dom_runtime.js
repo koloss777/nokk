@@ -922,8 +922,12 @@
   // Visible text of an element: skip hidden subtrees, gather text nodes, collapse
   // runs of whitespace. Not a full innerText (no per-block newlines) but enough
   // for reading rendered text.
+  const __INNERTEXT_SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'HEAD', 'TITLE']);
   function __innerText(el) {
     if (!el || el.nodeType !== ELEMENT_NODE || __isHiddenEl(el)) return '';
+    // `innerText` renders only visible content — the text inside <script>/<style>
+    // etc. is not rendered, so it must not leak into it (`textContent` includes it).
+    if (__INNERTEXT_SKIP.has(el.tagName)) return '';
     let s = '';
     for (const c of el.childNodes) {
       if (c.nodeType === TEXT_NODE) s += c.data;
