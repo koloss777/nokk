@@ -78,6 +78,18 @@ would flag today. Closing them is the top priority — coherence is the whole po
   A canvas also keeps the first context type it was given, so asking for a conflicting one
   returns `null` as a real browser does. The identity surface (vendor/renderer, ANGLE
   `UNMASKED_*`, `MAX_*`, extensions) was already Chrome-shaped and is now pinned too.
+- ✅ **Audio output depends on the graph.** `OfflineAudioContext.startRendering()`
+  returned a fixed sine keyed only on the session seed, so a 10 kHz oscillator and a 440 Hz
+  one rendered identically — the same differential tell as canvas/WebGL, and audio is the
+  third classic fingerprint (FingerprintJS/CreepJS render an oscillator through a compressor
+  and hash the samples). Nodes now record their `AudioParam`s, connections are tracked, and
+  the rendered buffer is synthesised from the actual graph: the oscillator's waveform at its
+  frequency/type, shaped by any compressor, plus per-session jitter. `AnalyserNode`'s
+  frequency/time data derive from the graph too, `oncomplete` fires (async, as the classic
+  routine waits on) alongside the promise, and the interfaces carry the right
+  `[object AudioContext]` tag. Different graphs differ, an identical graph is stable.
+  Verified live against the FingerprintJS routine. (Not a real DSP: the compressor is a
+  soft-clip approximation, so a probe modelling exact ScriptProcessor output would diverge.)
 - ✅ **Fingerprint regression tests** — a probe asserts the whole surface: no own
   properties on DOM/event/document/navigator instances, no `__pt_*` bridge global
   reachable via `getOwnPropertyNames`/`ownKeys`/`getOwnPropertyDescriptor`/`hasOwnProperty`

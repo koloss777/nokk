@@ -1223,33 +1223,146 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   }
 
   // --- AudioContext -----------------------------------------------------
-  const audioNode = () => ({ connect(){ return audioNode(); }, disconnect(){}, start(){}, stop(){},
-    gain: { value: 1, setValueAtTime(){} }, frequency: { value: 440, setValueAtTime(){} },
-    threshold: { value: -24, setValueAtTime(){} }, knee:{value:30,setValueAtTime(){}}, ratio:{value:12,setValueAtTime(){}},
-    attack:{value:0.003,setValueAtTime(){}}, release:{value:0.25,setValueAtTime(){}},
-    Q:{value:1,setValueAtTime(){}}, type: 'sine', buffer: null });
-  class BaseAudioContext {
-    constructor(){ this.sampleRate = 44100; this.currentTime = 0; this.state = 'running';
-      this.destination = audioNode(); this.listener = {}; }
-    createOscillator(){ return audioNode(); } createGain(){ return audioNode(); }
-    createAnalyser(){ return Object.assign(audioNode(), { frequencyBinCount: 1024, fftSize: 2048, getFloatFrequencyData(){}, getByteFrequencyData(){} }); }
-    createDynamicsCompressor(){ return audioNode(); } createBiquadFilter(){ return audioNode(); }
-    createScriptProcessor(){ return audioNode(); } createBuffer(ch, len, rate){ return { numberOfChannels: ch, length: len, sampleRate: rate, getChannelData(){ return new Float32Array(len); } }; }
-    createBufferSource(){ return audioNode(); } createConvolver(){ return audioNode(); }
-    createStereoPanner(){ return audioNode(); } decodeAudioData(){ return Promise.resolve(this.createBuffer(2, 44100, 44100)); }
-    resume(){ this.state = 'running'; return Promise.resolve(); } suspend(){ return Promise.resolve(); } close(){ this.state = 'closed'; return Promise.resolve(); }
-  }
-  globalThis.AudioContext = mask(class AudioContext extends BaseAudioContext {}, 'AudioContext');
-  globalThis.webkitAudioContext = globalThis.AudioContext;
-  globalThis.OfflineAudioContext = mask(class OfflineAudioContext extends BaseAudioContext {
-    constructor(ch, len, rate){ super(); this.length = len || 44100; if (rate) this.sampleRate = rate;
-      this._chans = ch || 1; }
-    startRendering(){ const len = this.length, self = this;
-      // Deterministic rendered buffer => stable audio fingerprint.
-      return Promise.resolve({ numberOfChannels: self._chans, length: len, sampleRate: self.sampleRate,
-        getChannelData(){ const a = new Float32Array(len); const amp = 0.1 + (SEED % 4096) / 4.194304e9; for (let i = 0; i < len; i++) a[i] = Math.sin(i / 100) * amp; return a; } });
+  // Audio fingerprinting renders a graph (an oscillator through a compressor) in
+  // an OfflineAudioContext and hashes the output samples. The old shim rendered a
+  // fixed sine keyed only on the session seed, so every graph produced the same
+  // samples — the same differential tell canvas/WebGL had: a 10 kHz oscillator
+  // and a 440 Hz one hashed identically. The nodes now record their parameters,
+  // connections are tracked, and the rendered buffer is synthesised from the
+  // actual graph, so different graphs differ, an identical graph is stable, and
+  // the per-session seed adds device-like jitter.
+  const audioParam = (v) => ({
+    value: v, defaultValue: v, minValue: -3.4028235e38, maxValue: 3.4028235e38, automationRate: 'a-rate',
+    setValueAtTime(x) { this.value = +x; return this; },
+    linearRampToValueAtTime(x) { this.value = +x; return this; },
+    exponentialRampToValueAtTime(x) { this.value = +x; return this; },
+    setTargetAtTime() { return this; }, setValueCurveAtTime() { return this; },
+    cancelScheduledValues() { return this; }, cancelAndHoldAtTime() { return this; },
+  });
+  const makeNode = (ctx, kind, extra) => {
+    const node = Object.assign({
+      context: ctx, numberOfInputs: 1, numberOfOutputs: 1, channelCount: 2,
+      channelCountMode: 'max', channelInterpretation: 'speakers', __ptKind: kind,
+      connect(dst) { ctx.__ptEdges.push(kind + '>' + (dst && dst.__ptKind || 'destination')); return dst && dst.connect ? dst : undefined; },
+      disconnect() {}, start() {}, stop() {},
+      addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
+    }, extra || {});
+    ctx.__ptNodes.push(node);
+    return node;
+  };
+  // FNV-1a over every node parameter + the edge list: the graph's identity.
+  const graphHash = (ctx) => {
+    let h = 2166136261 >>> 0;
+    const note = (s) => { s = String(s); for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; } };
+    for (const n of ctx.__ptNodes) {
+      note(n.__ptKind);
+      if (n.type !== undefined) note('t' + n.type);
+      for (const k of ['frequency', 'detune', 'gain', 'Q', 'threshold', 'knee', 'ratio', 'attack', 'release', 'pan', 'delayTime']) {
+        if (n[k] && typeof n[k].value === 'number') note(k + n[k].value);
+      }
     }
-  }, 'OfflineAudioContext');
+    note(ctx.__ptEdges.join(','));
+    return h >>> 0;
+  };
+  const oscWave = (type, phase) => {
+    const p = phase - Math.floor(phase);
+    if (type === 'square') return p < 0.5 ? 1 : -1;
+    if (type === 'sawtooth') return 2 * p - 1;
+    if (type === 'triangle') return 4 * Math.abs(p - 0.5) - 1;
+    return Math.sin(2 * Math.PI * p);
+  };
+  const bufferOf = (data, chans, len, rate) => {
+    const b = {
+      numberOfChannels: chans, length: len, sampleRate: rate, duration: len / rate,
+      getChannelData(c) { return c ? new Float32Array(len) : data; },
+      copyFromChannel(dst, c, start) { const s = c ? 0 : (start | 0); for (let i = 0; i < dst.length && s + i < len; i++) dst[i] = data[s + i]; },
+      copyToChannel() {},
+    };
+    return b;
+  };
+
+  class BaseAudioContext {
+    constructor() {
+      this.sampleRate = 44100; this.currentTime = 0; this.state = 'running';
+      this.__ptNodes = []; this.__ptEdges = [];
+      this.destination = makeNode(this, 'destination', { maxChannelCount: 2 });
+      this.listener = { positionX: audioParam(0), positionY: audioParam(0), positionZ: audioParam(0), setPosition() {}, setOrientation() {} };
+      this.audioWorklet = { addModule() { return Promise.resolve(); } };
+      this.onstatechange = null;
+    }
+    createOscillator() { return makeNode(this, 'oscillator', { type: 'sine', frequency: audioParam(440), detune: audioParam(0), onended: null, setPeriodicWave() {} }); }
+    createGain() { return makeNode(this, 'gain', { gain: audioParam(1) }); }
+    createAnalyser() {
+      const ctx = this;
+      return makeNode(this, 'analyser', {
+        fftSize: 2048, frequencyBinCount: 1024, minDecibels: -100, maxDecibels: -30, smoothingTimeConstant: 0.8,
+        getFloatFrequencyData(a) { const h = graphHash(ctx); for (let i = 0; i < a.length; i++) a[i] = -30 - (((h ^ Math.imul(i + 1, 2654435761)) >>> 0) % 7000) / 100; },
+        getByteFrequencyData(a) { const h = graphHash(ctx); for (let i = 0; i < a.length; i++) a[i] = ((h ^ Math.imul(i + 1, 40503)) >>> 0) % 256; },
+        getFloatTimeDomainData(a) { const h = graphHash(ctx); for (let i = 0; i < a.length; i++) a[i] = (((h ^ Math.imul(i + 1, 2246822519)) >>> 0) / 4294967295) * 2 - 1; },
+        getByteTimeDomainData(a) { const h = graphHash(ctx); for (let i = 0; i < a.length; i++) a[i] = 128 + (((h ^ Math.imul(i + 1, 668265263)) >>> 0) % 128) - 64; },
+      });
+    }
+    createDynamicsCompressor() { return makeNode(this, 'compressor', { threshold: audioParam(-24), knee: audioParam(30), ratio: audioParam(12), attack: audioParam(0.003), release: audioParam(0.25), reduction: 0 }); }
+    createBiquadFilter() { return makeNode(this, 'biquad', { type: 'lowpass', frequency: audioParam(350), detune: audioParam(0), Q: audioParam(1), gain: audioParam(0), getFrequencyResponse() {} }); }
+    createScriptProcessor() { return makeNode(this, 'scriptprocessor', { bufferSize: 4096, onaudioprocess: null }); }
+    createBufferSource() { return makeNode(this, 'buffersource', { buffer: null, playbackRate: audioParam(1), detune: audioParam(0), loop: false, onended: null }); }
+    createConvolver() { return makeNode(this, 'convolver', { buffer: null, normalize: true }); }
+    createStereoPanner() { return makeNode(this, 'stereopanner', { pan: audioParam(0) }); }
+    createDelay() { return makeNode(this, 'delay', { delayTime: audioParam(0) }); }
+    createWaveShaper() { return makeNode(this, 'waveshaper', { curve: null, oversample: 'none' }); }
+    createPanner() { return makeNode(this, 'panner', { positionX: audioParam(0), positionY: audioParam(0), positionZ: audioParam(0), setPosition() {} }); }
+    createBuffer(ch, len, rate) { return bufferOf(new Float32Array(len), ch, len, rate || this.sampleRate); }
+    createPeriodicWave() { return {}; }
+    decodeAudioData(_d, cb) { const b = this.createBuffer(2, this.sampleRate, this.sampleRate); if (typeof cb === 'function') cb(b); return Promise.resolve(b); }
+    resume() { this.state = 'running'; return Promise.resolve(); }
+    suspend() { this.state = 'suspended'; return Promise.resolve(); }
+    close() { this.state = 'closed'; return Promise.resolve(); }
+    addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
+    // Render the graph to one channel of samples: the oscillator's waveform at
+    // its frequency, shaped by any compressor, plus tiny per-session jitter.
+    __ptRender(chans, len) {
+      const nodes = this.__ptNodes;
+      const osc = nodes.find((n) => n.__ptKind === 'oscillator');
+      const comp = nodes.find((n) => n.__ptKind === 'compressor');
+      const gain = nodes.find((n) => n.__ptKind === 'gain');
+      const freq = osc && osc.frequency ? osc.frequency.value : 440;
+      const type = osc ? osc.type : 'sine';
+      const amp = gain && gain.gain ? gain.gain.value : 1;
+      const h = (graphHash(this) ^ SEED) >>> 0;
+      const jitter = (h / 4294967295) * 1e-4;      // device-DSP-scale
+      const jFreq = 1 + (h & 0x3ff) / 4096;
+      const thr = comp ? Math.pow(10, (comp.threshold.value || -24) / 20) : 1;
+      const ratio = comp ? (comp.ratio.value || 12) : 1;
+      const data = new Float32Array(len);
+      for (let i = 0; i < len; i++) {
+        const t = i / this.sampleRate;
+        let v = oscWave(type, freq * t) * 0.5 * amp;
+        if (comp) { const s = v < 0 ? -1 : 1, m = Math.abs(v); v = s * (m > thr ? thr + (m - thr) / ratio : m); }
+        data[i] = v + jitter * Math.sin(i * jFreq);
+      }
+      return bufferOf(data, chans, len, this.sampleRate);
+    }
+  }
+  const audioTag = (Ctor, name) => { try { Object.defineProperty(Ctor.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {} return Ctor; };
+  globalThis.AudioContext = audioTag(mask(class AudioContext extends BaseAudioContext {}, 'AudioContext'), 'AudioContext');
+  globalThis.webkitAudioContext = globalThis.AudioContext;
+  globalThis.OfflineAudioContext = audioTag(mask(class OfflineAudioContext extends BaseAudioContext {
+    constructor(ch, len, rate) {
+      super();
+      if (ch && typeof ch === 'object') { this.__ptChans = ch.numberOfChannels || 1; this.length = ch.length || 44100; if (ch.sampleRate) this.sampleRate = ch.sampleRate; }
+      else { this.__ptChans = ch || 1; this.length = len || 44100; if (rate) this.sampleRate = rate; }
+      this.oncomplete = null;
+    }
+    startRendering() {
+      const buffer = this.__ptRender(this.__ptChans, this.length);
+      // Fire the legacy `oncomplete` asynchronously (as the real API does; the
+      // classic FingerprintJS routine waits on it) *and* resolve the promise.
+      Promise.resolve().then(() => {
+        if (typeof this.oncomplete === 'function') { try { this.oncomplete({ renderedBuffer: buffer, type: 'complete' }); } catch (e) {} }
+      });
+      return Promise.resolve(buffer);
+    }
+  }, 'OfflineAudioContext'), 'OfflineAudioContext');
 
   // --- navigator.plugins / mimeTypes (Chrome's PDF set, properly typed) --
   // Real Chrome exposes PluginArray / MimeTypeArray / Plugin / MimeType

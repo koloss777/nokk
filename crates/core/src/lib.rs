@@ -1646,6 +1646,83 @@ mod tests {
         );
     }
 
+    /// Audio fingerprinting renders an oscillator through a compressor in an
+    /// `OfflineAudioContext` and hashes the samples. The shim rendered a fixed
+    /// sine keyed only on the seed, so every graph hashed the same — a 10 kHz and
+    /// a 440 Hz oscillator were indistinguishable. The buffer now derives from the
+    /// actual graph (node params + connections), so different graphs differ and an
+    /// identical graph stays stable.
+    #[tokio::test]
+    async fn audio_render_depends_on_the_graph() {
+        let _serial = serial().await;
+        let engine = engine(2, 4);
+        let ctx = engine.new_context().await.unwrap();
+
+        // Drive the classic FingerprintJS shape, then stash a raw-sample hash of
+        // each rendered buffer (what a real probe actually compares).
+        let setup = r#"(() => {
+          const render = (freq) => {
+            const c = new OfflineAudioContext(1, 4410, 44100);
+            const osc = c.createOscillator(); osc.type = 'triangle'; osc.frequency.value = freq;
+            const comp = c.createDynamicsCompressor();
+            comp.threshold.value = -50; comp.knee.value = 40; comp.ratio.value = 12;
+            comp.attack.value = 0; comp.release.value = 0.25;
+            osc.connect(comp); comp.connect(c.destination); osc.start(0);
+            return c.startRendering();
+          };
+          const hash = (buf) => {
+            const d = buf.getChannelData(0); let h = 0;
+            for (let i = 4000; i < 4400; i++) { h = (Math.imul(h, 31) + Math.round(d[i] * 1e7)) | 0; }
+            return h;
+          };
+          let done = null; const ready = new Promise(r => { done = r; });
+          Promise.all([render(10000), render(440), render(10000)]).then(([a, b, a2]) => {
+            globalThis.__audio = {
+              hashA: hash(a), hashB: hash(b), hashA2: hash(a2),
+              nonSilent: (() => { const d = a.getChannelData(0); for (let i = 0; i < d.length; i++) if (d[i] !== 0) return true; return false; })(),
+              len: a.length, sampleRate: a.sampleRate, channels: a.numberOfChannels, duration: a.duration,
+              analyserByFreq: (() => {
+                const mk = (f) => { const c = new OfflineAudioContext(1, 4410, 44100); const o = c.createOscillator(); o.frequency.value = f; const an = c.createAnalyser(); o.connect(an); const arr = new Float32Array(16); an.getFloatFrequencyData(arr); let s = ''; for (const x of arr) s += x + ','; return s; };
+                return mk(1000) !== mk(9000);
+              })(),
+              tags: [Object.prototype.toString.call(new AudioContext()), typeof AudioContext, typeof OfflineAudioContext]
+            };
+            done(true);
+          });
+          return ready;
+        })()"#;
+        ctx.evaluate(setup).await.unwrap();
+        ctx.run_event_loop().await.ok();
+        let p = probe(&ctx, "JSON.stringify(globalThis.__audio || null)").await;
+        assert!(!p.is_null(), "audio render promise never resolved");
+
+        // The property a fingerprinter checks: different graphs → different hash.
+        assert_ne!(
+            p["hashA"], p["hashB"],
+            "a 10kHz and a 440Hz oscillator hashed identically"
+        );
+        // ...and the same graph is reproducible (fingerprint stability).
+        assert_eq!(
+            p["hashA"], p["hashA2"],
+            "the same graph rendered two different hashes"
+        );
+        assert_eq!(p["nonSilent"], true, "rendered buffer was silent");
+        assert_eq!(
+            p["analyserByFreq"], true,
+            "analyser output did not depend on the graph"
+        );
+
+        // Buffer shape is what was requested.
+        assert_eq!(p["len"], 4410);
+        assert_eq!(p["sampleRate"], 44100);
+        assert_eq!(p["channels"], 1);
+
+        // Interfaces present and correctly tagged under a Chrome UA.
+        assert_eq!(p["tags"][0], "[object AudioContext]");
+        assert_eq!(p["tags"][1], "function");
+        assert_eq!(p["tags"][2], "function");
+    }
+
     #[tokio::test]
     async fn interaction_click_and_type_via_synthetic_layout() {
         let _serial = serial().await;
