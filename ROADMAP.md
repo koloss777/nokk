@@ -96,6 +96,14 @@ would flag today. Closing them is the top priority — coherence is the whole po
   (while staying callable), `webdriver` false and not an own property, `[native code]` for
   every page-visible function and accessor, and intact `instanceof` chains. Verified to
   *fail* on reintroduced drift, so hardening can't silently regress.
+- ✅ **Tracker/ad/analytics blocking.** Subresource requests (external scripts,
+  `fetch`/XHR) to ~3.5k known ad/analytics/tracker domains (Peter Lowe's list) are dropped
+  before they hit the wire, so those scripts never load or run — trimming the passive
+  fingerprinting surface a page can probe us with, and speeding loads. Matches exact host +
+  parent domain; on by default (`--allow-trackers` / `NOKK_ALLOW_TRACKERS` to disable).
+  Deliberately *not* an anti-bot-vendor list (DataDome/PerimeterX/hCaptcha/Cloudflare must
+  run to hand out a token). Verified: a page's `google-analytics.com`/`doubleclick.net`
+  scripts fetch 0 bytes with blocking on, the real 52 KB/116 KB files with it off.
 - ✅ **`performance` coherent with the wall clock.** Was a bare object with
   `timeOrigin === 0` and `now()` pinned to the virtual-timer clock — trivially caught by
   the standard cross-check. Now a real `Performance` instance (no own properties,

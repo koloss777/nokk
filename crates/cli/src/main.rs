@@ -75,6 +75,12 @@ struct Cli {
     #[arg(long, env = "NOKK_SESSION_STORE", value_name = "DIR")]
     session_store: Option<std::path::PathBuf>,
 
+    /// Load ad/analytics/tracker scripts instead of dropping them. Tracker
+    /// blocking is on by default (trims the passive-fingerprinting surface and
+    /// speeds loads); pass this to disable it.
+    #[arg(long, env = "NOKK_ALLOW_TRACKERS")]
+    allow_trackers: bool,
+
     /// For `--load`: retry up to N extra times if the response is a Cloudflare
     /// "Just a moment…" challenge (the pass is probabilistic).
     #[arg(long, default_value_t = 0)]
@@ -171,6 +177,7 @@ impl Cli {
             // CDP server); only the library test harness stays offline.
             use_real_network: true,
             session_store: self.session_store.clone(),
+            block_trackers: !self.allow_trackers,
             ..Default::default()
         }
     }

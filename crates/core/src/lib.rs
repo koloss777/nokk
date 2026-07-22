@@ -46,7 +46,7 @@ pub enum EngineError {
 }
 
 /// Top-level engine configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub pool: PoolConfig,
     pub client: ClientConfig,
@@ -59,6 +59,24 @@ pub struct EngineConfig {
     /// disables on-disk persistence — named sessions are still isolated and
     /// shared by name for the engine's lifetime, just not saved across runs.
     pub session_store: Option<PathBuf>,
+    /// Drop subresource requests (external scripts, `fetch`/XHR) to known
+    /// ad/analytics/tracker domains so they never load or run — trimming the
+    /// passive-fingerprinting surface. On by default. Anti-bot vendors are
+    /// deliberately *not* on the list (they must run to hand out a token).
+    pub block_trackers: bool,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            pool: PoolConfig::default(),
+            client: ClientConfig::default(),
+            stealth: StealthProfile::default(),
+            use_real_network: false,
+            session_store: None,
+            block_trackers: true,
+        }
+    }
 }
 
 struct EngineInner {
@@ -71,6 +89,9 @@ struct EngineInner {
     /// Fingerprint clients keyed by proxy, so contexts sharing a proxy share one
     /// connection pool (per-context identity without a client-per-context blow-up).
     client_pool: Mutex<HashMap<String, Client>>,
+    /// Drop subresource requests to tracker/ad/analytics domains (see
+    /// [`EngineConfig::block_trackers`]).
+    block_trackers: bool,
     /// Directory where named session jars are persisted (`None` = in-memory only).
     session_store: Option<PathBuf>,
     /// Shared, named session cookie jars — one per session name, loaded from the
@@ -269,6 +290,7 @@ impl Engine {
                 client,
                 client_config: config.client,
                 use_real_network: config.use_real_network,
+                block_trackers: config.block_trackers,
                 client_pool: Mutex::new(HashMap::new()),
                 session_store: config.session_store,
                 sessions: Mutex::new(HashMap::new()),
@@ -580,13 +602,21 @@ impl BrowserContext {
             let code = match script {
                 nokk_dom::Script::Inline(code) => code.clone(),
                 nokk_dom::Script::External(src) => match resolve_url(base_url, src) {
-                    Some(abs) => match self.fetch_text(&abs, "script").await {
-                        Ok((_, code)) => code,
-                        Err(e) => {
-                            tracing::warn!(url = %abs, error = %e, "external script fetch failed");
+                    Some(abs) => {
+                        // Don't fetch or run tracker/analytics scripts — the point
+                        // of the blocklist is that they never execute.
+                        if self.engine.block_trackers && nokk_net::is_blocked_url(&abs) {
+                            self.record("GET", &abs, "script", 0, &[]);
                             continue;
                         }
-                    },
+                        match self.fetch_text(&abs, "script").await {
+                            Ok((_, code)) => code,
+                            Err(e) => {
+                                tracing::warn!(url = %abs, error = %e, "external script fetch failed");
+                                continue;
+                            }
+                        }
+                    }
                     None => {
                         tracing::warn!(src, "could not resolve external script URL");
                         continue;
@@ -708,6 +738,16 @@ impl BrowserContext {
         let kind = headers
             .remove("x-pt-kind")
             .unwrap_or_else(|| "fetch".to_string());
+        // Blocked tracker: never hit the wire; reject like a real ad-blocker
+        // (ERR_BLOCKED_BY_CLIENT), and log it so the interception audit is complete.
+        if self.engine.block_trackers && nokk_net::is_blocked_url(&url) {
+            self.record(&method, &url, &kind, 0, &[]);
+            return format!(
+                "__pt_fetchReject({}, {})",
+                id,
+                serde_json::to_string("blocked by tracker filter").unwrap()
+            );
+        }
         let body = r["body"].as_str().map(|s| s.as_bytes().to_vec());
         let req = Request {
             method,
@@ -1757,6 +1797,51 @@ mod tests {
         assert_eq!(p["tags"][0], "[object AudioContext]");
         assert_eq!(p["tags"][1], "function");
         assert_eq!(p["tags"][2], "function");
+    }
+
+    #[tokio::test]
+    async fn tracker_scripts_are_blocked_but_benign_ones_run() {
+        let _serial = serial().await;
+        // Real network so external scripts are actually fetched; the tracker one is
+        // dropped before the wire, the benign one 404s but is attempted.
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 4,
+                max_heap_mb: None,
+            },
+            use_real_network: true,
+            block_trackers: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        let html = r#"<!DOCTYPE html><html><head></head><body>
+            <script>window.__ran = 'inline';</script>
+            <script src="https://www.google-analytics.com/analytics.js"></script>
+            </body></html>"#;
+        ctx.load_html("https://example.com/", html).await.unwrap();
+
+        // The inline script ran normally.
+        assert_eq!(
+            ctx.evaluate("window.__ran").await.unwrap(),
+            Value::String("inline".into())
+        );
+        // The tracker request never hit the wire — it's logged with status 0 and no
+        // request to google-analytics.com produced a real (non-zero) response.
+        let ga = ctx
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.contains("google-analytics.com"))
+            .map(|r| r.status)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ga,
+            vec![0],
+            "tracker script should be blocked (status 0), got {ga:?}"
+        );
     }
 
     #[tokio::test]
