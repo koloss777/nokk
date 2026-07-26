@@ -205,6 +205,16 @@ ceiling.
   `new_context_with_proxy(proxy)`. Exposed via CDP
   `Target.createBrowserContext({ proxyServer })` + `createTarget({ browserContextId })`
   (`browser.createBrowserContext({ proxyServer })` in Puppeteer). Verified end-to-end.
+- ⬜ **Per-context coherent fingerprint profiles (rotation).** Requested in
+  [#1](https://github.com/koloss777/nokk/issues/1). Rotate the *whole* fingerprint per
+  browser context, not just the User-Agent: a matched set of `{ wreq TLS emulation +
+  UA + navigator.userAgentData + sec-ch-ua + platform + screen + hardwareConcurrency +
+  timezone/locale }` where every layer agrees. Naive UA rotation is a *net negative* — a UA
+  that doesn't match the TLS/JA3 handshake or the client hints is itself a documented
+  detection signal (it's why the TLS emulation is pinned to the UA today). Ship a few
+  hand-verified coherent profiles (Chrome/Linux, Chrome/Windows, Chrome/macOS), assign one
+  per `new_context_with_identity`, and derive timezone/locale from the proxy's geoIP so they
+  stay coherent (a technique clearcote uses). Builds on the per-context identity above.
 - ✅ **Persistent / named sessions — warm up once, resume anytime.** Give a session a name
   and its cookie jar (incl. session-only cookies and `cf_clearance`) persists to
   `<store>/<name>.json`, so a session warmed up once (log in, clear a challenge) re-attaches
