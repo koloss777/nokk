@@ -64,6 +64,14 @@ pub struct EngineConfig {
     /// passive-fingerprinting surface. On by default. Anti-bot vendors are
     /// deliberately *not* on the list (they must run to hand out a token).
     pub block_trackers: bool,
+    /// Give each browser context its own coherent fingerprint. When on, a
+    /// context's identity (the Puppeteer browser-context id the CDP layer passes
+    /// through) deterministically selects one of the [`nokk_stealth::FingerprintProfile`]
+    /// presets, driving *both* its JS environment and its TLS emulation OS so the
+    /// two never contradict. Off by default: every context uses [`Self::stealth`],
+    /// which keeps runs deterministic. The default (empty-identity) context always
+    /// uses [`Self::stealth`] so the shared default client stays coherent.
+    pub rotate_fingerprint: bool,
 }
 
 impl Default for EngineConfig {
@@ -75,6 +83,7 @@ impl Default for EngineConfig {
             use_real_network: false,
             session_store: None,
             block_trackers: true,
+            rotate_fingerprint: false,
         }
     }
 }
@@ -99,8 +108,15 @@ struct EngineInner {
     sessions: Mutex<HashMap<String, Arc<SessionJar>>>,
     stealth: StealthProfile,
     /// JS run in every new context before any page script: the spoofed
-    /// `navigator`/`window`/`screen` environment. Built once from the profile.
+    /// `navigator`/`window`/`screen` environment. Built once from the default
+    /// profile; used for the default context and whenever rotation is off.
     bootstrap: String,
+    /// Give each browser context a coherent per-identity fingerprint (see
+    /// [`EngineConfig::rotate_fingerprint`]).
+    rotate_fingerprint: bool,
+    /// Per-profile bootstraps, built lazily and cached, so rotation doesn't
+    /// re-render the same ~KB of JS for every context sharing a profile.
+    profile_bootstraps: Mutex<HashMap<nokk_stealth::FingerprintProfile, String>>,
 }
 
 impl EngineInner {
@@ -109,7 +125,12 @@ impl EngineInner {
     /// the shared default client. Otherwise the client is built once per key and
     /// pooled — so each identity gets its *own* cookie jar (Puppeteer browser
     /// contexts are isolated even when they share, or omit, a proxy).
-    fn client_for(&self, key: &str, proxy: Option<ProxyConfig>) -> Result<Client, EngineError> {
+    fn client_for(
+        &self,
+        key: &str,
+        proxy: Option<ProxyConfig>,
+        emulation_os: Option<nokk_net::EmulationOs>,
+    ) -> Result<Client, EngineError> {
         if key.is_empty() || !self.use_real_network {
             return Ok(self.client.clone());
         }
@@ -125,9 +146,61 @@ impl EngineInner {
         // *different* identities don't serialise on it; re-check on insert.
         let mut cfg = self.client_config.clone();
         cfg.proxy = proxy;
+        // `emulation_os` is a deterministic function of `key` (the identity), so a
+        // pooled client for a key never disagrees with a later lookup's OS.
+        if let Some(os) = emulation_os {
+            cfg.emulation_os = os;
+        }
         let client = Client::Fingerprint(FingerprintClient::new(&cfg)?);
         let mut pool = self.client_pool.lock().unwrap_or_else(|e| e.into_inner());
         Ok(pool.entry(key.to_string()).or_insert(client).clone())
+    }
+
+    /// The rotated fingerprint profile a context `identity` should present, or
+    /// `None` when it should use the engine default. Rotation is opt-in, and the
+    /// default (empty-identity) context always uses the default so its shared
+    /// client's TLS OS stays coherent with its JS profile. The mapping is a stable
+    /// hash of the identity, so a given browser context is the same machine across
+    /// runs.
+    fn rotated_profile(&self, identity: &str) -> Option<nokk_stealth::FingerprintProfile> {
+        if !self.rotate_fingerprint || identity.is_empty() {
+            return None;
+        }
+        Some(nokk_stealth::FingerprintProfile::from_seed(identity_seed(
+            identity,
+        )))
+    }
+
+    /// The TLS emulation OS for a rotated `profile` (`None` → the default client's
+    /// OS is used unchanged).
+    fn emulation_os_of(
+        profile: Option<nokk_stealth::FingerprintProfile>,
+    ) -> Option<nokk_net::EmulationOs> {
+        profile.map(|p| emulation_os_for(&p.stealth()))
+    }
+
+    /// The per-context bootstrap JS for a rotated `profile`, or the engine default
+    /// when `profile` is `None`. Built once per profile and cached — every context
+    /// sharing a profile gets the same rendered script.
+    fn bootstrap_for(&self, profile: Option<nokk_stealth::FingerprintProfile>) -> String {
+        let Some(profile) = profile else {
+            return self.bootstrap.clone();
+        };
+        if let Some(b) = self
+            .profile_bootstraps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&profile)
+        {
+            return b.clone();
+        }
+        let stealth = profile.stealth();
+        let built = build_bootstrap(&stealth);
+        let mut cache = self
+            .profile_bootstraps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.entry(profile).or_insert(built).clone()
     }
 
     /// Filesystem path for a named session's jar, or `None` when sessions aren't
@@ -170,6 +243,7 @@ impl EngineInner {
         name: &str,
         jar: Arc<SessionJar>,
         proxy: Option<ProxyConfig>,
+        emulation_os: Option<nokk_net::EmulationOs>,
     ) -> Result<Client, EngineError> {
         if !self.use_real_network {
             return Ok(self.client.clone());
@@ -185,6 +259,9 @@ impl EngineInner {
         }
         let mut cfg = self.client_config.clone();
         cfg.proxy = proxy;
+        if let Some(os) = emulation_os {
+            cfg.emulation_os = os;
+        }
         let client = Client::Fingerprint(FingerprintClient::with_session(&cfg, Some(jar))?);
         let mut pool = self.client_pool.lock().unwrap_or_else(|e| e.into_inner());
         Ok(pool.entry(key).or_insert(client).clone())
@@ -248,6 +325,30 @@ fn emulation_os_for(profile: &StealthProfile) -> nokk_net::EmulationOs {
     }
 }
 
+/// The full per-context bootstrap JS for a stealth `profile`, in dependency order:
+/// the stealth environment (navigator/window/screen/Intl/timers/fetch), then the
+/// DOM runtime (document/Element/Event…), then the fingerprint hardening layer
+/// (which patches HTMLElement.prototype + navigator, so it must run last).
+fn build_bootstrap(profile: &StealthProfile) -> String {
+    format!(
+        "{}\n{}\n{}",
+        nokk_stealth::bootstrap_script(profile),
+        nokk_dom::runtime_js(),
+        nokk_stealth::fingerprint_script(profile),
+    )
+}
+
+/// A stable 64-bit seed (FNV-1a) for a context identity, so a given browser
+/// context maps to the same rotated fingerprint profile every run.
+fn identity_seed(s: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for b in s.bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 fn proxy_key(p: &ProxyConfig) -> String {
     format!(
         "proxy:{:?}|{}|{}|{}",
@@ -281,16 +382,8 @@ impl Engine {
         } else {
             Client::Stub(StubClient::new(config.client.clone()))
         };
-        // Per-context bootstrap, in dependency order: the stealth environment
-        // (navigator/window/screen/Intl/timers/fetch), then the DOM runtime
-        // (document/Element/Event…), then the fingerprint hardening layer (which
-        // patches HTMLElement.prototype + navigator, so it must run last).
-        let bootstrap = format!(
-            "{}\n{}\n{}",
-            nokk_stealth::bootstrap_script(&config.stealth),
-            nokk_dom::runtime_js(),
-            nokk_stealth::fingerprint_script(&config.stealth),
-        );
+        // The default context's bootstrap (used whenever rotation is off).
+        let bootstrap = build_bootstrap(&config.stealth);
         tracing::info!(
             workers = pool.worker_count(),
             max_live_contexts = pool.max_live_contexts(),
@@ -309,6 +402,8 @@ impl Engine {
                 sessions: Mutex::new(HashMap::new()),
                 stealth: config.stealth,
                 bootstrap,
+                rotate_fingerprint: config.rotate_fingerprint,
+                profile_bootstraps: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -354,8 +449,12 @@ impl Engine {
         identity: String,
         proxy: Option<ProxyConfig>,
     ) -> Result<BrowserContext, EngineError> {
-        let client = self.inner.client_for(&identity, proxy)?;
-        self.build_context(client, None).await
+        let profile = self.inner.rotated_profile(&identity);
+        let client =
+            self.inner
+                .client_for(&identity, proxy, EngineInner::emulation_os_of(profile))?;
+        let bootstrap = self.inner.bootstrap_for(profile);
+        self.build_context(client, None, bootstrap).await
     }
 
     /// Open a context bound to a named, persistent session. Its cookie jar is
@@ -370,9 +469,16 @@ impl Engine {
         name: String,
         proxy: Option<ProxyConfig>,
     ) -> Result<BrowserContext, EngineError> {
+        let profile = self.inner.rotated_profile(&name);
         let jar = self.inner.session_jar(&name)?;
-        let client = self.inner.client_for_session(&name, jar, proxy)?;
-        self.build_context(client, Some(name)).await
+        let client = self.inner.client_for_session(
+            &name,
+            jar,
+            proxy,
+            EngineInner::emulation_os_of(profile),
+        )?;
+        let bootstrap = self.inner.bootstrap_for(profile);
+        self.build_context(client, Some(name), bootstrap).await
     }
 
     /// Shared tail of context creation: acquire a slot, place on the least-loaded
@@ -381,11 +487,11 @@ impl Engine {
         &self,
         client: Client,
         session: Option<String>,
+        bootstrap: String,
     ) -> Result<BrowserContext, EngineError> {
         let permit = self.inner.pool.acquire_context().await?;
         let worker = self.inner.pool.pick_worker();
         let load = self.inner.pool.register_context(worker);
-        let bootstrap = self.inner.bootstrap.clone();
         let index = self
             .inner
             .pool
@@ -423,6 +529,18 @@ impl Engine {
             .get(name)
             .map(|j| j.snapshot())
             .unwrap_or_default()
+    }
+
+    /// The coherent stealth profile a context with this `identity` will present:
+    /// the engine default, or — with [`EngineConfig::rotate_fingerprint`] on — the
+    /// rotated per-identity preset. Its JS `ua_platform` and the TLS emulation OS
+    /// agree by construction. Exposed so callers (and the CDP layer) can see the
+    /// machine a given browser context impersonates.
+    pub fn stealth_for_identity(&self, identity: &str) -> StealthProfile {
+        self.inner
+            .rotated_profile(identity)
+            .map(|p| p.stealth())
+            .unwrap_or_else(|| self.inner.stealth.clone())
     }
 
     /// The stealth injection script for this engine's profile — the code the CDP
@@ -1873,6 +1991,65 @@ mod tests {
         assert_eq!(
             emulation_os_for(&FingerprintProfile::ChromeMac.stealth()),
             nokk_net::EmulationOs::Mac
+        );
+    }
+
+    #[test]
+    fn rotation_off_gives_every_context_the_default_profile() {
+        let eng = Engine::new(EngineConfig::default()).unwrap();
+        let d = StealthProfile::default();
+        for id in ["", "ctx-a", "ctx-b", "session-x"] {
+            assert_eq!(eng.stealth_for_identity(id).user_agent, d.user_agent);
+            assert_eq!(eng.stealth_for_identity(id).platform, d.platform);
+        }
+    }
+
+    #[test]
+    fn rotation_is_per_identity_stable_and_coherent() {
+        let eng = Engine::new(EngineConfig {
+            rotate_fingerprint: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // The default (empty-identity) context keeps the default profile so the
+        // shared default client's TLS OS stays coherent with its JS profile.
+        assert_eq!(
+            eng.stealth_for_identity("").platform,
+            StealthProfile::default().platform
+        );
+
+        // A given identity always resolves to the same machine (stable hash).
+        assert_eq!(
+            eng.stealth_for_identity("ctx-a").user_agent,
+            eng.stealth_for_identity("ctx-a").user_agent
+        );
+
+        // Every resolved profile is internally coherent: its JS Client-Hints
+        // platform and the TLS emulation OS it will use agree.
+        for i in 0..40 {
+            let id = format!("browser-context-{i}");
+            let sp = eng.stealth_for_identity(&id);
+            let os = emulation_os_for(&sp);
+            let expected = match sp.ua_platform.as_str() {
+                "Windows" => nokk_net::EmulationOs::Windows,
+                "macOS" => nokk_net::EmulationOs::Mac,
+                "Linux" => nokk_net::EmulationOs::Linux,
+                other => panic!("unexpected ua_platform {other}"),
+            };
+            assert_eq!(os, expected, "TLS OS must match the JS platform for {id}");
+        }
+
+        // Rotation actually surfaces more than one OS across a spread of contexts.
+        let seen: std::collections::HashSet<_> = (0..40)
+            .map(|i| {
+                eng.stealth_for_identity(&format!("browser-context-{i}"))
+                    .ua_platform
+            })
+            .collect();
+        assert!(
+            seen.len() >= 2,
+            "rotation should present multiple OS profiles, saw {seen:?}"
         );
     }
 

@@ -81,6 +81,13 @@ struct Cli {
     #[arg(long, env = "NOKK_ALLOW_TRACKERS")]
     allow_trackers: bool,
 
+    /// Give each browser context its own coherent fingerprint (OS, UA, screen,
+    /// WebGL, and a matching TLS emulation), selected deterministically from the
+    /// context's identity. Off by default; useful when driving many isolated
+    /// contexts that should each look like a different machine.
+    #[arg(long, env = "NOKK_ROTATE_FINGERPRINT")]
+    rotate_fingerprint: bool,
+
     /// For `--load`: retry up to N extra times if the response is a Cloudflare
     /// "Just a moment…" challenge (the pass is probabilistic).
     #[arg(long, default_value_t = 0)]
@@ -178,6 +185,7 @@ impl Cli {
             use_real_network: true,
             session_store: self.session_store.clone(),
             block_trackers: !self.allow_trackers,
+            rotate_fingerprint: self.rotate_fingerprint,
             ..Default::default()
         }
     }
