@@ -48,28 +48,122 @@ pub struct StealthProfile {
 }
 
 impl Default for StealthProfile {
-    /// A recent stable Chrome on desktop Linux. Bump alongside the network
-    /// profile when Chrome's stable channel moves.
+    /// A recent stable Chrome on desktop Linux — the [`FingerprintProfile::ChromeLinux`]
+    /// preset, so there is one source of truth for the default identity.
     fn default() -> Self {
-        Self {
-            // Keep the Chrome major version in step with the TLS emulation
-            // (`nokk_net::FingerprintClient::EMULATION` = Chrome 137), or
-            // the JS UA and the ClientHello disagree — an instant tell.
-            user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-                         (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
-                .into(),
-            platform: "Linux x86_64".into(),
-            languages: vec!["en-US".into(), "en".into()],
-            hardware_concurrency: 8,
-            device_memory_gb: 8,
-            vendor: "Google Inc.".into(),
-            webgl_vendor: "Google Inc. (Intel)".into(),
-            webgl_renderer: "ANGLE (Intel, Mesa Intel(R) UHD Graphics, OpenGL 4.6)".into(),
-            timezone: "America/New_York".into(),
-            timezone_offset_minutes: 300, // EST (UTC-5); DST rule yields EDT (240)
-            timezone_dst: "us".into(),
-            timezone_name_std: "Eastern Standard Time".into(),
-            timezone_name_dst: "Eastern Daylight Time".into(),
+        FingerprintProfile::ChromeLinux.stealth()
+    }
+}
+
+/// The Chrome major version every profile's UA / client hints report. **Must**
+/// match the TLS emulation (`nokk_net::FingerprintClient::EMULATION` = Chrome
+/// 137) or the JS UA and the ClientHello disagree — an instant anti-bot tell.
+pub const CHROME_MAJOR: &str = "137";
+
+/// The OS a fingerprint profile emulates. The network layer maps this to a wreq
+/// `EmulationOS` so the TLS ClientHello matches the profile's UA and platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileOs {
+    Linux,
+    Windows,
+    Mac,
+}
+
+/// A named, internally-coherent fingerprint preset.
+///
+/// Rotating these per browser context makes distinct contexts look like distinct
+/// machines — but *only* because every layer agrees. Naive User-Agent rotation is
+/// a net negative: a UA that doesn't match the platform, the TLS/JA3 handshake, or
+/// the `sec-ch-ua` client hints is itself a documented detection signal. Each
+/// preset therefore drives the whole [`StealthProfile`] and names the OS the TLS
+/// emulation must use ([`Self::os`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FingerprintProfile {
+    ChromeLinux,
+    ChromeWindows,
+    ChromeMac,
+}
+
+impl FingerprintProfile {
+    /// Every preset, for rotation.
+    pub const ALL: [FingerprintProfile; 3] =
+        [Self::ChromeLinux, Self::ChromeWindows, Self::ChromeMac];
+
+    /// The OS this preset emulates (drives the TLS `EmulationOS`).
+    pub fn os(self) -> ProfileOs {
+        match self {
+            Self::ChromeLinux => ProfileOs::Linux,
+            Self::ChromeWindows => ProfileOs::Windows,
+            Self::ChromeMac => ProfileOs::Mac,
+        }
+    }
+
+    /// Deterministically pick a preset from a seed — a context's identity seed
+    /// maps to a stable-but-varied profile for per-context rotation.
+    pub fn from_seed(seed: u64) -> Self {
+        Self::ALL[(seed % Self::ALL.len() as u64) as usize]
+    }
+
+    /// The coherent [`StealthProfile`] for this preset: every field
+    /// (UA / platform / vendor / WebGL / concurrency) agrees with the OS, and the
+    /// Chrome major matches the TLS emulation.
+    pub fn stealth(self) -> StealthProfile {
+        // Timezone is device- not OS-specific; keep one coherent US/Eastern zone
+        // for all presets until geoIP-derived zones land.
+        let tz = || {
+            (
+                "America/New_York".to_string(),
+                300,
+                "us".to_string(),
+                "Eastern Standard Time".to_string(),
+                "Eastern Daylight Time".to_string(),
+            )
+        };
+        let (timezone, timezone_offset_minutes, timezone_dst, timezone_name_std, timezone_name_dst) =
+            tz();
+        let common =
+            |ua: &str, platform: &str, hw: u32, webgl_vendor: &str, webgl_renderer: &str| {
+                StealthProfile {
+                    user_agent: ua.to_string(),
+                    platform: platform.to_string(),
+                    languages: vec!["en-US".into(), "en".into()],
+                    hardware_concurrency: hw,
+                    device_memory_gb: 8, // Chrome caps navigator.deviceMemory at 8
+                    vendor: "Google Inc.".into(),
+                    webgl_vendor: webgl_vendor.to_string(),
+                    webgl_renderer: webgl_renderer.to_string(),
+                    timezone: timezone.clone(),
+                    timezone_offset_minutes,
+                    timezone_dst: timezone_dst.clone(),
+                    timezone_name_std: timezone_name_std.clone(),
+                    timezone_name_dst: timezone_name_dst.clone(),
+                }
+            };
+        match self {
+            Self::ChromeLinux => common(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+                 Chrome/137.0.0.0 Safari/537.36",
+                "Linux x86_64",
+                8,
+                "Google Inc. (Intel)",
+                "ANGLE (Intel, Mesa Intel(R) UHD Graphics, OpenGL 4.6)",
+            ),
+            Self::ChromeWindows => common(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
+                 Chrome/137.0.0.0 Safari/537.36",
+                "Win32",
+                16,
+                "Google Inc. (NVIDIA)",
+                "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002503) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+            ),
+            Self::ChromeMac => common(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+                "MacIntel",
+                8,
+                "Google Inc. (Apple)",
+                "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
+            ),
         }
     }
 }
@@ -1687,6 +1781,56 @@ fn json_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_profiles_are_internally_coherent() {
+        // Each preset's UA OS token must match its `navigator.platform`, its WebGL
+        // renderer must match the OS's graphics stack, and every preset must report
+        // the same Chrome major as the TLS emulation. A mismatch here is exactly the
+        // tell coherent rotation exists to avoid.
+        for p in FingerprintProfile::ALL {
+            let s = p.stealth();
+            assert!(
+                s.user_agent.contains(&format!("Chrome/{CHROME_MAJOR}.")),
+                "{p:?} UA is not Chrome {CHROME_MAJOR}: {}",
+                s.user_agent
+            );
+            match p.os() {
+                ProfileOs::Linux => {
+                    assert!(s.user_agent.contains("Linux") && s.platform == "Linux x86_64");
+                    assert!(s.webgl_renderer.contains("OpenGL"));
+                }
+                ProfileOs::Windows => {
+                    assert!(s.user_agent.contains("Windows NT") && s.platform == "Win32");
+                    assert!(s.webgl_renderer.contains("Direct3D11"));
+                }
+                ProfileOs::Mac => {
+                    assert!(s.user_agent.contains("Mac OS X") && s.platform == "MacIntel");
+                    assert!(s.webgl_renderer.contains("Metal"));
+                }
+            }
+            // deviceMemory never exceeds Chrome's cap; vendor is always Google.
+            assert!(s.device_memory_gb <= 8);
+            assert_eq!(s.vendor, "Google Inc.");
+        }
+    }
+
+    #[test]
+    fn default_is_the_linux_preset_and_seed_rotates() {
+        // Backward-compat: the default identity is the Chrome/Linux preset.
+        assert_eq!(
+            StealthProfile::default().user_agent,
+            FingerprintProfile::ChromeLinux.stealth().user_agent
+        );
+        // A seed maps to a stable preset, and sweeping seeds hits all of them.
+        assert_eq!(
+            FingerprintProfile::from_seed(0),
+            FingerprintProfile::from_seed(3)
+        );
+        let seen: std::collections::HashSet<_> =
+            (0..3u64).map(FingerprintProfile::from_seed).collect();
+        assert_eq!(seen.len(), 3, "seed rotation did not cover all presets");
+    }
 
     #[test]
     fn default_profile_hides_webdriver() {
