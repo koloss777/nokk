@@ -46,6 +46,50 @@ async def main():
 asyncio.run(main())
 ```
 
+### Async launcher
+
+`launch()` is a quick synchronous call. In an async program, use
+`launch_async()` so nothing blocks the event loop:
+
+```python
+import asyncio, nokk
+from playwright.async_api import async_playwright
+
+async def main():
+    async with await nokk.launch_async() as server, async_playwright() as pw:
+        browser = await pw.chromium.connect_over_cdp(server.ws_endpoint)
+        page = await browser.new_page()
+        await page.goto("https://example.com")
+        print(await page.title())
+
+asyncio.run(main())
+```
+
+## Give an AI agent a stealth browser (MCP)
+
+`nokk` ships an [MCP](https://modelcontextprotocol.io) server, so an AI agent
+(Claude Desktop, Claude Code, …) can browse and scrape through nokk's
+fingerprinted engine instead of a headful browser that anti-bots flag. Install
+the extra and register it:
+
+```bash
+pip install "nokk[mcp]"
+```
+
+```json
+{
+  "mcpServers": {
+    "nokk": { "command": "python", "args": ["-m", "nokk.mcp", "--rotate-fingerprint"] }
+  }
+}
+```
+
+Use the `python` from the environment where you installed `nokk[mcp]` (its full
+path if the client doesn't share your shell). Tools: `open`, `read_text`,
+`read_html`, `click`, `fill`, `evaluate`, `links`, `reset`. Run it directly with
+`python -m nokk.mcp`; it accepts `--proxy`, `--rotate-fingerprint`,
+`--geoip-timezone`, `--session-store`, `--workers`.
+
 ## `launch()` options
 
 `nokk.launch()` starts the CDP server on a free port and returns a `NokkServer`

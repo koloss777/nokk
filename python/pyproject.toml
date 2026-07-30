@@ -11,9 +11,10 @@ build-backend = "maturin"
 
 [project]
 name = "nokk"
-# PEP 440 form of the git tag (v0.1.18-alpha -> 0.1.18a1). CI overrides this from
+# PEP 440 form of the git tag (v0.1.19-alpha -> 0.1.19a1). CI overrides this from
 # the tag at publish time; keep it in step with the release when bumping by hand.
-version = "0.1.18a1"
+# Each PyPI upload needs a fresh version — 0.1.18a1 is already published.
+version = "0.1.19a1"
 description = "Undetectable headless-browser engine: a lightweight, Chrome-fingerprinted CDP server for Puppeteer/Playwright scraping. pip install and connect — no browser download."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -36,6 +37,13 @@ classifiers = [
     "Topic :: Software Development :: Testing",
     "Operating System :: POSIX :: Linux",
 ]
+
+[project.optional-dependencies]
+# `pip install "nokk[mcp]"` — run nokk as a Model Context Protocol server so an
+# AI agent can drive the stealth browser: `python -m nokk.mcp`.
+# (No console-script entry point: maturin `bindings = "bin"` reserves the wheel's
+# script slot for the embedded `nokk` binary, so the MCP server is run via -m.)
+mcp = ["mcp>=1.2", "websockets>=12"]
 
 [project.urls]
 Homepage = "https://github.com/koloss777/nokk"

@@ -274,19 +274,27 @@ value-to-effort:
   Puppeteer/Playwright (JS). Ship a package that bundles/downloads the right prebuilt
   binary per platform and exposes `launch()` → a `browserWSEndpoint` to `puppeteer.connect`
   / `chromium.connectOverCDP`. `npx nokk` starts the server.
-- 🟡 **PyPI** (`pip`) — Python is the other huge scraping audience. **Scaffolded** in
-  [`python/`](python/): a thin launcher wheel that bundles the binary (the pattern `ruff`/`uv`
-  use), built with `maturin` (`bindings = "bin"`, `manifest-path` → `crates/cli`) so each
-  platform wheel embeds the `nokk` binary — `pip install nokk` needs no toolchain, no
-  BoringSSL build, no Docker. `nokk.launch(port, workers, proxy, rotate_fingerprint…)` spawns
-  the CDP server, waits on `/json/version`, and returns a `NokkServer` whose `ws_endpoint`
-  goes to `playwright`/`pyppeteer` `connect_over_cdp`; it's a context manager and self-cleans
-  at exit. Launcher is **validated end-to-end** against a local binary. Remaining: land the
-  first real [wheel CI run](.github/workflows/python-wheels.yml) (manylinux_2_28 building
-  BoringSSL + prebuilt V8 — see [BUILD.md](docs/BUILD.md)), set up PyPI trusted publishing,
-  and claim the `nokk` name with an alpha publish. Native PyO3 bindings are a heavier
-  follow-up with unclear benefit (the interface is CDP). macOS/Windows wheels wait on those
-  binaries. `nokk` is free on PyPI.
+- 🟡 **PyPI** (`pip`) — **published**: [`pip install nokk`](https://pypi.org/project/nokk/)
+  works (name claimed, `0.1.18a1` live). A thin launcher wheel in [`python/`](python/) bundles
+  the binary (the `ruff`/`uv` pattern), built with `maturin` (`bindings = "bin"`,
+  `manifest-path` → `crates/cli`) so each wheel embeds the `nokk` binary — no toolchain, no
+  BoringSSL build, no Docker. `nokk.launch(…)` / async `nokk.launch_async(…)` spawn the CDP
+  server, wait on `/json/version`, and return a self-cleaning server whose `ws_endpoint` goes
+  to `playwright`/`pyppeteer` `connect_over_cdp`. Also ships an **MCP server** — see below.
+  Remaining: automate releases via the [wheel CI](.github/workflows/python-wheels.yml)
+  (manylinux_2_28 building BoringSSL + prebuilt V8 — see [BUILD.md](docs/BUILD.md)) with PyPI
+  trusted publishing; the first publish was a manual `twine upload`. Native PyO3 bindings are
+  a heavier follow-up with unclear benefit (the interface is CDP). macOS/Windows wheels wait
+  on those binaries.
+- 🟡 **MCP server** (`nokk[mcp]`) — nokk as a [Model Context Protocol](https://modelcontextprotocol.io)
+  stdio server (`python -m nokk.mcp`), so an AI agent (Claude Desktop/Code, …)
+  browses through the stealth engine instead of a headful browser anti-bots flag. A minimal
+  async CDP client ([`python/nokk/_cdp.py`](python/nokk/_cdp.py)) — no Playwright dependency —
+  backs `open`/`read_text`/`read_html`/`click`/`fill`/`evaluate`/`links`/`reset` over stdio;
+  built on `launch_async`. Validated end-to-end against a local binary (SDK v2 `MCPServer`
+  with a v1 `FastMCP` fallback). Follow-up: richer tools (wait-for, screenshots are N/A
+  without rendering), and `click`/`fill` via the CDP `Input` domain for `isTrusted` events
+  (currently JS-dispatched).
 - ⬜ **cargo-binstall** — near-free once on crates.io + GitHub Releases: `cargo binstall
   nokk` fetches the prebuilt binary instead of compiling. Needs the release-artifact
   naming `binstall` expects.

@@ -210,6 +210,36 @@ timezone disagrees with its IP is a classic tell. Both flags are off by default,
 context stays deterministic. From the Rust API these are `EngineConfig::rotate_fingerprint`
 and `EngineConfig::geoip_timezone`.
 
+### From Python (`pip install nokk`)
+
+nokk ships a [PyPI package](https://pypi.org/project/nokk/) that **embeds the prebuilt
+binary** — no toolchain, no browser download, no Docker. `launch()` (or async
+`launch_async()`) starts the CDP server and hands back an endpoint for Playwright/pyppeteer:
+
+```python
+import nokk
+from playwright.sync_api import sync_playwright
+
+with nokk.launch(rotate_fingerprint=True) as server, sync_playwright() as pw:
+    browser = pw.chromium.connect_over_cdp(server.ws_endpoint)
+    page = browser.new_page()
+    page.goto("https://example.com")
+    print(page.title())
+```
+
+### As an MCP server (give an AI agent a stealth browser)
+
+With the `nokk[mcp]` extra, nokk runs as a [Model Context Protocol](https://modelcontextprotocol.io)
+server, so an AI agent (Claude Desktop/Code, …) can browse and scrape through the
+fingerprinted engine instead of a headful browser anti-bots flag:
+
+```jsonc
+// pip install "nokk[mcp]"   (use the python from that environment)
+{ "mcpServers": { "nokk": { "command": "python", "args": ["-m", "nokk.mcp", "--rotate-fingerprint"] } } }
+```
+
+Tools: `open`, `read_text`, `read_html`, `click`, `fill`, `evaluate`, `links`, `reset`.
+
 ## How it works
 
 nokk is a Cargo workspace of small, single-responsibility crates:

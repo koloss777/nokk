@@ -5,7 +5,7 @@ over the Chrome DevTools Protocol. This package embeds the prebuilt ``nokk``
 binary, so there is nothing to build and no browser to download — ``pip install
 nokk`` and go.
 
-Basic use with Playwright::
+Synchronous::
 
     import nokk
     from playwright.sync_api import sync_playwright
@@ -16,15 +16,15 @@ Basic use with Playwright::
         page.goto("https://example.com")
         print(page.title())
 
-Or with pyppeteer::
+Asynchronous (never blocks the event loop)::
 
     import asyncio, nokk
-    from pyppeteer import connect
+    from playwright.async_api import async_playwright
 
     async def main():
-        with nokk.launch() as server:
-            browser = await connect(browserWSEndpoint=server.ws_endpoint)
-            page = await browser.newPage()
+        async with await nokk.launch_async() as server, async_playwright() as pw:
+            browser = await pw.chromium.connect_over_cdp(server.ws_endpoint)
+            page = await browser.new_page()
             await page.goto("https://example.com")
             print(await page.title())
 
@@ -33,6 +33,7 @@ Or with pyppeteer::
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import contextlib
 import os
@@ -44,9 +45,16 @@ import sysconfig
 import time
 import urllib.request
 from pathlib import Path
-from typing import Mapping, Optional, Sequence, Union
+from typing import List, Mapping, Optional, Sequence, Union
 
-__all__ = ["launch", "NokkServer", "binary_path", "__version__"]
+__all__ = [
+    "launch",
+    "launch_async",
+    "NokkServer",
+    "AsyncNokkServer",
+    "binary_path",
+    "__version__",
+]
 
 try:  # populated from the installed distribution metadata
     from importlib.metadata import PackageNotFoundError, version as _pkg_version
@@ -59,6 +67,8 @@ except Exception:  # pragma: no cover - importlib.metadata always present on 3.8
     __version__ = "0.0.0"
 
 _EXE = "nokk.exe" if os.name == "nt" else "nokk"
+
+PathLike = Union[str, "os.PathLike[str]"]
 
 
 def binary_path() -> str:
@@ -107,6 +117,62 @@ def _free_port(host: str) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((host, 0))
         return s.getsockname()[1]
+
+
+def _build_command(
+    host: str,
+    port: int,
+    *,
+    workers: Optional[int],
+    max_contexts: Optional[int],
+    proxy: Optional[str],
+    session_store: Optional[PathLike],
+    rotate_fingerprint: bool,
+    geoip_timezone: bool,
+    allow_trackers: bool,
+    args: Optional[Sequence[str]],
+) -> List[str]:
+    cmd = [binary_path(), "--host", host, "--port", str(port)]
+    if workers is not None:
+        cmd += ["--workers", str(workers)]
+    if max_contexts is not None:
+        cmd += ["--max-contexts", str(max_contexts)]
+    if proxy:
+        cmd += ["--proxy", proxy]
+    if session_store is not None:
+        cmd += ["--session-store", os.fspath(session_store)]
+    if rotate_fingerprint:
+        cmd.append("--rotate-fingerprint")
+    if geoip_timezone:
+        cmd.append("--geoip-timezone")
+    if allow_trackers:
+        cmd.append("--allow-trackers")
+    if args:
+        cmd += list(args)
+    return cmd
+
+
+def _merged_env(env: Optional[Mapping[str, str]]) -> "dict[str, str]":
+    proc_env = dict(os.environ)
+    if env:
+        proc_env.update(env)
+    return proc_env
+
+
+def _terminate_quiet(process: "asyncio.subprocess.Process") -> None:
+    """Best-effort, exception-free terminate — safe to call from ``atexit``.
+
+    ``Process.terminate`` only sends the signal (no await), so this is fine even
+    though the loop is gone by interpreter-exit time.
+    """
+    with contextlib.suppress(Exception):
+        if process.returncode is None:
+            process.terminate()
+
+
+# --------------------------------------------------------------------------- #
+# Synchronous API
+# --------------------------------------------------------------------------- #
 
 
 class NokkServer:
@@ -175,8 +241,7 @@ class NokkServer:
         self.close()
 
     def __repr__(self) -> str:
-        alive = self._process.poll() is None
-        state = "running" if alive else "stopped"
+        state = "running" if self._process.poll() is None else "stopped"
         return f"<NokkServer {self.host}:{self.port} ({state}) pid={self.pid}>"
 
 
@@ -187,7 +252,7 @@ def launch(
     workers: Optional[int] = None,
     max_contexts: Optional[int] = None,
     proxy: Optional[str] = None,
-    session_store: Optional[Union[str, "os.PathLike[str]"]] = None,
+    session_store: Optional[PathLike] = None,
     rotate_fingerprint: bool = False,
     geoip_timezone: bool = False,
     allow_trackers: bool = False,
@@ -196,6 +261,8 @@ def launch(
     timeout: float = 30.0,
 ) -> NokkServer:
     """Start a ``nokk`` CDP server and return a :class:`NokkServer`.
+
+    See :func:`launch_async` for an equivalent that never blocks the event loop.
 
     :param host: address to bind (default loopback).
     :param port: TCP port; ``0`` (default) picks a free one.
@@ -216,29 +283,19 @@ def launch(
     :raises TimeoutError: if the server does not become ready in ``timeout``.
     """
     resolved_port = port or _free_port(host)
-    cmd = [binary_path(), "--host", host, "--port", str(resolved_port)]
-    if workers is not None:
-        cmd += ["--workers", str(workers)]
-    if max_contexts is not None:
-        cmd += ["--max-contexts", str(max_contexts)]
-    if proxy:
-        cmd += ["--proxy", proxy]
-    if session_store is not None:
-        cmd += ["--session-store", os.fspath(session_store)]
-    if rotate_fingerprint:
-        cmd.append("--rotate-fingerprint")
-    if geoip_timezone:
-        cmd.append("--geoip-timezone")
-    if allow_trackers:
-        cmd.append("--allow-trackers")
-    if args:
-        cmd += list(args)
-
-    proc_env = dict(os.environ)
-    if env:
-        proc_env.update(env)
-
-    process = subprocess.Popen(cmd, env=proc_env)
+    cmd = _build_command(
+        host,
+        resolved_port,
+        workers=workers,
+        max_contexts=max_contexts,
+        proxy=proxy,
+        session_store=session_store,
+        rotate_fingerprint=rotate_fingerprint,
+        geoip_timezone=geoip_timezone,
+        allow_trackers=allow_trackers,
+        args=args,
+    )
+    process = subprocess.Popen(cmd, env=_merged_env(env))
     server = NokkServer(process, host, resolved_port)
     try:
         server._wait_until_ready(timeout)
@@ -246,4 +303,137 @@ def launch(
         server.close()
         raise
     atexit.register(server.close)
+    return server
+
+
+# --------------------------------------------------------------------------- #
+# Asynchronous API
+# --------------------------------------------------------------------------- #
+
+
+async def _ready_async(host: str, port: int, timeout: float) -> bool:
+    """Whether the CDP HTTP endpoint answers 200, without blocking the loop."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout
+        )
+    except Exception:
+        return False
+    try:
+        writer.write(
+            f"GET /json/version HTTP/1.0\r\nHost: {host}:{port}\r\n"
+            f"Connection: close\r\n\r\n".encode()
+        )
+        await writer.drain()
+        status = await asyncio.wait_for(reader.readline(), timeout)
+        return b" 200 " in status
+    except Exception:
+        return False
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+
+
+class AsyncNokkServer:
+    """A running ``nokk`` CDP server managed on the asyncio loop.
+
+    Returned by :func:`launch_async`. Use ``async with`` or :meth:`aclose`.
+    """
+
+    def __init__(self, process: "asyncio.subprocess.Process", host: str, port: int):
+        self._process = process
+        self.host = host
+        self.port = port
+
+    @property
+    def ws_endpoint(self) -> str:
+        return f"ws://{self.host}:{self.port}/devtools/browser/nokk"
+
+    @property
+    def http_endpoint(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    @property
+    def pid(self) -> int:
+        return self._process.pid
+
+    async def _wait_until_ready(self, timeout: float) -> None:
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if self._process.returncode is not None:
+                raise RuntimeError(
+                    f"nokk exited before becoming ready (code {self._process.returncode})"
+                )
+            if await _ready_async(self.host, self.port, 1.0):
+                return
+            await asyncio.sleep(0.05)
+        raise TimeoutError(f"nokk did not become ready within {timeout:.1f}s")
+
+    async def aclose(self, timeout: float = 5.0) -> None:
+        """Stop the server. Idempotent."""
+        proc = self._process
+        if proc.returncode is not None:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout)
+        except Exception:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+
+    async def __aenter__(self) -> "AsyncNokkServer":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
+
+    def __repr__(self) -> str:
+        state = "running" if self._process.returncode is None else "stopped"
+        return f"<AsyncNokkServer {self.host}:{self.port} ({state}) pid={self.pid}>"
+
+
+async def launch_async(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    workers: Optional[int] = None,
+    max_contexts: Optional[int] = None,
+    proxy: Optional[str] = None,
+    session_store: Optional[PathLike] = None,
+    rotate_fingerprint: bool = False,
+    geoip_timezone: bool = False,
+    allow_trackers: bool = False,
+    args: Optional[Sequence[str]] = None,
+    env: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+) -> AsyncNokkServer:
+    """Async equivalent of :func:`launch` — spawns the server and awaits
+    readiness without blocking the event loop. Same keyword arguments.
+    """
+    resolved_port = port or _free_port(host)
+    cmd = _build_command(
+        host,
+        resolved_port,
+        workers=workers,
+        max_contexts=max_contexts,
+        proxy=proxy,
+        session_store=session_store,
+        rotate_fingerprint=rotate_fingerprint,
+        geoip_timezone=geoip_timezone,
+        allow_trackers=allow_trackers,
+        args=args,
+    )
+    process = await asyncio.create_subprocess_exec(*cmd, env=_merged_env(env))
+    server = AsyncNokkServer(process, host, resolved_port)
+    try:
+        await server._wait_until_ready(timeout)
+    except BaseException:
+        await server.aclose()
+        raise
+    atexit.register(_terminate_quiet, process)
     return server
