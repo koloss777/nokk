@@ -1,0 +1,81 @@
+name: python-wheels
+
+# Build and publish the `nokk` PyPI launcher wheel — a wheel that *embeds* the
+# prebuilt `nokk` binary, so `pip install nokk` needs no Rust toolchain, no
+# BoringSSL build, and no Docker on the user's machine.
+#
+# Triggered by the same `v*` tags as the binary release. The Rust build is the
+# heavy part (BoringSSL via bindgen + a prebuilt V8), so it runs in a manylinux
+# container with cmake + libclang installed; `.cargo/config.toml` is gitignored,
+# so the container's system libclang is auto-detected (no machine-specific paths).
+#
+# NOTE: first-run shakeout — the BoringSSL/V8 build inside manylinux may need
+# extra deps beyond cmake/clang; see docs/BUILD.md. macOS/Windows wheels wait on
+# those binaries existing in the release workflow.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86_64:
+    name: Build manylinux x86_64 wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheel (manylinux_2_28)
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: python
+          target: x86_64-unknown-linux-gnu
+          manylinux: "2_28"
+          args: --release --out dist
+          # BoringSSL (bindgen) + prebuilt V8 build deps, inside the container.
+          before-script-linux: |
+            dnf install -y cmake clang clang-devel gcc gcc-c++ perl || \
+            yum install -y cmake clang clang-devel gcc gcc-c++ perl
+
+      - name: Sanity-check the wheel contents
+        run: |
+          python -m pip install --upgrade pip
+          ls -la python/dist
+          python - <<'PY'
+          import glob, zipfile
+          whl = glob.glob("python/dist/*.whl")[0]
+          names = zipfile.ZipFile(whl).namelist()
+          assert any(n.endswith("nokk") or n.endswith("nokk.exe") for n in names), \
+              f"binary not embedded in wheel: {names}"
+          print("ok:", whl)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-x86_64
+          path: python/dist/*.whl
+
+  publish:
+    name: Publish to PyPI
+    needs: [linux-x86_64]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    environment: pypi
+    permissions:
+      # PyPI Trusted Publishing (OIDC) — configure the publisher on the PyPI
+      # project first; no API token secret needed.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

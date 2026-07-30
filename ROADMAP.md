@@ -274,16 +274,19 @@ value-to-effort:
   Puppeteer/Playwright (JS). Ship a package that bundles/downloads the right prebuilt
   binary per platform and exposes `launch()` → a `browserWSEndpoint` to `puppeteer.connect`
   / `chromium.connectOverCDP`. `npx nokk` starts the server.
-- ⬜ **PyPI** (`pip`) — Python is the other huge scraping audience. Ship a **thin launcher
-  wheel that bundles the binary** (the pattern `ruff`/`uv` use): a `python/` package built
-  with `maturin` (`bindings = "bin"`, `manifest-path` → `crates/cli`), so each platform
-  wheel embeds the `nokk` binary. `nokk/__init__.py` exposes `launch(port, workers, proxy…)`
-  → spawns the CDP server, waits on `/json/version`, returns the `browserWSEndpoint` for
-  `playwright`/`pyppeteer` to `connect_over_cdp`; a context manager tears it down. Native
-  PyO3 bindings are a heavier follow-up with unclear benefit (the interface is CDP). Publish
-  via `cibuildwheel` + `maturin publish`. Main risk: the manylinux build image must build
-  BoringSSL + host prebuilt V8 (see [BUILD.md](docs/BUILD.md)); needs macOS/Windows binaries
-  for those wheels. `nokk` is free on PyPI.
+- 🟡 **PyPI** (`pip`) — Python is the other huge scraping audience. **Scaffolded** in
+  [`python/`](python/): a thin launcher wheel that bundles the binary (the pattern `ruff`/`uv`
+  use), built with `maturin` (`bindings = "bin"`, `manifest-path` → `crates/cli`) so each
+  platform wheel embeds the `nokk` binary — `pip install nokk` needs no toolchain, no
+  BoringSSL build, no Docker. `nokk.launch(port, workers, proxy, rotate_fingerprint…)` spawns
+  the CDP server, waits on `/json/version`, and returns a `NokkServer` whose `ws_endpoint`
+  goes to `playwright`/`pyppeteer` `connect_over_cdp`; it's a context manager and self-cleans
+  at exit. Launcher is **validated end-to-end** against a local binary. Remaining: land the
+  first real [wheel CI run](.github/workflows/python-wheels.yml) (manylinux_2_28 building
+  BoringSSL + prebuilt V8 — see [BUILD.md](docs/BUILD.md)), set up PyPI trusted publishing,
+  and claim the `nokk` name with an alpha publish. Native PyO3 bindings are a heavier
+  follow-up with unclear benefit (the interface is CDP). macOS/Windows wheels wait on those
+  binaries. `nokk` is free on PyPI.
 - ⬜ **cargo-binstall** — near-free once on crates.io + GitHub Releases: `cargo binstall
   nokk` fetches the prebuilt binary instead of compiling. Needs the release-artifact
   naming `binstall` expects.

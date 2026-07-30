@@ -1,0 +1,51 @@
+# nokk — Python launcher wheel.
+#
+# This packages the prebuilt `nokk` binary *inside* the wheel (maturin
+# `bindings = "bin"`), so `pip install nokk` gives users a working CDP server
+# with no Rust toolchain, no cmake/BoringSSL build, and no Docker. The Python
+# side is a thin launcher: spawn the server, wait until it's ready, hand back a
+# `browserWSEndpoint` for Playwright / pyppeteer to connect over CDP.
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "nokk"
+# PEP 440 form of the git tag (v0.1.18-alpha -> 0.1.18a1). CI overrides this from
+# the tag at publish time; keep it in step with the release when bumping by hand.
+version = "0.1.18a1"
+description = "Undetectable headless-browser engine: a lightweight, Chrome-fingerprinted CDP server for Puppeteer/Playwright scraping. pip install and connect — no browser download."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "koloss777" }]
+keywords = [
+    "scraping", "web-scraping", "puppeteer", "playwright", "pyppeteer",
+    "cdp", "chrome-devtools-protocol", "headless-browser", "browser-automation",
+    "stealth", "anti-bot", "fingerprint", "ja3", "ja4", "cloudflare",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Topic :: Software Development :: Testing",
+    "Operating System :: POSIX :: Linux",
+]
+
+[project.urls]
+Homepage = "https://github.com/koloss777/nokk"
+Repository = "https://github.com/koloss777/nokk"
+Issues = "https://github.com/koloss777/nokk/issues"
+
+[tool.maturin]
+# Build the `nokk` CLI binary from the workspace and embed it in the wheel.
+bindings = "bin"
+manifest-path = "../crates/cli/Cargo.toml"
+# Include the pure-Python launcher package (this directory's `nokk/`).
+python-source = "."
+strip = true
