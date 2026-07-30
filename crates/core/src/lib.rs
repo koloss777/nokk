@@ -72,6 +72,14 @@ pub struct EngineConfig {
     /// which keeps runs deterministic. The default (empty-identity) context always
     /// uses [`Self::stealth`] so the shared default client stays coherent.
     pub rotate_fingerprint: bool,
+    /// Derive a context's timezone and locale from its proxy's exit IP, so the
+    /// reported `Intl` timezone / `navigator.languages` match where the traffic
+    /// actually comes from (a mismatch is a documented tell). Off by default; it
+    /// costs one geolocation request per distinct proxy (cached thereafter), made
+    /// through that proxy so it looks like ordinary page traffic. Best-effort — a
+    /// failed lookup keeps the profile's default zone. No effect on contexts
+    /// without a proxy.
+    pub geoip_timezone: bool,
 }
 
 impl Default for EngineConfig {
@@ -84,6 +92,7 @@ impl Default for EngineConfig {
             session_store: None,
             block_trackers: true,
             rotate_fingerprint: false,
+            geoip_timezone: false,
         }
     }
 }
@@ -114,9 +123,15 @@ struct EngineInner {
     /// Give each browser context a coherent per-identity fingerprint (see
     /// [`EngineConfig::rotate_fingerprint`]).
     rotate_fingerprint: bool,
-    /// Per-profile bootstraps, built lazily and cached, so rotation doesn't
-    /// re-render the same ~KB of JS for every context sharing a profile.
-    profile_bootstraps: Mutex<HashMap<nokk_stealth::FingerprintProfile, String>>,
+    /// Derive each context's timezone/locale from its proxy's exit IP (see
+    /// [`EngineConfig::geoip_timezone`]).
+    geoip_timezone: bool,
+    /// Rendered bootstraps, keyed by `(profile, geo)`, built lazily and cached so
+    /// contexts sharing an identity+proxy don't re-render the same ~KB of JS.
+    bootstrap_cache: Mutex<HashMap<String, String>>,
+    /// Exit-IP geolocation per proxy (the result, incl. a cached miss), so the
+    /// lookup runs at most once per distinct proxy.
+    geo_cache: Mutex<HashMap<String, Option<nokk_net::GeoInfo>>>,
 }
 
 impl EngineInner {
@@ -179,28 +194,95 @@ impl EngineInner {
         profile.map(|p| emulation_os_for(&p.stealth()))
     }
 
-    /// The per-context bootstrap JS for a rotated `profile`, or the engine default
-    /// when `profile` is `None`. Built once per profile and cached — every context
-    /// sharing a profile gets the same rendered script.
-    fn bootstrap_for(&self, profile: Option<nokk_stealth::FingerprintProfile>) -> String {
-        let Some(profile) = profile else {
+    /// The per-context bootstrap JS for a rotated `profile` (or the engine default
+    /// when `None`), with its timezone/locale overridden to `geo` when present.
+    /// Built once per `(profile, geo)` and cached — contexts sharing an
+    /// identity+proxy get the same rendered script.
+    fn context_bootstrap(
+        &self,
+        profile: Option<nokk_stealth::FingerprintProfile>,
+        geo: Option<&nokk_net::GeoInfo>,
+    ) -> String {
+        // Fast path: the prebuilt default when neither rotation nor geo applies.
+        if profile.is_none() && geo.is_none() {
             return self.bootstrap.clone();
-        };
+        }
+        let key = format!(
+            "{}|{}",
+            match profile {
+                Some(p) => format!("{p:?}"),
+                None => "default".to_string(),
+            },
+            match geo {
+                Some(g) => format!("{}/{}", g.timezone, g.country_code),
+                None => "-".to_string(),
+            },
+        );
         if let Some(b) = self
-            .profile_bootstraps
+            .bootstrap_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&profile)
+            .get(&key)
         {
             return b.clone();
         }
-        let stealth = profile.stealth();
+        let base = profile
+            .map(|p| p.stealth())
+            .unwrap_or_else(|| self.stealth.clone());
+        let stealth = match geo {
+            Some(g) => nokk_stealth::apply_geo(&base, &g.timezone, &g.country_code),
+            None => base,
+        };
         let built = build_bootstrap(&stealth);
         let mut cache = self
-            .profile_bootstraps
+            .bootstrap_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        cache.entry(profile).or_insert(built).clone()
+        cache.entry(key).or_insert(built).clone()
+    }
+
+    /// The exit-IP geolocation for a context's `proxy_key`, or `None` when geoIP is
+    /// off, there's no proxy, or the network is stubbed. Looked up once per proxy
+    /// (through `client`, so the request travels that proxy) and cached — including
+    /// a miss, so a failing proxy isn't re-probed on every context.
+    async fn geo_for(&self, proxy_key: &str, client: &Client) -> Option<nokk_net::GeoInfo> {
+        if !self.geoip_timezone || !self.use_real_network || proxy_key.is_empty() {
+            return None;
+        }
+        if let Some(cached) = self
+            .geo_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(proxy_key)
+        {
+            return cached.clone();
+        }
+        let result = self.geo_lookup(client).await;
+        self.geo_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(proxy_key.to_string())
+            .or_insert(result)
+            .clone()
+    }
+
+    /// One best-effort geolocation request through `client` (hence its proxy).
+    async fn geo_lookup(&self, client: &Client) -> Option<nokk_net::GeoInfo> {
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("User-Agent".to_string(), self.stealth.user_agent.clone());
+        let req = Request {
+            method: "GET".into(),
+            url: nokk_net::GEO_LOOKUP_URL.to_string(),
+            headers,
+            body: None,
+        };
+        match client.send(req).await {
+            Ok(resp) => nokk_net::parse_geo(&resp.body),
+            Err(e) => {
+                tracing::debug!(error = %e, "geoip lookup failed; keeping default timezone");
+                None
+            }
+        }
     }
 
     /// Filesystem path for a named session's jar, or `None` when sessions aren't
@@ -403,7 +485,9 @@ impl Engine {
                 stealth: config.stealth,
                 bootstrap,
                 rotate_fingerprint: config.rotate_fingerprint,
-                profile_bootstraps: Mutex::new(HashMap::new()),
+                geoip_timezone: config.geoip_timezone,
+                bootstrap_cache: Mutex::new(HashMap::new()),
+                geo_cache: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -450,10 +534,12 @@ impl Engine {
         proxy: Option<ProxyConfig>,
     ) -> Result<BrowserContext, EngineError> {
         let profile = self.inner.rotated_profile(&identity);
+        let geo_key = proxy.as_ref().map(proxy_key).unwrap_or_default();
         let client =
             self.inner
                 .client_for(&identity, proxy, EngineInner::emulation_os_of(profile))?;
-        let bootstrap = self.inner.bootstrap_for(profile);
+        let geo = self.inner.geo_for(&geo_key, &client).await;
+        let bootstrap = self.inner.context_bootstrap(profile, geo.as_ref());
         self.build_context(client, None, bootstrap).await
     }
 
@@ -470,6 +556,7 @@ impl Engine {
         proxy: Option<ProxyConfig>,
     ) -> Result<BrowserContext, EngineError> {
         let profile = self.inner.rotated_profile(&name);
+        let geo_key = proxy.as_ref().map(proxy_key).unwrap_or_default();
         let jar = self.inner.session_jar(&name)?;
         let client = self.inner.client_for_session(
             &name,
@@ -477,7 +564,8 @@ impl Engine {
             proxy,
             EngineInner::emulation_os_of(profile),
         )?;
-        let bootstrap = self.inner.bootstrap_for(profile);
+        let geo = self.inner.geo_for(&geo_key, &client).await;
+        let bootstrap = self.inner.context_bootstrap(profile, geo.as_ref());
         self.build_context(client, Some(name), bootstrap).await
     }
 
@@ -2051,6 +2139,43 @@ mod tests {
             seen.len() >= 2,
             "rotation should present multiple OS profiles, saw {seen:?}"
         );
+    }
+
+    #[test]
+    fn geoip_is_off_by_default() {
+        assert!(!EngineConfig::default().geoip_timezone);
+    }
+
+    #[test]
+    fn geo_adjusted_bootstrap_reflects_the_exit_ip_zone() {
+        // The geo override is applied when composing a context's bootstrap: an
+        // exit IP in Germany moves the rendered Intl timezone + locale, while the
+        // default (no-geo) bootstrap keeps the profile's own zone. This exercises
+        // the pure composition path without a live lookup.
+        let eng = Engine::new(EngineConfig {
+            rotate_fingerprint: true,
+            geoip_timezone: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let profile = Some(nokk_stealth::FingerprintProfile::ChromeWindows);
+        let geo = nokk_net::GeoInfo {
+            timezone: "Europe/Berlin".to_string(),
+            country_code: "DE".to_string(),
+        };
+
+        let with_geo = eng.inner.context_bootstrap(profile, Some(&geo));
+        assert!(with_geo.contains("Europe/Berlin"));
+        assert!(with_geo.contains("Central European Standard Time"));
+        // Windows OS identity is untouched by the geo override.
+        assert!(with_geo.contains(r#"platform: "Windows""#));
+
+        let without_geo = eng.inner.context_bootstrap(profile, None);
+        assert!(!without_geo.contains("Europe/Berlin"));
+        assert_ne!(with_geo, without_geo);
+
+        // Cached: same inputs return the identical rendering.
+        assert_eq!(with_geo, eng.inner.context_bootstrap(profile, Some(&geo)));
     }
 
     #[tokio::test]

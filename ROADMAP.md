@@ -219,9 +219,11 @@ ceiling.
   (`--rotate-fingerprint` / `NOKK_ROTATE_FINGERPRINT`), off by default so single-context runs
   stay deterministic. The default (empty-identity) context keeps the engine default so its
   shared client stays coherent. End-to-end: `browser.createBrowserContext()` yields a
-  self-consistent, distinct machine per context. (Follow-up: derive timezone/locale from the
-  proxy's geoIP so a rotated profile's zone matches its exit IP — a technique clearcote uses;
-  presets currently share one US/Eastern zone.)
+  self-consistent, distinct machine per context. Timezone/locale are derived from the proxy's
+  geoIP (opt-in `--geoip-timezone` / `NOKK_GEOIP_TIMEZONE`): one lookup per proxy, made
+  *through* that proxy and cached, moves a context's `Intl` timezone + `navigator.languages`
+  to match its exit IP (a mismatch is a documented tell — a technique clearcote uses).
+  Best-effort: a failed lookup or an uncarried zone keeps the profile's coherent default.
 - ✅ **Persistent / named sessions — warm up once, resume anytime.** Give a session a name
   and its cookie jar (incl. session-only cookies and `cf_clearance`) persists to
   `<store>/<name>.json`, so a session warmed up once (log in, clear a challenge) re-attaches

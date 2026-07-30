@@ -17,8 +17,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 mod blocklist;
+mod geoip;
 mod session;
 pub use blocklist::{host_of, is_blocked, is_blocked_url};
+pub use geoip::{parse_geo, GeoInfo, GEO_LOOKUP_URL};
 pub use session::{CookieRecord, SessionJar};
 
 /// Errors from the network layer.

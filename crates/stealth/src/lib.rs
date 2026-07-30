@@ -186,6 +186,230 @@ impl FingerprintProfile {
     }
 }
 
+/// The timezone half of a [`StealthProfile`], resolved from an IANA zone name:
+/// the standard-time offset and DST rule the `Date` shim needs, plus the long
+/// zone names `Date.toString()` prints. See [`timezone_fields`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimezoneFields {
+    /// Standard-time UTC offset in minutes, `getTimezoneOffset` convention
+    /// (positive = behind UTC).
+    pub offset_std_minutes: i32,
+    /// DST rule the `Date` shim understands: `"us"`, `"eu"`, or `"none"`.
+    pub dst_rule: &'static str,
+    pub name_std: &'static str,
+    pub name_dst: &'static str,
+}
+
+/// The coherent timezone fields for a common IANA zone, or `None` for a zone we
+/// don't carry (the caller then keeps the profile's default zone rather than
+/// half-applying an incoherent one).
+///
+/// The `Date` shim only models northern-hemisphere `"us"`/`"eu"` DST, so
+/// southern-hemisphere zones (Sydney, Auckland, São Paulo…) are listed as
+/// `"none"` at their standard offset — coherent year-round except during their
+/// summer DST, a far smaller tell than an offset that contradicts the IP.
+pub fn timezone_fields(iana: &str) -> Option<TimezoneFields> {
+    // (offset_std_minutes, dst_rule, name_std, name_dst)
+    let f = |offset_std_minutes, dst_rule, name_std, name_dst| {
+        Some(TimezoneFields {
+            offset_std_minutes,
+            dst_rule,
+            name_std,
+            name_dst,
+        })
+    };
+    match iana {
+        // North America (US DST rule).
+        "America/New_York" | "America/Toronto" => {
+            f(300, "us", "Eastern Standard Time", "Eastern Daylight Time")
+        }
+        "America/Chicago" => f(360, "us", "Central Standard Time", "Central Daylight Time"),
+        "America/Denver" => f(
+            420,
+            "us",
+            "Mountain Standard Time",
+            "Mountain Daylight Time",
+        ),
+        "America/Phoenix" => f(
+            420,
+            "none",
+            "Mountain Standard Time",
+            "Mountain Standard Time",
+        ),
+        "America/Los_Angeles" | "America/Vancouver" => {
+            f(480, "us", "Pacific Standard Time", "Pacific Daylight Time")
+        }
+        "America/Anchorage" => f(540, "us", "Alaska Standard Time", "Alaska Daylight Time"),
+        "America/Mexico_City" => f(
+            360,
+            "none",
+            "Central Standard Time",
+            "Central Standard Time",
+        ),
+        "America/Sao_Paulo" => f(
+            180,
+            "none",
+            "Brasilia Standard Time",
+            "Brasilia Standard Time",
+        ),
+        // Europe / Africa (EU DST rule, or none).
+        "Europe/London" | "Europe/Dublin" | "Europe/Lisbon" => {
+            f(0, "eu", "Greenwich Mean Time", "British Summer Time")
+        }
+        "Europe/Paris" | "Europe/Berlin" | "Europe/Madrid" | "Europe/Rome" | "Europe/Amsterdam"
+        | "Europe/Brussels" | "Europe/Vienna" | "Europe/Zurich" | "Europe/Prague"
+        | "Europe/Warsaw" | "Europe/Stockholm" | "Europe/Oslo" | "Europe/Copenhagen"
+        | "Europe/Budapest" => f(
+            -60,
+            "eu",
+            "Central European Standard Time",
+            "Central European Summer Time",
+        ),
+        "Europe/Athens" | "Europe/Helsinki" | "Europe/Bucharest" | "Europe/Kyiv"
+        | "Europe/Kiev" | "Europe/Riga" | "Europe/Sofia" => f(
+            -120,
+            "eu",
+            "Eastern European Standard Time",
+            "Eastern European Summer Time",
+        ),
+        "Europe/Istanbul" => f(-180, "none", "GMT+03:00", "GMT+03:00"),
+        "Europe/Moscow" => f(-180, "none", "Moscow Standard Time", "Moscow Standard Time"),
+        "Africa/Lagos" => f(
+            -60,
+            "none",
+            "West Africa Standard Time",
+            "West Africa Standard Time",
+        ),
+        "Africa/Johannesburg" => f(
+            -120,
+            "none",
+            "South Africa Standard Time",
+            "South Africa Standard Time",
+        ),
+        // Asia / Pacific (fixed offsets).
+        "Asia/Dubai" => f(-240, "none", "Gulf Standard Time", "Gulf Standard Time"),
+        "Asia/Karachi" => f(
+            -300,
+            "none",
+            "Pakistan Standard Time",
+            "Pakistan Standard Time",
+        ),
+        "Asia/Kolkata" | "Asia/Calcutta" => {
+            f(-330, "none", "India Standard Time", "India Standard Time")
+        }
+        "Asia/Dhaka" => f(
+            -360,
+            "none",
+            "Bangladesh Standard Time",
+            "Bangladesh Standard Time",
+        ),
+        "Asia/Bangkok" | "Asia/Jakarta" => f(-420, "none", "Indochina Time", "Indochina Time"),
+        "Asia/Shanghai" | "Asia/Hong_Kong" => {
+            f(-480, "none", "China Standard Time", "China Standard Time")
+        }
+        "Asia/Singapore" => f(
+            -480,
+            "none",
+            "Singapore Standard Time",
+            "Singapore Standard Time",
+        ),
+        "Asia/Taipei" => f(-480, "none", "Taipei Standard Time", "Taipei Standard Time"),
+        "Asia/Tokyo" => f(-540, "none", "Japan Standard Time", "Japan Standard Time"),
+        "Asia/Seoul" => f(-540, "none", "Korean Standard Time", "Korean Standard Time"),
+        "Australia/Sydney" | "Australia/Melbourne" => f(
+            -600,
+            "none",
+            "Australian Eastern Standard Time",
+            "Australian Eastern Standard Time",
+        ),
+        "Pacific/Auckland" => f(
+            -720,
+            "none",
+            "New Zealand Standard Time",
+            "New Zealand Standard Time",
+        ),
+        "UTC" | "Etc/UTC" | "Etc/GMT" => f(
+            0,
+            "none",
+            "Coordinated Universal Time",
+            "Coordinated Universal Time",
+        ),
+        _ => None,
+    }
+}
+
+/// A plausible `navigator.languages` list for an ISO-3166 country code — so the
+/// reported locale matches the exit IP's country. Defaults to US English for
+/// countries we don't carry (English is a safe, common fallback and never
+/// contradicts an unknown region the way a wrong specific locale would).
+pub fn country_languages(country_code: &str) -> Vec<String> {
+    let v = |tags: &[&str]| tags.iter().map(|s| s.to_string()).collect();
+    match country_code.to_ascii_uppercase().as_str() {
+        "US" => v(&["en-US", "en"]),
+        "GB" => v(&["en-GB", "en"]),
+        "CA" => v(&["en-CA", "fr-CA", "en"]),
+        "AU" => v(&["en-AU", "en"]),
+        "NZ" => v(&["en-NZ", "en"]),
+        "IE" => v(&["en-IE", "en"]),
+        "ZA" => v(&["en-ZA", "en"]),
+        "DE" | "AT" => v(&["de-DE", "de", "en"]),
+        "CH" => v(&["de-CH", "de", "fr", "en"]),
+        "FR" => v(&["fr-FR", "fr", "en"]),
+        "ES" => v(&["es-ES", "es", "en"]),
+        "IT" => v(&["it-IT", "it", "en"]),
+        "NL" => v(&["nl-NL", "nl", "en"]),
+        "BE" => v(&["nl-BE", "fr-BE", "en"]),
+        "PT" => v(&["pt-PT", "pt", "en"]),
+        "PL" => v(&["pl-PL", "pl", "en"]),
+        "SE" => v(&["sv-SE", "sv", "en"]),
+        "NO" => v(&["nb-NO", "no", "en"]),
+        "DK" => v(&["da-DK", "da", "en"]),
+        "FI" => v(&["fi-FI", "fi", "en"]),
+        "CZ" => v(&["cs-CZ", "cs", "en"]),
+        "HU" => v(&["hu-HU", "hu", "en"]),
+        "RO" => v(&["ro-RO", "ro", "en"]),
+        "GR" => v(&["el-GR", "el", "en"]),
+        "TR" => v(&["tr-TR", "tr", "en"]),
+        "RU" => v(&["ru-RU", "ru"]),
+        "UA" => v(&["uk-UA", "uk", "ru"]),
+        "BR" => v(&["pt-BR", "pt", "en"]),
+        "MX" => v(&["es-MX", "es", "en"]),
+        "JP" => v(&["ja-JP", "ja"]),
+        "KR" => v(&["ko-KR", "ko"]),
+        "CN" => v(&["zh-CN", "zh"]),
+        "TW" => v(&["zh-TW", "zh"]),
+        "HK" => v(&["zh-HK", "zh", "en"]),
+        "SG" => v(&["en-SG", "en", "zh"]),
+        "IN" => v(&["en-IN", "en", "hi"]),
+        "AE" => v(&["ar-AE", "ar", "en"]),
+        "PK" => v(&["en-PK", "ur", "en"]),
+        "BD" => v(&["bn-BD", "bn", "en"]),
+        "TH" => v(&["th-TH", "th", "en"]),
+        "ID" => v(&["id-ID", "id", "en"]),
+        _ => v(&["en-US", "en"]),
+    }
+}
+
+/// Return `profile` with its timezone and locale overridden to match an exit IP's
+/// geolocation (IANA `timezone` + ISO `country_code`), leaving the OS-derived
+/// identity (UA, platform, screen, WebGL) untouched. The timezone is only changed
+/// when [`timezone_fields`] knows the zone, so the result is always coherent;
+/// languages always follow the country ([`country_languages`] falls back to
+/// English). This is how a rotated profile stays consistent with the proxy it
+/// exits through.
+pub fn apply_geo(profile: &StealthProfile, timezone: &str, country_code: &str) -> StealthProfile {
+    let mut p = profile.clone();
+    if let Some(tz) = timezone_fields(timezone) {
+        p.timezone = timezone.to_string();
+        p.timezone_offset_minutes = tz.offset_std_minutes;
+        p.timezone_dst = tz.dst_rule.to_string();
+        p.timezone_name_std = tz.name_std.to_string();
+        p.timezone_name_dst = tz.name_dst.to_string();
+    }
+    p.languages = country_languages(country_code);
+    p
+}
+
 /// Produce the JavaScript that must run before any page script. In Phase 5 this
 /// is delivered via `Page.addScriptToEvaluateOnNewDocument`.
 ///
@@ -1863,6 +2087,66 @@ mod tests {
 
         // Rotation actually changes the JS-visible fingerprint.
         assert_ne!(win, mac);
+    }
+
+    #[test]
+    fn geo_override_keeps_the_os_identity_and_matches_the_zone() {
+        // A Linux machine exiting through a Berlin IP: OS-derived identity stays
+        // Linux, but timezone + locale move to Germany, coherently.
+        let base = FingerprintProfile::ChromeLinux.stealth();
+        let de = apply_geo(&base, "Europe/Berlin", "DE");
+        assert_eq!(de.platform, base.platform, "OS identity must not change");
+        assert_eq!(de.user_agent, base.user_agent);
+        assert_eq!(de.screen_width, base.screen_width);
+        assert_eq!(de.timezone, "Europe/Berlin");
+        assert_eq!(de.timezone_offset_minutes, -60); // UTC+1 std
+        assert_eq!(de.timezone_dst, "eu");
+        assert_eq!(de.languages, vec!["de-DE", "de", "en"]);
+
+        // The rendered Intl/Date shim reflects the new zone, not the default.
+        let js = bootstrap_script(&de);
+        assert!(js.contains("Europe/Berlin"));
+        assert!(js.contains("Central European Standard Time"));
+        assert!(!js.contains("America/New_York"));
+    }
+
+    #[test]
+    fn geo_override_leaves_unknown_zones_coherent() {
+        // An IANA zone we don't carry: keep the profile's default zone rather than
+        // half-applying an incoherent one — but still adopt the country's locale.
+        let base = FingerprintProfile::ChromeLinux.stealth();
+        let out = apply_geo(&base, "Antarctica/Troll", "FR");
+        assert_eq!(out.timezone, base.timezone, "unknown zone keeps default");
+        assert_eq!(out.timezone_offset_minutes, base.timezone_offset_minutes);
+        assert_eq!(out.languages, vec!["fr-FR", "fr", "en"]);
+    }
+
+    #[test]
+    fn timezone_fields_are_self_consistent() {
+        // Every carried zone has a real DST rule and non-empty names, and a
+        // fixed-offset zone reuses one name for both seasons.
+        for z in [
+            "America/New_York",
+            "Europe/London",
+            "Europe/Paris",
+            "Asia/Tokyo",
+            "Australia/Sydney",
+            "UTC",
+        ] {
+            let f = timezone_fields(z).unwrap_or_else(|| panic!("missing {z}"));
+            assert!(matches!(f.dst_rule, "us" | "eu" | "none"));
+            assert!(!f.name_std.is_empty() && !f.name_dst.is_empty());
+            if f.dst_rule == "none" {
+                assert_eq!(f.name_std, f.name_dst, "{z}: fixed zone, one name");
+            }
+        }
+        assert!(timezone_fields("Not/AZone").is_none());
+    }
+
+    #[test]
+    fn country_languages_default_to_english() {
+        assert_eq!(country_languages("ZZ"), vec!["en-US", "en"]);
+        assert_eq!(country_languages("jp"), vec!["ja-JP", "ja"]); // case-insensitive
     }
 
     #[test]

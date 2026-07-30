@@ -88,6 +88,13 @@ struct Cli {
     #[arg(long, env = "NOKK_ROTATE_FINGERPRINT")]
     rotate_fingerprint: bool,
 
+    /// Derive each context's timezone and locale from its proxy's exit IP, so the
+    /// reported `Intl` timezone and `navigator.languages` match where the traffic
+    /// comes from. Costs one geolocation request per distinct proxy (cached),
+    /// made through that proxy. Best-effort; no effect without a proxy.
+    #[arg(long, env = "NOKK_GEOIP_TIMEZONE")]
+    geoip_timezone: bool,
+
     /// For `--load`: retry up to N extra times if the response is a Cloudflare
     /// "Just a moment…" challenge (the pass is probabilistic).
     #[arg(long, default_value_t = 0)]
@@ -186,6 +193,7 @@ impl Cli {
             session_store: self.session_store.clone(),
             block_trackers: !self.allow_trackers,
             rotate_fingerprint: self.rotate_fingerprint,
+            geoip_timezone: self.geoip_timezone,
             ..Default::default()
         }
     }
