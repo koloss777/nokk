@@ -238,6 +238,16 @@ fn sanitize_session_name(name: &str) -> Option<String> {
 
 /// Pool key for a proxy (used by [`Engine::new_context_with_proxy`] to share one
 /// client among contexts that route through the same proxy).
+/// The TLS emulation OS that matches a JS stealth profile, derived from its
+/// Client-Hints platform, so the ClientHello and the User-Agent agree.
+fn emulation_os_for(profile: &StealthProfile) -> nokk_net::EmulationOs {
+    match profile.ua_platform.as_str() {
+        "Windows" => nokk_net::EmulationOs::Windows,
+        "macOS" => nokk_net::EmulationOs::Mac,
+        _ => nokk_net::EmulationOs::Linux,
+    }
+}
+
 fn proxy_key(p: &ProxyConfig) -> String {
     format!(
         "proxy:{:?}|{}|{}|{}",
@@ -256,7 +266,10 @@ pub struct Engine {
 
 impl Engine {
     /// Build an engine and spawn its worker threads.
-    pub fn new(config: EngineConfig) -> Result<Self, EngineError> {
+    pub fn new(mut config: EngineConfig) -> Result<Self, EngineError> {
+        // Keep the TLS/HTTP emulation OS coherent with the JS profile's OS, so the
+        // ClientHello (JA3/JA4) never contradicts the User-Agent.
+        config.client.emulation_os = emulation_os_for(&config.stealth);
         if let Some(dir) = &config.session_store {
             std::fs::create_dir_all(dir).map_err(|e| {
                 EngineError::Session(format!("create store `{}`: {e}", dir.display()))
@@ -1841,6 +1854,25 @@ mod tests {
             ga,
             vec![0],
             "tracker script should be blocked (status 0), got {ga:?}"
+        );
+    }
+
+    #[test]
+    fn tls_emulation_os_follows_the_profile() {
+        use nokk_stealth::FingerprintProfile;
+        // Each JS profile's OS maps to the matching TLS emulation OS, so the
+        // ClientHello never contradicts the User-Agent.
+        assert_eq!(
+            emulation_os_for(&FingerprintProfile::ChromeLinux.stealth()),
+            nokk_net::EmulationOs::Linux
+        );
+        assert_eq!(
+            emulation_os_for(&FingerprintProfile::ChromeWindows.stealth()),
+            nokk_net::EmulationOs::Windows
+        );
+        assert_eq!(
+            emulation_os_for(&FingerprintProfile::ChromeMac.stealth()),
+            nokk_net::EmulationOs::Mac
         );
     }
 

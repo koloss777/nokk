@@ -85,10 +85,33 @@ impl Default for PoolLimits {
     }
 }
 
+/// Which desktop OS the TLS ClientHello (JA3/JA4) and HTTP/2 fingerprint emulate.
+/// Must match the JS profile's OS and User-Agent, or the handshake contradicts the
+/// UA — a documented anti-bot tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EmulationOs {
+    #[default]
+    Linux,
+    Windows,
+    Mac,
+}
+
+impl EmulationOs {
+    fn to_wreq(self) -> wreq_util::EmulationOS {
+        match self {
+            Self::Linux => wreq_util::EmulationOS::Linux,
+            Self::Windows => wreq_util::EmulationOS::Windows,
+            Self::Mac => wreq_util::EmulationOS::MacOS,
+        }
+    }
+}
+
 /// Client configuration.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     pub fingerprint: FingerprintProfile,
+    /// OS the TLS emulation impersonates; keep coherent with the JS profile.
+    pub emulation_os: EmulationOs,
     pub limits: PoolLimits,
     pub proxy: Option<ProxyConfig>,
     pub request_timeout: Duration,
@@ -98,6 +121,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             fingerprint: FingerprintProfile::default(),
+            emulation_os: EmulationOs::default(),
             limits: PoolLimits::default(),
             proxy: None,
             request_timeout: Duration::from_secs(30),
@@ -187,12 +211,6 @@ impl FingerprintClient {
     /// Newer emulations track Chrome's current TLS + request-header set more
     /// closely (Cloudflare fingerprints header order, so accuracy matters).
     pub const EMULATION: wreq_util::Emulation = wreq_util::Emulation::Chrome137;
-    /// The OS we impersonate. Pinned to Linux so the wire `User-Agent` /
-    /// `sec-ch-ua-platform` match the stealth JS `navigator.platform` (Linux) —
-    /// the emulation otherwise defaults to macOS, which would make the HTTP UA
-    /// and the JS UA disagree (an instant anti-bot tell).
-    pub const EMULATION_OS: wreq_util::EmulationOS = wreq_util::EmulationOS::Linux;
-
     pub fn new(config: &ClientConfig) -> Result<Self, NetError> {
         Self::with_session(config, None)
     }
@@ -207,9 +225,11 @@ impl FingerprintClient {
         session: Option<Arc<SessionJar>>,
     ) -> Result<Self, NetError> {
         let _ = config.fingerprint; // only ChromeDesktop today; see EMULATION
+                                    // The TLS/HTTP2 OS must match the JS profile's OS (and its UA /
+                                    // sec-ch-ua-platform), or the ClientHello contradicts the User-Agent.
         let emulation = wreq_util::EmulationOption::builder()
             .emulation(Self::EMULATION)
-            .emulation_os(Self::EMULATION_OS)
+            .emulation_os(config.emulation_os.to_wreq())
             .build();
         let mut builder = wreq::Client::builder().emulation(emulation);
         builder = match session {
@@ -365,6 +385,22 @@ mod tests {
         match err {
             Err(NetError::Connect(msg)) => assert!(msg.contains("TRACE"), "got: {msg}"),
             other => panic!("expected unsupported-method Connect error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_builds_for_each_emulation_os() {
+        // Building a fingerprinted client is offline; each OS must produce a valid
+        // client (a coherent Chrome-on-that-OS ClientHello).
+        for os in [EmulationOs::Linux, EmulationOs::Windows, EmulationOs::Mac] {
+            let cfg = ClientConfig {
+                emulation_os: os,
+                ..Default::default()
+            };
+            assert!(
+                FingerprintClient::new(&cfg).is_ok(),
+                "failed to build client for {os:?}"
+            );
         }
     }
 }
