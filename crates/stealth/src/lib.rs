@@ -45,6 +45,18 @@ pub struct StealthProfile {
     /// (e.g. "Eastern Standard Time" / "Eastern Daylight Time").
     pub timezone_name_std: String,
     pub timezone_name_dst: String,
+    /// `screen.width`/`.height` (and `availWidth` == width). A fingerprint vector,
+    /// and it must be plausible for the OS.
+    pub screen_width: u32,
+    pub screen_height: u32,
+    /// `screen.availHeight` (height minus the OS's menu/task bar).
+    pub avail_height: u32,
+    /// `screen.colorDepth`/`.pixelDepth`.
+    pub color_depth: u32,
+    /// `navigator.userAgentData.platform` — the Client Hints platform
+    /// (`"Windows"`/`"macOS"`/`"Linux"`), which must agree with the UA and
+    /// `navigator.platform`.
+    pub ua_platform: String,
 }
 
 impl Default for StealthProfile {
@@ -121,29 +133,37 @@ impl FingerprintProfile {
         };
         let (timezone, timezone_offset_minutes, timezone_dst, timezone_name_std, timezone_name_dst) =
             tz();
-        let common =
-            |ua: &str, platform: &str, hw: u32, webgl_vendor: &str, webgl_renderer: &str| {
-                StealthProfile {
-                    user_agent: ua.to_string(),
-                    platform: platform.to_string(),
-                    languages: vec!["en-US".into(), "en".into()],
-                    hardware_concurrency: hw,
-                    device_memory_gb: 8, // Chrome caps navigator.deviceMemory at 8
-                    vendor: "Google Inc.".into(),
-                    webgl_vendor: webgl_vendor.to_string(),
-                    webgl_renderer: webgl_renderer.to_string(),
-                    timezone: timezone.clone(),
-                    timezone_offset_minutes,
-                    timezone_dst: timezone_dst.clone(),
-                    timezone_name_std: timezone_name_std.clone(),
-                    timezone_name_dst: timezone_name_dst.clone(),
-                }
-            };
+        // OS-derived, coherent by construction: navigator.platform, the Client
+        // Hints platform, and a plausible screen for each OS.
+        let (platform, ua_platform, sw, sh, avail_height, color_depth) = match self.os() {
+            ProfileOs::Linux => ("Linux x86_64", "Linux", 1920u32, 1080u32, 1053u32, 24u32),
+            ProfileOs::Windows => ("Win32", "Windows", 1920, 1080, 1032, 24),
+            ProfileOs::Mac => ("MacIntel", "macOS", 1512, 982, 944, 30),
+        };
+        let common = |ua: &str, hw: u32, webgl_vendor: &str, webgl_renderer: &str| StealthProfile {
+            user_agent: ua.to_string(),
+            platform: platform.to_string(),
+            ua_platform: ua_platform.to_string(),
+            languages: vec!["en-US".into(), "en".into()],
+            hardware_concurrency: hw,
+            device_memory_gb: 8, // Chrome caps navigator.deviceMemory at 8
+            vendor: "Google Inc.".into(),
+            webgl_vendor: webgl_vendor.to_string(),
+            webgl_renderer: webgl_renderer.to_string(),
+            screen_width: sw,
+            screen_height: sh,
+            avail_height,
+            color_depth,
+            timezone: timezone.clone(),
+            timezone_offset_minutes,
+            timezone_dst: timezone_dst.clone(),
+            timezone_name_std: timezone_name_std.clone(),
+            timezone_name_dst: timezone_name_dst.clone(),
+        };
         match self {
             Self::ChromeLinux => common(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
                  Chrome/137.0.0.0 Safari/537.36",
-                "Linux x86_64",
                 8,
                 "Google Inc. (Intel)",
                 "ANGLE (Intel, Mesa Intel(R) UHD Graphics, OpenGL 4.6)",
@@ -151,7 +171,6 @@ impl FingerprintProfile {
             Self::ChromeWindows => common(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
                  Chrome/137.0.0.0 Safari/537.36",
-                "Win32",
                 16,
                 "Google Inc. (NVIDIA)",
                 "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002503) Direct3D11 vs_5_0 ps_5_0, D3D11)",
@@ -159,7 +178,6 @@ impl FingerprintProfile {
             Self::ChromeMac => common(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
                  (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-                "MacIntel",
                 8,
                 "Google Inc. (Apple)",
                 "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
@@ -243,7 +261,13 @@ pub fn bootstrap_script(profile: &StealthProfile) -> String {
         .replace("__HW__", &profile.hardware_concurrency.to_string())
         .replace("__MEM__", &profile.device_memory_gb.to_string())
         .replace("__WEBGL_VENDOR__", &quoted(&profile.webgl_vendor))
-        .replace("__WEBGL_RENDERER__", &quoted(&profile.webgl_renderer));
+        .replace("__WEBGL_RENDERER__", &quoted(&profile.webgl_renderer))
+        .replace("__CHROME_MAJOR__", CHROME_MAJOR)
+        .replace("__UA_PLATFORM__", &quoted(&profile.ua_platform))
+        .replace("__SCREEN_W__", &profile.screen_width.to_string())
+        .replace("__SCREEN_H__", &profile.screen_height.to_string())
+        .replace("__AVAIL_H__", &profile.avail_height.to_string())
+        .replace("__COLOR_DEPTH__", &profile.color_depth.to_string());
 
     // The Intl shim shadows the prebuilt V8's native Intl/Date-locale APIs, which
     // ICU-abort the whole process (this build lacks working ICU data). It also
@@ -303,8 +327,8 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
     deviceMemory: __MEM__, maxTouchPoints: 0, webdriver: false, onLine: true, cookieEnabled: true,
     doNotTrack: null, pdfViewerEnabled: true,
     userAgentData: { brands: [
-      { brand: "Chromium", version: "137" }, { brand: "Google Chrome", version: "137" }, { brand: "Not.A/Brand", version: "24" }
-    ], mobile: false, platform: "Linux" },
+      { brand: "Chromium", version: "__CHROME_MAJOR__" }, { brand: "Google Chrome", version: "__CHROME_MAJOR__" }, { brand: "Not.A/Brand", version: "24" }
+    ], mobile: false, platform: __UA_PLATFORM__ },
   });
   win.navigator = Object.create(NavigatorProto);
 
@@ -314,8 +338,8 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   // --- screen -----------------------------------------------------------
   const ScreenProto = defClass("Screen");
   staticProps(ScreenProto, {
-    width: 1920, height: 1080, availWidth: 1920, availHeight: 1040, availTop: 0, availLeft: 0,
-    colorDepth: 24, pixelDepth: 24, isExtended: false,
+    width: __SCREEN_W__, height: __SCREEN_H__, availWidth: __SCREEN_W__, availHeight: __AVAIL_H__, availTop: 0, availLeft: 0,
+    colorDepth: __COLOR_DEPTH__, pixelDepth: __COLOR_DEPTH__, isExtended: false,
     orientation: { type: "landscape-primary", angle: 0 },
   });
   win.screen = Object.create(ScreenProto);
@@ -1813,6 +1837,32 @@ mod tests {
             assert!(s.device_memory_gb <= 8);
             assert_eq!(s.vendor, "Google Inc.");
         }
+    }
+
+    #[test]
+    fn bootstrap_reflects_the_profile_os() {
+        // The Windows preset must put Windows client-hints + its screen into the JS
+        // environment; the Mac preset macOS + a retina-ish screen. If these were
+        // still hardcoded, rotation would leak a Linux fingerprint under a Win/Mac UA.
+        let win = bootstrap_script(&FingerprintProfile::ChromeWindows.stealth());
+        assert!(
+            win.contains(r#"platform: "Windows""#),
+            "userAgentData.platform not Windows"
+        );
+        assert!(win.contains("width: 1920") && win.contains("height: 1080"));
+        assert!(
+            win.contains(r#"version: "137""#),
+            "client-hints brand version not 137"
+        );
+        assert!(win.contains("Win32"), "navigator.platform not Win32");
+
+        let mac = bootstrap_script(&FingerprintProfile::ChromeMac.stealth());
+        assert!(mac.contains(r#"platform: "macOS""#));
+        assert!(mac.contains("width: 1512") && mac.contains("height: 982"));
+        assert!(mac.contains("MacIntel"));
+
+        // Rotation actually changes the JS-visible fingerprint.
+        assert_ne!(win, mac);
     }
 
     #[test]
