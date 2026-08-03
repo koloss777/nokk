@@ -52,14 +52,19 @@ def _log(msg: str) -> None:
 # querySelectorAll misses it — we walk shadow roots recursively.
 _DOM_PROBE_JS = (
     "(()=>{const frames=[],cont=[];"
+    "const cls=e=>((e.className&&e.className.baseVal!==undefined?e.className.baseVal:e.className)||'')"
+    "  .toString().slice(0,40);"
     "const walk=(root)=>{if(!root||!root.querySelectorAll)return;"
     "root.querySelectorAll('iframe').forEach(f=>{const r=f.getBoundingClientRect();"
     "frames.push({src:((f.src||(f.getAttribute&&f.getAttribute('src'))||'')+'').slice(0,90),"
-    "x:r.x,y:r.y,w:r.width,h:r.height,vis:r.width>0&&r.height>0});});"
+    "id:(f.id||'').slice(0,30),cls:cls(f),x:r.x,y:r.y,w:r.width,h:r.height,vis:r.width>0&&r.height>0});});"
+    # Turnstile-ish containers AND any checkbox-like element (the widget's clickable bit):
     "root.querySelectorAll('*').forEach(e=>{"
-    "if(/turnstile|cf-chl|challenge/i.test((e.className+' '+e.id)+'')){"
+    "const key=(cls(e)+' '+(e.id||'')+' '+(e.getAttribute&&(e.getAttribute('role')||'')));"
+    "if(/turnstile|cf-chl|challenge|checkbox/i.test(key)||e.tagName==='INPUT'){"
     "const r=e.getBoundingClientRect();"
-    "cont.push({tag:e.tagName,x:r.x,y:r.y,w:r.width,h:r.height});}"
+    "cont.push({tag:e.tagName,id:(e.id||'').slice(0,30),cls:cls(e),role:(e.getAttribute&&e.getAttribute('role'))||'',"
+    "x:r.x,y:r.y,w:r.width,h:r.height});}"
     "if(e.shadowRoot)walk(e.shadowRoot);});};"
     "walk(document);"
     "return{dpr:window.devicePixelRatio,vw:innerWidth,vh:innerHeight,frames,cont};})()"
@@ -188,7 +193,7 @@ async def harvest(
                 _log(f"attach failed ({e!r}); manual click still works")
 
             last_click = 0.0
-            frames_logged = False
+            last_sig = ""
 
             async def _probe_dom() -> dict:
                 res = await cdp.call(
@@ -216,7 +221,7 @@ async def harvest(
                 """Best-effort: click the Turnstile checkbox by coordinate. A real
                 `Input` mouse event (isTrusted) into a genuine browser often clears
                 the interactive widget; if not, the manual click is the fallback."""
-                nonlocal last_click, frames_logged
+                nonlocal last_click, last_sig
                 if not (auto_click and page_session):
                     return
                 now = loop.time()
@@ -226,31 +231,31 @@ async def harvest(
                 dom = await _probe_dom()
                 frames = dom.get("frames", [])
                 conts = dom.get("cont", [])
-                # Log the layout the first time anything Turnstile-ish shows up
-                # (the widget appears a couple seconds in, not on the first probe).
-                if (frames or conts) and not frames_logged:
+
+                # Dump the full candidate layout whenever it changes, so the widget's
+                # real coordinates (tag/id/class/rect) are visible for tuning.
+                sig = json.dumps([frames, conts], sort_keys=True)
+                if sig != last_sig and (frames or conts):
+                    last_sig = sig
                     _log(f"viewport {dom.get('vw')}x{dom.get('vh')} dpr={dom.get('dpr')}")
                     for f in frames:
                         _log(f"  iframe {f['w']:.0f}x{f['h']:.0f} @({f['x']:.0f},{f['y']:.0f}) "
-                             f"vis={f['vis']} src={f['src']!r}")
+                             f"vis={f['vis']} id={f.get('id','')!r} cls={f.get('cls','')!r} src={f['src']!r}")
                     for c in conts:
-                        _log(f"  turnstile-el <{c['tag']}> {c['w']:.0f}x{c['h']:.0f} @({c['x']:.0f},{c['y']:.0f})")
-                    frames_logged = True
+                        _log(f"  el <{c['tag']}> {c['w']:.0f}x{c['h']:.0f} @({c['x']:.0f},{c['y']:.0f}) "
+                             f"id={c.get('id','')!r} cls={c.get('cls','')!r} role={c.get('role','')!r}")
 
-                # Prefer a real, visible widget with non-zero height (the iframe);
-                # only fall back to a collapsed container if that's all there is.
+                # Prefer a visible iframe (the real widget); else a visible container.
                 target = _pick_widget(frames)
                 if not target:
                     visible = [c for c in conts if c["w"] > 0 and c["h"] > 0]
                     target = visible[0] if visible else next((c for c in conts if c["w"] > 0), None)
                 if not target:
-                    _log("no Turnstile widget located yet; retrying (or click manually)")
-                    return
+                    return  # nothing to click yet; the DOM dump above shows what's there
 
-                # Checkbox sits ~30px from the widget's left. Use the widget's
-                # vertical centre; for a collapsed (h==0) container, nudge down to
-                # where the checkbox row renders.
-                cy = target["y"] + (target["h"] / 2 if target["h"] > 0 else 33)
+                # Checkbox sits ~30px from the widget's left. Use its vertical centre;
+                # for a collapsed (h==0) container nudge down to the checkbox row.
+                cy = target["y"] + (target["h"] / 2 if target["h"] > 0 else 30)
                 x, y = target["x"] + 30, cy
                 for ev, buttons in (("mouseMoved", 0), ("mousePressed", 1), ("mouseReleased", 0)):
                     await cdp.call(
@@ -261,7 +266,8 @@ async def harvest(
                         session_id=page_session,
                     )
                 last_click = now
-                _log(f"auto-clicked at ({x:.0f},{y:.0f}) [widget {target['w']:.0f}x{target['h']:.0f}]")
+                _log(f"auto-clicked at ({x:.0f},{y:.0f}) -> target <{target.get('tag','iframe')}> "
+                     f"{target['w']:.0f}x{target['h']:.0f} @({target['x']:.0f},{target['y']:.0f})")
 
             while loop.time() < deadline:
                 try:

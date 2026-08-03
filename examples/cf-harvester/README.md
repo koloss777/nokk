@@ -10,14 +10,17 @@ solving it inside nokk, this example lets a real, undetected Chromium
 ([`nodriver`](https://github.com/ultrafunkamsterdam/nodriver)) solve it once, then
 hands the `cf_clearance` cookie to nokk to **replay**.
 
-> **Status — validated:** the harvest → replay hybrid is proven end-to-end. A cookie
+> **Status — validated end-to-end.** The harvest → replay hybrid is proven: a cookie
 > harvested here replays through nokk (matching Chrome version, same exit IP) to
 > **HTTP 200** past a live managed-Turnstile site. See [docs/RESEARCH.md](docs/RESEARCH.md).
 >
-> **The auto-click is best-effort, not a finished solver.** Managed Turnstile renders
-> in a shadow DOM with a collapsed container, so the coordinate click can miss. The
-> reliable path is a **manual click** in the window it opens (the poll loop picks up
-> the cookie either way). Automating the click on managed Turnstile is an open problem.
+> **The auto-click works** — verified solving a live managed Turnstile autonomously. It
+> walks the shadow DOM to find the `.cf-turnstile` container and clicks the checkbox by
+> coordinate with a real `Input` mouse event (`isTrusted`). It can still miss if a site
+> positions the widget unusually or uses a closed shadow root with no locatable container;
+> a **manual click** in the opened window is the fallback (the poll loop picks up the
+> cookie either way). Use `--headless` at your own risk — managed challenges are far more
+> reliable headful (run under Xvfb on a server).
 
 ## The hybrid, and why not “solve it in nokk”
 
