@@ -255,6 +255,13 @@ Already shipping:
 - 🟡 Prebuilt Linux binary + Docker image (`ghcr.io`), built by the tag-triggered
   [release workflow](.github/workflows/release.yml). (macOS/Windows binaries: planned.)
 
+> ⚠️ **RC dependency.** After the Chrome-emulation bump 137→148 (needed for `cf_clearance`
+> replay), the workspace depends on **release-candidate** crates: `wreq = "6.0.0-rc.29"` and
+> `wreq-util = "3.0.0-rc.14"` (wreq-util 2.x capped at Chrome 137). Prebuilt-binary/Docker
+> releases are fine (they bundle the locked versions), but **move to wreq 6.0 stable before a
+> crates.io publish or a stable release tag** — then re-run build/test/clippy for any final
+> API drift.
+
 ### Distribution channels
 
 nokk is driven over CDP, so it is useful to every scraping ecosystem, not just Rust.
