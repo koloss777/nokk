@@ -13,8 +13,9 @@ use std::sync::RwLock;
 use cookie_store::{CookieStore as RawStore, RawCookie};
 use serde::{Deserialize, Serialize};
 use url::Url;
-use wreq::cookie::CookieStore;
+use wreq::cookie::{CookieStore, Cookies};
 use wreq::header::HeaderValue;
+use wreq::{Uri, Version};
 
 /// A serializable cookie jar backing a named, resumable session.
 #[derive(Debug, Default)]
@@ -113,32 +114,61 @@ impl SessionJar {
 }
 
 impl CookieStore for SessionJar {
-    fn set_cookies(&self, url: &Url, cookie_headers: &mut dyn Iterator<Item = &HeaderValue>) {
+    fn set_cookies(&self, cookie_headers: &mut dyn Iterator<Item = &HeaderValue>, uri: &Uri) {
+        let Some(url) = uri_to_url(uri) else {
+            return;
+        };
         let iter = cookie_headers.filter_map(|val| {
             std::str::from_utf8(val.as_bytes())
                 .ok()
                 .and_then(|s| RawCookie::parse(s.to_owned()).ok())
                 .map(|c| c.into_owned())
         });
-        self.0.write().unwrap().store_response_cookies(iter, url);
+        self.0.write().unwrap().store_response_cookies(iter, &url);
     }
 
-    fn cookies(&self, url: &Url) -> Option<HeaderValue> {
-        let lock = self.0.read().unwrap();
-        let mut iter = lock.get_request_values(url);
-        let (first_name, first_value) = iter.next()?;
-        let mut cookie = String::with_capacity(64);
-        cookie.push_str(first_name);
-        cookie.push('=');
-        cookie.push_str(first_value);
-        for (name, value) in iter {
-            cookie.push_str("; ");
-            cookie.push_str(name);
-            cookie.push('=');
-            cookie.push_str(value);
+    fn cookies(&self, uri: &Uri, version: Version) -> Cookies {
+        let Some(url) = uri_to_url(uri) else {
+            return Cookies::Empty;
+        };
+        // Collect owned pairs so the store lock is released before building headers.
+        let pairs: Vec<(String, String)> = {
+            let lock = self.0.read().unwrap();
+            lock.get_request_values(&url)
+                .map(|(n, v)| (n.to_owned(), v.to_owned()))
+                .collect()
+        };
+        if pairs.is_empty() {
+            return Cookies::Empty;
         }
-        HeaderValue::from_str(&cookie).ok()
+        // HTTP/2+ sends each cookie as its own header field; HTTP/1.1 combines
+        // them into one `Cookie:` header (RFC 9113 §8.1.2.5 vs RFC 9112 §5.6.3).
+        if matches!(version, Version::HTTP_2 | Version::HTTP_3) {
+            let headers = pairs
+                .iter()
+                .filter_map(|(n, v)| HeaderValue::from_str(&format!("{n}={v}")).ok())
+                .collect();
+            Cookies::Uncompressed(headers)
+        } else {
+            let mut cookie = String::with_capacity(64);
+            for (name, value) in &pairs {
+                if !cookie.is_empty() {
+                    cookie.push_str("; ");
+                }
+                cookie.push_str(name);
+                cookie.push('=');
+                cookie.push_str(value);
+            }
+            HeaderValue::from_str(&cookie)
+                .map(Cookies::Compressed)
+                .unwrap_or(Cookies::Empty)
+        }
     }
+}
+
+/// Convert wreq's request [`Uri`] into the [`Url`] the cookie store matches on.
+fn uri_to_url(uri: &Uri) -> Option<Url> {
+    Url::parse(&uri.to_string()).ok()
 }
 
 #[cfg(test)]
@@ -146,10 +176,18 @@ mod tests {
     use super::*;
 
     fn set_cookie(jar: &SessionJar, url: &str, header: &str) {
-        let url = Url::parse(url).unwrap();
+        let uri: Uri = url.parse().unwrap();
         let hv = HeaderValue::from_str(header).unwrap();
         let mut it = std::iter::once(&hv);
-        jar.set_cookies(&url, &mut it);
+        jar.set_cookies(&mut it, &uri);
+    }
+
+    /// The combined HTTP/1.1 `Cookie:` header the jar would send to `url`.
+    fn cookie_header(jar: &SessionJar, url: &str) -> Option<HeaderValue> {
+        match jar.cookies(&url.parse::<Uri>().unwrap(), Version::HTTP_11) {
+            Cookies::Compressed(h) => Some(h),
+            _ => None,
+        }
     }
 
     #[test]
@@ -157,14 +195,10 @@ mod tests {
         let jar = SessionJar::new();
         set_cookie(&jar, "https://example.com/", "sid=abc; Path=/");
         assert_eq!(jar.len(), 1);
-        let hdr = jar
-            .cookies(&Url::parse("https://example.com/x").unwrap())
-            .unwrap();
+        let hdr = cookie_header(&jar, "https://example.com/x").unwrap();
         assert_eq!(hdr.to_str().unwrap(), "sid=abc");
         // A different host must not see it.
-        assert!(jar
-            .cookies(&Url::parse("https://other.test/").unwrap())
-            .is_none());
+        assert!(cookie_header(&jar, "https://other.test/").is_none());
     }
 
     #[test]
@@ -180,9 +214,7 @@ mod tests {
 
         let reloaded = SessionJar::load_file(&path).unwrap();
         assert_eq!(reloaded.len(), 2);
-        let hdr = reloaded
-            .cookies(&Url::parse("https://example.com/").unwrap())
-            .unwrap();
+        let hdr = cookie_header(&reloaded, "https://example.com/").unwrap();
         let s = hdr.to_str().unwrap();
         assert!(s.contains("sid=abc") && s.contains("theme=dark"), "got {s}");
 

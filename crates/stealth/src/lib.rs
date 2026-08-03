@@ -69,8 +69,8 @@ impl Default for StealthProfile {
 
 /// The Chrome major version every profile's UA / client hints report. **Must**
 /// match the TLS emulation (`nokk_net::FingerprintClient::EMULATION` = Chrome
-/// 137) or the JS UA and the ClientHello disagree — an instant anti-bot tell.
-pub const CHROME_MAJOR: &str = "137";
+/// 148) or the JS UA and the ClientHello disagree — an instant anti-bot tell.
+pub const CHROME_MAJOR: &str = "148";
 
 /// The OS a fingerprint profile emulates. The network layer maps this to a wreq
 /// `EmulationOS` so the TLS ClientHello matches the profile's UA and platform.
@@ -163,21 +163,21 @@ impl FingerprintProfile {
         match self {
             Self::ChromeLinux => common(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
-                 Chrome/137.0.0.0 Safari/537.36",
+                 Chrome/148.0.0.0 Safari/537.36",
                 8,
                 "Google Inc. (Intel)",
                 "ANGLE (Intel, Mesa Intel(R) UHD Graphics, OpenGL 4.6)",
             ),
             Self::ChromeWindows => common(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
-                 Chrome/137.0.0.0 Safari/537.36",
+                 Chrome/148.0.0.0 Safari/537.36",
                 16,
                 "Google Inc. (NVIDIA)",
                 "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002503) Direct3D11 vs_5_0 ps_5_0, D3D11)",
             ),
             Self::ChromeMac => common(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-                 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+                 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
                 8,
                 "Google Inc. (Apple)",
                 "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
@@ -2075,8 +2075,8 @@ mod tests {
         );
         assert!(win.contains("width: 1920") && win.contains("height: 1080"));
         assert!(
-            win.contains(r#"version: "137""#),
-            "client-hints brand version not 137"
+            win.contains(r#"version: "148""#),
+            "client-hints brand version not 148"
         );
         assert!(win.contains("Win32"), "navigator.platform not Win32");
 

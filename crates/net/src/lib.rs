@@ -99,11 +99,11 @@ pub enum EmulationOs {
 }
 
 impl EmulationOs {
-    fn to_wreq(self) -> wreq_util::EmulationOS {
+    fn to_platform(self) -> wreq_util::Platform {
         match self {
-            Self::Linux => wreq_util::EmulationOS::Linux,
-            Self::Windows => wreq_util::EmulationOS::Windows,
-            Self::Mac => wreq_util::EmulationOS::MacOS,
+            Self::Linux => wreq_util::Platform::Linux,
+            Self::Windows => wreq_util::Platform::Windows,
+            Self::Mac => wreq_util::Platform::MacOS,
         }
     }
 }
@@ -209,10 +209,11 @@ const FP_OWNED_HEADERS: &[&str] = &[
 ];
 
 impl FingerprintClient {
-    /// The Chrome version we impersonate; must agree with the stealth JS profile.
-    /// Newer emulations track Chrome's current TLS + request-header set more
-    /// closely (Cloudflare fingerprints header order, so accuracy matters).
-    pub const EMULATION: wreq_util::Emulation = wreq_util::Emulation::Chrome137;
+    /// The Chrome profile we impersonate; must agree with the stealth JS profile
+    /// (its UA / sec-ch-ua / `CHROME_MAJOR`). Newer emulations track Chrome's
+    /// current TLS + request-header set more closely, and a stale version is itself
+    /// a Cloudflare tell — keep this on current stable and in step with the JS side.
+    pub const EMULATION: wreq_util::Profile = wreq_util::Profile::Chrome148;
     pub fn new(config: &ClientConfig) -> Result<Self, NetError> {
         Self::with_session(config, None)
     }
@@ -229,9 +230,9 @@ impl FingerprintClient {
         let _ = config.fingerprint; // only ChromeDesktop today; see EMULATION
                                     // The TLS/HTTP2 OS must match the JS profile's OS (and its UA /
                                     // sec-ch-ua-platform), or the ClientHello contradicts the User-Agent.
-        let emulation = wreq_util::EmulationOption::builder()
-            .emulation(Self::EMULATION)
-            .emulation_os(config.emulation_os.to_wreq())
+        let emulation = wreq_util::Emulation::builder()
+            .profile(Self::EMULATION)
+            .platform(config.emulation_os.to_platform())
             .build();
         let mut builder = wreq::Client::builder().emulation(emulation);
         builder = match session {
@@ -303,7 +304,7 @@ impl HttpClient for FingerprintClient {
         })?;
         let status = resp.status().as_u16();
         // Final URL after redirects — captured before `bytes()` consumes `resp`.
-        let url = resp.url().to_string();
+        let url = resp.uri().to_string();
         let mut headers = BTreeMap::new();
         for (k, v) in resp.headers() {
             if let Ok(s) = v.to_str() {

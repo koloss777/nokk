@@ -115,9 +115,9 @@ async fn serve_http(stream: &mut TcpStream, path: &str, port: u16) -> std::io::R
     let ws_url = format!("ws://127.0.0.1:{port}/devtools/browser/nokk");
     let body = match path {
         p if p.starts_with("/json/version") => json!({
-            "Browser": "Chrome/137.0.0.0",
+            "Browser": "Chrome/148.0.0.0",
             "Protocol-Version": "1.3",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
             "V8-Version": "13.7",
             "WebKit-Version": "537.36",
             "webSocketDebuggerUrl": ws_url,
@@ -380,9 +380,9 @@ impl Conn {
                 &session,
                 json!({
                     "protocolVersion": "1.3",
-                    "product": "Chrome/137.0.0.0",
+                    "product": "Chrome/148.0.0.0",
                     "revision": "@nokk",
-                    "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+                    "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
                     "jsVersion": "13.7",
                 }),
             )],
