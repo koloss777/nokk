@@ -80,6 +80,12 @@ pub struct EngineConfig {
     /// failed lookup keeps the profile's default zone. No effect on contexts
     /// without a proxy.
     pub geoip_timezone: bool,
+    /// Chrome major version to emulate across both layers — the TLS/HTTP
+    /// fingerprint and the JS UA / `userAgentData`. Defaults to current stable
+    /// ([`nokk_net::DEFAULT_CHROME_MAJOR`]); set it to match, e.g., the browser a
+    /// reused `cf_clearance` was minted under. Bounded by what wreq-util ships (an
+    /// unavailable version falls back to the default).
+    pub chrome_major: u32,
 }
 
 impl Default for EngineConfig {
@@ -93,6 +99,7 @@ impl Default for EngineConfig {
             block_trackers: true,
             rotate_fingerprint: false,
             geoip_timezone: false,
+            chrome_major: nokk_net::DEFAULT_CHROME_MAJOR,
         }
     }
 }
@@ -126,6 +133,9 @@ struct EngineInner {
     /// Derive each context's timezone/locale from its proxy's exit IP (see
     /// [`EngineConfig::geoip_timezone`]).
     geoip_timezone: bool,
+    /// Chrome major every context emulates (JS side); rotated presets are
+    /// re-versioned to it so they stay coherent with the TLS emulation.
+    chrome_major: u32,
     /// Rendered bootstraps, keyed by `(profile, geo)`, built lazily and cached so
     /// contexts sharing an identity+proxy don't re-render the same ~KB of JS.
     bootstrap_cache: Mutex<HashMap<String, String>>,
@@ -227,7 +237,7 @@ impl EngineInner {
             return b.clone();
         }
         let base = profile
-            .map(|p| p.stealth())
+            .map(|p| p.stealth().with_chrome_major(self.chrome_major))
             .unwrap_or_else(|| self.stealth.clone());
         let stealth = match geo {
             Some(g) => nokk_stealth::apply_geo(&base, &g.timezone, &g.country_code),
@@ -450,6 +460,11 @@ pub struct Engine {
 impl Engine {
     /// Build an engine and spawn its worker threads.
     pub fn new(mut config: EngineConfig) -> Result<Self, EngineError> {
+        // Emulate one Chrome major across both layers: the TLS/HTTP fingerprint and
+        // the JS UA / userAgentData. Re-version the default stealth profile to match
+        // so the ClientHello and the UA never disagree.
+        config.client.chrome_major = config.chrome_major;
+        config.stealth = config.stealth.with_chrome_major(config.chrome_major);
         // Keep the TLS/HTTP emulation OS coherent with the JS profile's OS, so the
         // ClientHello (JA3/JA4) never contradicts the User-Agent.
         config.client.emulation_os = emulation_os_for(&config.stealth);
@@ -486,6 +501,7 @@ impl Engine {
                 bootstrap,
                 rotate_fingerprint: config.rotate_fingerprint,
                 geoip_timezone: config.geoip_timezone,
+                chrome_major: config.chrome_major,
                 bootstrap_cache: Mutex::new(HashMap::new()),
                 geo_cache: Mutex::new(HashMap::new()),
             }),
@@ -605,6 +621,22 @@ impl Engine {
     /// configured store or if the session hasn't been opened this run.
     pub fn save_session(&self, name: &str) {
         self.inner.save_session_blocking(name);
+    }
+
+    /// Import a `Set-Cookie`-style cookie into a named session, as if `origin`
+    /// had sent it — the basis for reusing a `cf_clearance` harvested elsewhere.
+    /// The session's client sends it on subsequent requests (cookie replay only
+    /// works if this engine's fingerprint + exit IP match the harvester's).
+    pub fn import_session_cookie(
+        &self,
+        name: &str,
+        set_cookie: &str,
+        origin: &str,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .session_jar(name)?
+            .add_set_cookie(set_cookie, origin);
+        Ok(())
     }
 
     /// Snapshot a named session's currently-held cookies — for inspection or CDP

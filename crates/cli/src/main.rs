@@ -75,6 +75,18 @@ struct Cli {
     #[arg(long, env = "NOKK_SESSION_STORE", value_name = "DIR")]
     session_store: Option<std::path::PathBuf>,
 
+    /// For `--load`: bind the navigation to a named session (its cookie jar is
+    /// reused). Pair with `--import-cookies` to preload a harvested clearance.
+    #[arg(long, value_name = "NAME")]
+    session: Option<String>,
+
+    /// For `--load`: import cookies from a JSON file into the `--session` jar
+    /// before navigating — e.g. a `cf_clearance.json` harvested by nokk-cf
+    /// (`{ "cookies": { name: value, … }, "domain": "…", "url": "…" }`). Replay
+    /// only works if this engine's Chrome emulation + exit IP match the harvester.
+    #[arg(long, value_name = "FILE")]
+    import_cookies: Option<std::path::PathBuf>,
+
     /// Load ad/analytics/tracker scripts instead of dropping them. Tracker
     /// blocking is on by default (trims the passive-fingerprinting surface and
     /// speeds loads); pass this to disable it.
@@ -94,6 +106,13 @@ struct Cli {
     /// made through that proxy. Best-effort; no effect without a proxy.
     #[arg(long, env = "NOKK_GEOIP_TIMEZONE")]
     geoip_timezone: bool,
+
+    /// Chrome major version to emulate (TLS fingerprint + JS UA together), e.g.
+    /// `148`. Defaults to current stable; set it to match the browser a reused
+    /// `cf_clearance` was minted under. Bounded by what wreq-util ships — an
+    /// unavailable version falls back to the default.
+    #[arg(long, env = "NOKK_CHROME_VERSION", value_name = "MAJOR")]
+    chrome_version: Option<u32>,
 
     /// For `--load`: retry up to N extra times if the response is a Cloudflare
     /// "Just a moment…" challenge (the pass is probabilistic).
@@ -126,6 +145,42 @@ fn parse_proxy(s: &str) -> Option<nokk_net::ProxyConfig> {
         username: (!u.username().is_empty()).then(|| u.username().to_string()),
         password: u.password().map(|p| p.to_string()),
     })
+}
+
+/// Import cookies from a harvested-clearance JSON file into a named session.
+///
+/// Expects the shape nokk-cf writes: `{ "cookies": { name: value, … }, "domain":
+/// "…", "url": "…" }`. Each cookie is stored as if the origin had set it for the
+/// domain, so the session's next request replays them.
+fn import_cookies_file(engine: &Engine, session: &str, path: &std::path::Path) -> Result<()> {
+    let data = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&data)?;
+    let domain = v
+        .get("domain")
+        .and_then(|d| d.as_str())
+        .ok_or_else(|| anyhow::anyhow!("cookie file missing \"domain\""))?;
+    let origin = v
+        .get("url")
+        .and_then(|u| u.as_str())
+        .ok_or_else(|| anyhow::anyhow!("cookie file missing \"url\""))?;
+    let cookies = v
+        .get("cookies")
+        .and_then(|c| c.as_object())
+        .ok_or_else(|| anyhow::anyhow!("cookie file missing \"cookies\" object"))?;
+    let mut n = 0;
+    for (name, value) in cookies {
+        let Some(value) = value.as_str() else {
+            continue;
+        };
+        let set_cookie = format!("{name}={value}; Domain={domain}; Path=/; Secure");
+        engine
+            .import_session_cookie(session, &set_cookie, origin)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        n += 1;
+    }
+    eprintln!("imported {n} cookies into session '{session}' for {domain}");
+    Ok(())
 }
 
 /// Render an eval result for the terminal: unwrap a JSON string to its raw text
@@ -194,6 +249,9 @@ impl Cli {
             block_trackers: !self.allow_trackers,
             rotate_fingerprint: self.rotate_fingerprint,
             geoip_timezone: self.geoip_timezone,
+            chrome_major: self
+                .chrome_version
+                .unwrap_or(nokk_net::DEFAULT_CHROME_MAJOR),
             ..Default::default()
         }
     }
@@ -235,11 +293,29 @@ async fn main() -> Result<()> {
     // One-shot load mode: navigate to a URL, then optionally probe the DOM.
     if let Some(url) = &cli.load {
         let t = Instant::now();
-        // Retry on a Cloudflare challenge (the pass is probabilistic). Each try
-        // is a fresh context so a poisoned session doesn't carry over.
+        let session = cli.session.clone();
+        let proxy = cli.proxy.as_deref().and_then(parse_proxy);
+        // Preload a harvested clearance (cf_clearance.json) into the session so the
+        // navigation carries it — cookie replay for a Cloudflare-gated site.
+        if let Some(path) = &cli.import_cookies {
+            let name = session
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--import-cookies requires --session"))?;
+            import_cookies_file(&engine, name, path)?;
+        }
+        // Retry on a Cloudflare challenge (the pass is probabilistic). Without a
+        // session each try is a fresh context so a poisoned session doesn't carry
+        // over; a named session deliberately reuses its (imported) jar.
         let mut ctx = None;
         for attempt in 0..=cli.retries {
-            let c = engine.new_context().await?;
+            let c = match &session {
+                Some(name) => {
+                    engine
+                        .new_context_with_session(name.clone(), proxy.clone())
+                        .await?
+                }
+                None => engine.new_context().await?,
+            };
             c.navigate(url).await?;
             let title = c.evaluate("document.title").await.unwrap_or_default();
             let challenged =

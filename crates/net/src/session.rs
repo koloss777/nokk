@@ -94,6 +94,15 @@ impl SessionJar {
         }
     }
 
+    /// Like [`Self::add_cookie_str`] but parses the origin from a string — handy
+    /// for importing a harvested clearance whose origin is a plain URL string.
+    /// A malformed URL is ignored (best-effort import).
+    pub fn add_set_cookie(&self, set_cookie: &str, url: &str) {
+        if let Ok(u) = Url::parse(url) {
+            self.add_cookie_str(set_cookie, &u);
+        }
+    }
+
     /// Snapshot every unexpired cookie, for CDP `Network.getCookies` or session
     /// inspection.
     pub fn snapshot(&self) -> Vec<CookieRecord> {
