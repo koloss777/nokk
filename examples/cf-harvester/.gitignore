@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+.venv/
+venv/
+
+# harvested artifacts / local runs — these hold LIVE cookies, never commit them
+cf_clearance*.json
+*.clearance.json
+/data/

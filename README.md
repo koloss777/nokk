@@ -190,6 +190,19 @@ Every page opened in that context shares the named jar; it flushes to disk when 
 closes. Distinct session names are fully isolated. Without `--session-store`, sessions are
 in-memory only. From the Rust API this is `Engine::new_context_with_session(name, proxy)`.
 
+**Reusing a Cloudflare `cf_clearance`.** An interactive/managed Turnstile can't be solved by
+a no-render engine, but a clearance solved once in a real browser can be *replayed*: match
+its Chrome version (`--chrome-version <N>`) and exit IP, import the cookies, and navigate.
+
+```bash
+nokk --load https://gated.example/ --chrome-version 148 \
+     --session cf --import-cookies cf_clearance.json      # → 200, past the gate
+```
+
+See [examples/cf-harvester](examples/cf-harvester/) for a real-browser harvester that
+produces `cf_clearance.json`, and the [research write-up](examples/cf-harvester/docs/RESEARCH.md)
+on why this hybrid (real browser solves, nokk replays at scale) is the honest approach.
+
 ### Rotating fingerprints across contexts
 
 With `--rotate-fingerprint`, every browser context presents its **own coherent machine** —

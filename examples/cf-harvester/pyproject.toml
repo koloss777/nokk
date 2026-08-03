@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nokk-cf"
+version = "0.0.1"
+description = "Harvest Cloudflare cf_clearance with a real (undetected) browser, so a lightweight engine like nokk can reuse it instead of solving the challenge itself."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "koloss777" }]
+keywords = [
+    "cloudflare", "cf-clearance", "turnstile", "anti-bot", "bypass",
+    "web-scraping", "scraping", "nodriver", "nokk",
+]
+dependencies = [
+    # Undetected Chromium driver that does the real-browser solve.
+    "nodriver>=0.38",
+    # Raw CDP reads (Storage.getCookies / Browser.getVersion) — nodriver's own
+    # cookie call stalls on a mid-challenge page.
+    "websockets>=12",
+]
+
+[project.optional-dependencies]
+# Expose the harvester as a small HTTP service that nokk can call.
+server = ["fastapi>=0.110", "uvicorn>=0.29"]
+
+[project.scripts]
+nokk-cf = "nokk_cf.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/koloss777/nokk"
+"Example source" = "https://github.com/koloss777/nokk/tree/main/examples/cf-harvester"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nokk_cf"]
