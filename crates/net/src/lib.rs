@@ -99,11 +99,62 @@ pub enum EmulationOs {
 }
 
 impl EmulationOs {
-    fn to_wreq(self) -> wreq_util::EmulationOS {
+    fn to_platform(self) -> wreq_util::Platform {
         match self {
-            Self::Linux => wreq_util::EmulationOS::Linux,
-            Self::Windows => wreq_util::EmulationOS::Windows,
-            Self::Mac => wreq_util::EmulationOS::MacOS,
+            Self::Linux => wreq_util::Platform::Linux,
+            Self::Windows => wreq_util::Platform::Windows,
+            Self::Mac => wreq_util::Platform::MacOS,
+        }
+    }
+}
+
+/// The Chrome major version emulated by default — current stable. Keep in step
+/// with `nokk_stealth::CHROME_MAJOR`.
+pub const DEFAULT_CHROME_MAJOR: u32 = 148;
+
+/// Map a Chrome major version to the matching wreq TLS/HTTP emulation profile.
+///
+/// Covers the modern range wreq-util ships (roughly Chrome 120–149); an
+/// unavailable version falls back to [`DEFAULT_CHROME_MAJOR`] with a warning, so
+/// a caller can request "the version my `cf_clearance` was minted under" and get
+/// the closest faithful handshake nokk can actually produce.
+pub fn profile_for_major(major: u32) -> wreq_util::Profile {
+    use wreq_util::Profile as P;
+    match major {
+        120 => P::Chrome120,
+        123 => P::Chrome123,
+        124 => P::Chrome124,
+        126 => P::Chrome126,
+        127 => P::Chrome127,
+        128 => P::Chrome128,
+        129 => P::Chrome129,
+        130 => P::Chrome130,
+        131 => P::Chrome131,
+        132 => P::Chrome132,
+        133 => P::Chrome133,
+        134 => P::Chrome134,
+        135 => P::Chrome135,
+        136 => P::Chrome136,
+        137 => P::Chrome137,
+        138 => P::Chrome138,
+        139 => P::Chrome139,
+        140 => P::Chrome140,
+        141 => P::Chrome141,
+        142 => P::Chrome142,
+        143 => P::Chrome143,
+        144 => P::Chrome144,
+        145 => P::Chrome145,
+        146 => P::Chrome146,
+        147 => P::Chrome147,
+        148 => P::Chrome148,
+        149 => P::Chrome149,
+        other => {
+            tracing::warn!(
+                requested = other,
+                fallback = DEFAULT_CHROME_MAJOR,
+                "no wreq emulation for this Chrome version; using the default"
+            );
+            P::Chrome148
         }
     }
 }
@@ -114,6 +165,10 @@ pub struct ClientConfig {
     pub fingerprint: FingerprintProfile,
     /// OS the TLS emulation impersonates; keep coherent with the JS profile.
     pub emulation_os: EmulationOs,
+    /// Chrome major version the TLS/HTTP fingerprint emulates. Must match the JS
+    /// profile's UA / `CHROME_MAJOR`. Mapped to a wreq profile by
+    /// [`profile_for_major`]; an unavailable version falls back to the default.
+    pub chrome_major: u32,
     pub limits: PoolLimits,
     pub proxy: Option<ProxyConfig>,
     pub request_timeout: Duration,
@@ -124,6 +179,7 @@ impl Default for ClientConfig {
         Self {
             fingerprint: FingerprintProfile::default(),
             emulation_os: EmulationOs::default(),
+            chrome_major: DEFAULT_CHROME_MAJOR,
             limits: PoolLimits::default(),
             proxy: None,
             request_timeout: Duration::from_secs(30),
@@ -209,10 +265,12 @@ const FP_OWNED_HEADERS: &[&str] = &[
 ];
 
 impl FingerprintClient {
-    /// The Chrome version we impersonate; must agree with the stealth JS profile.
-    /// Newer emulations track Chrome's current TLS + request-header set more
-    /// closely (Cloudflare fingerprints header order, so accuracy matters).
-    pub const EMULATION: wreq_util::Emulation = wreq_util::Emulation::Chrome137;
+    /// The default Chrome profile we impersonate; must agree with the stealth JS
+    /// profile (its UA / sec-ch-ua / `CHROME_MAJOR`). Newer emulations track
+    /// Chrome's current TLS + request-header set more closely, and a stale version
+    /// is itself a Cloudflare tell — keep this on current stable. Per-client the
+    /// version is chosen by [`profile_for_major`] from [`ClientConfig::chrome_major`].
+    pub const EMULATION: wreq_util::Profile = wreq_util::Profile::Chrome148;
     pub fn new(config: &ClientConfig) -> Result<Self, NetError> {
         Self::with_session(config, None)
     }
@@ -229,9 +287,9 @@ impl FingerprintClient {
         let _ = config.fingerprint; // only ChromeDesktop today; see EMULATION
                                     // The TLS/HTTP2 OS must match the JS profile's OS (and its UA /
                                     // sec-ch-ua-platform), or the ClientHello contradicts the User-Agent.
-        let emulation = wreq_util::EmulationOption::builder()
-            .emulation(Self::EMULATION)
-            .emulation_os(config.emulation_os.to_wreq())
+        let emulation = wreq_util::Emulation::builder()
+            .profile(profile_for_major(config.chrome_major))
+            .platform(config.emulation_os.to_platform())
             .build();
         let mut builder = wreq::Client::builder().emulation(emulation);
         builder = match session {
@@ -303,7 +361,7 @@ impl HttpClient for FingerprintClient {
         })?;
         let status = resp.status().as_u16();
         // Final URL after redirects — captured before `bytes()` consumes `resp`.
-        let url = resp.url().to_string();
+        let url = resp.uri().to_string();
         let mut headers = BTreeMap::new();
         for (k, v) in resp.headers() {
             if let Ok(s) = v.to_str() {
@@ -402,6 +460,22 @@ mod tests {
             assert!(
                 FingerprintClient::new(&cfg).is_ok(),
                 "failed to build client for {os:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_builds_for_a_custom_chrome_major() {
+        // A supported version, and an unavailable one that must fall back rather
+        // than fail — the caller can request any major and still get a client.
+        for major in [131u32, 137, 148, 149, 999] {
+            let cfg = ClientConfig {
+                chrome_major: major,
+                ..Default::default()
+            };
+            assert!(
+                FingerprintClient::new(&cfg).is_ok(),
+                "failed to build client for Chrome {major}"
             );
         }
     }

@@ -57,6 +57,10 @@ pub struct StealthProfile {
     /// (`"Windows"`/`"macOS"`/`"Linux"`), which must agree with the UA and
     /// `navigator.platform`.
     pub ua_platform: String,
+    /// Chrome major version reported by the UA / `userAgentData` brands. Must
+    /// match the TLS emulation ([`nokk_net`]'s `chrome_major`). Change it via
+    /// [`Self::with_chrome_major`] so the UA string and this field stay coherent.
+    pub chrome_major: u32,
 }
 
 impl Default for StealthProfile {
@@ -67,10 +71,25 @@ impl Default for StealthProfile {
     }
 }
 
+impl StealthProfile {
+    /// Re-version this profile to a different Chrome major: the UA's
+    /// `Chrome/<n>.0.0.0` token and [`Self::chrome_major`] (which drives the
+    /// `userAgentData` brand version in the bootstrap) are rewritten together, so
+    /// the reported version stays coherent. Pair with `nokk_net`'s TLS emulation
+    /// at the *same* major, or the UA and the ClientHello disagree.
+    pub fn with_chrome_major(mut self, major: u32) -> Self {
+        let old = format!("Chrome/{}.0.0.0", self.chrome_major);
+        let new = format!("Chrome/{major}.0.0.0");
+        self.user_agent = self.user_agent.replace(&old, &new);
+        self.chrome_major = major;
+        self
+    }
+}
+
 /// The Chrome major version every profile's UA / client hints report. **Must**
 /// match the TLS emulation (`nokk_net::FingerprintClient::EMULATION` = Chrome
-/// 137) or the JS UA and the ClientHello disagree — an instant anti-bot tell.
-pub const CHROME_MAJOR: &str = "137";
+/// 148) or the JS UA and the ClientHello disagree — an instant anti-bot tell.
+pub const CHROME_MAJOR: &str = "148";
 
 /// The OS a fingerprint profile emulates. The network layer maps this to a wreq
 /// `EmulationOS` so the TLS ClientHello matches the profile's UA and platform.
@@ -144,6 +163,7 @@ impl FingerprintProfile {
             user_agent: ua.to_string(),
             platform: platform.to_string(),
             ua_platform: ua_platform.to_string(),
+            chrome_major: CHROME_MAJOR.parse().unwrap_or(148),
             languages: vec!["en-US".into(), "en".into()],
             hardware_concurrency: hw,
             device_memory_gb: 8, // Chrome caps navigator.deviceMemory at 8
@@ -163,21 +183,21 @@ impl FingerprintProfile {
         match self {
             Self::ChromeLinux => common(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
-                 Chrome/137.0.0.0 Safari/537.36",
+                 Chrome/148.0.0.0 Safari/537.36",
                 8,
                 "Google Inc. (Intel)",
                 "ANGLE (Intel, Mesa Intel(R) UHD Graphics, OpenGL 4.6)",
             ),
             Self::ChromeWindows => common(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
-                 Chrome/137.0.0.0 Safari/537.36",
+                 Chrome/148.0.0.0 Safari/537.36",
                 16,
                 "Google Inc. (NVIDIA)",
                 "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002503) Direct3D11 vs_5_0 ps_5_0, D3D11)",
             ),
             Self::ChromeMac => common(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-                 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+                 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
                 8,
                 "Google Inc. (Apple)",
                 "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
@@ -486,7 +506,7 @@ pub fn bootstrap_script(profile: &StealthProfile) -> String {
         .replace("__MEM__", &profile.device_memory_gb.to_string())
         .replace("__WEBGL_VENDOR__", &quoted(&profile.webgl_vendor))
         .replace("__WEBGL_RENDERER__", &quoted(&profile.webgl_renderer))
-        .replace("__CHROME_MAJOR__", CHROME_MAJOR)
+        .replace("__CHROME_MAJOR__", &profile.chrome_major.to_string())
         .replace("__UA_PLATFORM__", &quoted(&profile.ua_platform))
         .replace("__SCREEN_W__", &profile.screen_width.to_string())
         .replace("__SCREEN_H__", &profile.screen_height.to_string())
@@ -2075,8 +2095,8 @@ mod tests {
         );
         assert!(win.contains("width: 1920") && win.contains("height: 1080"));
         assert!(
-            win.contains(r#"version: "137""#),
-            "client-hints brand version not 137"
+            win.contains(r#"version: "148""#),
+            "client-hints brand version not 148"
         );
         assert!(win.contains("Win32"), "navigator.platform not Win32");
 
@@ -2087,6 +2107,24 @@ mod tests {
 
         // Rotation actually changes the JS-visible fingerprint.
         assert_ne!(win, mac);
+    }
+
+    #[test]
+    fn with_chrome_major_reversions_ua_and_brands_coherently() {
+        let p = FingerprintProfile::ChromeLinux
+            .stealth()
+            .with_chrome_major(131);
+        assert_eq!(p.chrome_major, 131);
+        assert!(
+            p.user_agent.contains("Chrome/131.0.0.0"),
+            "UA: {}",
+            p.user_agent
+        );
+        assert!(!p.user_agent.contains("Chrome/148"));
+        // The bootstrap's userAgentData brand version follows the field.
+        let js = bootstrap_script(&p);
+        assert!(js.contains(r#"version: "131""#));
+        assert!(!js.contains(r#"version: "148""#));
     }
 
     #[test]

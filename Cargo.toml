@@ -34,8 +34,8 @@ url = "2"
 # Chrome-fingerprinted HTTP client (Phase 2). BoringSSL-backed; emits a Chrome
 # ClientHello (JA3/JA4) + HTTP/2 fingerprint. Build needs cmake + libclang (see
 # docs/BUILD.md).
-wreq = { version = "5", features = ["cookies"] }
-wreq-util = "2"
+wreq = { version = "6.0.0-rc.29", features = ["cookies"] }
+wreq-util = "3.0.0-rc.14"
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
