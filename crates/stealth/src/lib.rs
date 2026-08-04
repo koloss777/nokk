@@ -1220,6 +1220,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   globalThis.WebGL2RenderingContext = globalThis.WebGL2RenderingContext || mask(class WebGL2RenderingContext {}, 'WebGL2RenderingContext');
   globalThis.CanvasRenderingContext2D = globalThis.CanvasRenderingContext2D || mask(class CanvasRenderingContext2D {}, 'CanvasRenderingContext2D');
   globalThis.HTMLCanvasElement = globalThis.HTMLCanvasElement || globalThis.Element;
+  // The opaque GL object types. Every browser exposes them, and the handles we
+  // hand back get these prototypes so `tex instanceof WebGLTexture` holds.
+  for (const n of ['WebGLShader','WebGLProgram','WebGLBuffer','WebGLTexture','WebGLFramebuffer',
+    'WebGLRenderbuffer','WebGLVertexArrayObject','WebGLUniformLocation','WebGLActiveInfo']) {
+    // Not constructible, like the real interfaces — only the context hands them out.
+    if (!globalThis[n]) globalThis[n] = mask(class { constructor() { throw new TypeError('Illegal constructor'); } }, n);
+  }
 
   // --- Canvas 2D --------------------------------------------------------
   // A fixed, plausible PNG payload: consistent hash => looks like one device.
@@ -1630,6 +1637,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       getShaderPrecisionFormat(){ return { rangeMin: 127, rangeMax: 127, precision: 23 }; },
       getContextAttributes_: null,
     });
+    const iface = (n) => (globalThis[n] ? globalThis[n].prototype : Object.prototype);
     // WebGL fingerprinting renders a scene and reads it back (readPixels, or
     // toDataURL on the canvas). With every call a no-op the readback was all
     // zeroes no matter what was drawn, so two different scenes compared equal —
@@ -1642,28 +1650,51 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       const GW = canvas.width || 300, GH = canvas.height || 150;
       __pt_glCreate(gid, GW, GH);
       __pt_glViewport(gid, 0, 0, GW, GH);
-      const shProto = globalThis.WebGLShader ? globalThis.WebGLShader.prototype : Object.prototype;
-      const prProto = globalThis.WebGLProgram ? globalThis.WebGLProgram.prototype : Object.prototype;
-      const bfProto = globalThis.WebGLBuffer ? globalThis.WebGLBuffer.prototype : Object.prototype;
+      const shProto = iface('WebGLShader'), prProto = iface('WebGLProgram'), bfProto = iface('WebGLBuffer');
+      const txProto = iface('WebGLTexture'), fbProto = iface('WebGLFramebuffer');
+      const rbProto = iface('WebGLRenderbuffer'), vaProto = iface('WebGLVertexArrayObject');
       let clearRGBA = [0, 0, 0, 0];
       const H = (o) => (o ? (o.__h | 0) : 0);              // JS wrapper -> native handle
       const L = (l) => (l && typeof l.__loc === 'number' ? l.__loc : -1);
       const bytesOf = (d) => (typeof d === 'number' ? new Uint8Array(Math.max(0, d)) : d);
+      const obj = (p, h) => { const o = Object.create(p); o.__h = h; return o; };
+      // WebGL's own unpack modes: the browser applies these on the CPU before the
+      // upload (GL has no such state), so they ride along with each texImage2D.
+      let flipY = 0, premul = 0;
+      let boundFB = null;                                  // null = the drawing buffer
+      const EMPTY = new Uint8Array(0);
+      const texBytes = (d) => (d && (d.byteLength !== undefined || d.length !== undefined) ? d : EMPTY);
+      // Pixels behind a texImage2D *source* argument (ImageData, another canvas,
+      // an image). Anything we can't read still yields its dimensions, so the
+      // texture is allocated at the right size instead of the call being dropped.
+      const srcPixels = (s) => {
+        if (!s) return { w: 0, h: 0, data: EMPTY };
+        if (s.data && s.width !== undefined) return { w: s.width | 0, h: s.height | 0, data: s.data };
+        const g = s.__ptC2d || s.__ptGl1 || s.__ptGl2;
+        if (g && g.__ptPixels) { const p = g.__ptPixels(); return { w: p.w, h: p.h, data: p.data }; }
+        const w = (s.naturalWidth || s.width || s.videoWidth || 0) | 0;
+        const h = (s.naturalHeight || s.height || s.videoHeight || 0) | 0;
+        return { w, h, data: EMPTY };
+      };
       Object.assign(gl, {
-        createShader(type) { const o = Object.create(shProto); o.__h = __pt_glCreateShader(gid, type >>> 0); o.__type = type; return o; },
+        createShader(type) { const o = obj(shProto, __pt_glCreateShader(gid, type >>> 0)); o.__type = type; return o; },
         shaderSource(sh, src) { if (sh) sh.__src = String(src); },
         compileShader(sh) { if (sh) __pt_glCompileShader(gid, H(sh), sh.__src || ''); },
         getShaderParameter(sh, pn) { if (pn === C.COMPILE_STATUS) return __pt_glShaderCompiled(gid, H(sh)); if (pn === 0x8B4F) return sh && sh.__type; return true; },
         getShaderInfoLog(sh) { return __pt_glShaderInfoLog(gid, H(sh)); },
-        createProgram() { const o = Object.create(prProto); o.__h = __pt_glCreateProgram(gid); return o; },
+        createProgram() { return obj(prProto, __pt_glCreateProgram(gid)); },
         attachShader(p, sh) { __pt_glAttachShader(gid, H(p), H(sh)); },
         linkProgram(p) { __pt_glLinkProgram(gid, H(p)); },
         getProgramParameter(p, pn) { if (pn === C.LINK_STATUS) return __pt_glProgramLinked(gid, H(p)); return 0; },
         getProgramInfoLog() { return ''; },
         useProgram(p) { __pt_glUseProgram(gid, H(p)); },
         getAttribLocation(p, name) { return __pt_glAttribLocation(gid, H(p), String(name)); },
-        getUniformLocation(p, name) { const l = __pt_glUniformLocation(gid, H(p), String(name)); return l >= 0 ? { __loc: l } : null; },
-        createBuffer() { const o = Object.create(bfProto); o.__h = __pt_glCreateBuffer(gid); return o; },
+        getUniformLocation(p, name) {
+          const l = __pt_glUniformLocation(gid, H(p), String(name));
+          if (l < 0) return null;                            // as the spec says for an unknown name
+          const o = Object.create(iface('WebGLUniformLocation')); o.__loc = l; return o;
+        },
+        createBuffer() { return obj(bfProto, __pt_glCreateBuffer(gid)); },
         bindBuffer(t, b) { __pt_glBindBuffer(gid, t >>> 0, H(b)); },
         bufferData(t, data, usage) { __pt_glBufferData(gid, t >>> 0, bytesOf(data), (usage || 0) >>> 0); },
         enableVertexAttribArray(i) { __pt_glEnableVertexAttribArray(gid, i >>> 0); },
@@ -1675,28 +1706,97 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         uniform1i(l, x) { __pt_glUniform1i(gid, L(l), x | 0); },
         uniformMatrix4fv(l, transpose, v) { __pt_glUniformMatrix4(gid, L(l), transpose ? 1 : 0, new Float32Array(v)); },
         clearColor(r, g, b, a) { const q = (v) => Math.max(0, Math.min(255, Math.round((+v || 0) * 255))); clearRGBA = [q(r), q(g), q(b), q(a)]; },
-        clear(mask) { if ((mask | 0) & C.COLOR_BUFFER_BIT) __pt_glClear(gid, clearRGBA[0], clearRGBA[1], clearRGBA[2], clearRGBA[3]); },
+        clear(mask) { __pt_glClear(gid, clearRGBA[0], clearRGBA[1], clearRGBA[2], clearRGBA[3], mask | 0); },
         viewport(x, y, w, h) { __pt_glViewport(gid, x | 0, y | 0, w | 0, h | 0); },
         enable(cap) { __pt_glEnable(gid, cap >>> 0, 1); },
         disable(cap) { __pt_glEnable(gid, cap >>> 0, 0); },
+        blendFunc(s, d) { __pt_glBlendFunc(gid, s >>> 0, d >>> 0); },
+        depthFunc(f) { __pt_glDepthFunc(gid, f >>> 0); },
         drawArrays(mode, first, count) { __pt_glDrawArrays(gid, mode >>> 0, first | 0, count | 0); },
         drawElements(mode, count, type, offset) { __pt_glDrawElements(gid, mode >>> 0, count | 0, type >>> 0, offset | 0); },
-        readPixels(x, y, w, h, format, type, dst) {
-          w = w | 0; h = h | 0; if (!dst) return dst;
-          const full = __pt_glReadPixels(gid);            // whole surface, top-left origin
-          for (let row = 0; row < h; row++) {
-            const sy = GH - 1 - ((y | 0) + row);          // WebGL readPixels is bottom-left
-            if (sy < 0 || sy >= GH) continue;
-            for (let col = 0; col < w; col++) {
-              const sx = (x | 0) + col; if (sx < 0 || sx >= GW) continue;
-              const si = (sy * GW + sx) * 4, di = (row * w + col) * 4;
-              dst[di] = full[si]; dst[di + 1] = full[si + 1]; dst[di + 2] = full[si + 2]; dst[di + 3] = full[si + 3];
-            }
+        // --- textures: the classic fingerprint scene is a textured quad, and a
+        // stubbed sampler reads black, collapsing every scene to one readback.
+        createTexture() { return obj(txProto, __pt_glCreateTexture(gid)); },
+        bindTexture(t, tex) { __pt_glBindTexture(gid, t >>> 0, H(tex)); },
+        activeTexture(u) { __pt_glActiveTexture(gid, u >>> 0); },
+        texParameteri(t, pn, p) { __pt_glTexParameteri(gid, t >>> 0, pn >>> 0, p | 0); },
+        texParameterf(t, pn, p) { __pt_glTexParameteri(gid, t >>> 0, pn >>> 0, p | 0); },
+        generateMipmap(t) { __pt_glGenerateMipmap(gid, t >>> 0); },
+        pixelStorei(pn, p) {
+          if ((pn | 0) === 0x9240) flipY = p ? 1 : 0;        // UNPACK_FLIP_Y_WEBGL
+          else if ((pn | 0) === 0x9241) premul = p ? 1 : 0;  // UNPACK_PREMULTIPLY_ALPHA_WEBGL
+          // Row alignment is pinned to 1 natively (uploads cross tightly packed).
+        },
+        texImage2D(target, level, internalformat, a, b, c, d, e, f) {
+          if (arguments.length >= 9) {                       // (…, w, h, border, format, type, pixels)
+            __pt_glTexImage2D(gid, target >>> 0, level | 0, internalformat | 0, a | 0, b | 0, c | 0,
+              d >>> 0, e >>> 0, texBytes(f), flipY, premul);
+          } else {                                           // (…, format, type, source)
+            const s = srcPixels(c);
+            __pt_glTexImage2D(gid, target >>> 0, level | 0, internalformat | 0, s.w, s.h, 0,
+              a >>> 0, b >>> 0, s.data, flipY, premul);
           }
+        },
+        texSubImage2D(target, level, xo, yo, a, b, c, d, e) {
+          if (arguments.length >= 9) {                       // (…, w, h, format, type, pixels)
+            __pt_glTexSubImage2D(gid, target >>> 0, level | 0, xo | 0, yo | 0, a | 0, b | 0,
+              c >>> 0, d >>> 0, texBytes(e), flipY, premul);
+          } else {                                           // (…, format, type, source)
+            const s = srcPixels(c);
+            __pt_glTexSubImage2D(gid, target >>> 0, level | 0, xo | 0, yo | 0, s.w, s.h,
+              a >>> 0, b >>> 0, s.data, flipY, premul);
+          }
+        },
+        // --- framebuffers: render-to-texture passes, and `null` means this
+        // canvas' drawing buffer (an FBO here — there is no framebuffer 0).
+        createFramebuffer() { return obj(fbProto, __pt_glCreateFramebuffer(gid)); },
+        bindFramebuffer(t, fb) { boundFB = fb || null; __pt_glBindFramebuffer(gid, t >>> 0, H(fb)); },
+        framebufferTexture2D(t, att, tt, tex, level) { __pt_glFramebufferTexture2D(gid, t >>> 0, att >>> 0, tt >>> 0, H(tex), level | 0); },
+        checkFramebufferStatus(t) { return __pt_glCheckFramebufferStatus(gid, t >>> 0); },
+        createRenderbuffer() { return obj(rbProto, __pt_glCreateRenderbuffer(gid)); },
+        bindRenderbuffer(t, rb) { __pt_glBindRenderbuffer(gid, t >>> 0, H(rb)); },
+        renderbufferStorage(t, fmt, w, h) { __pt_glRenderbufferStorage(gid, t >>> 0, fmt >>> 0, w | 0, h | 0); },
+        framebufferRenderbuffer(t, att, rt, rb) { __pt_glFramebufferRenderbuffer(gid, t >>> 0, att >>> 0, rt >>> 0, H(rb)); },
+        createVertexArray() { return obj(vaProto, __pt_glCreateVertexArray(gid)); },
+        bindVertexArray(v) { __pt_glBindVertexArray(gid, H(v)); },
+        deleteShader(o) { __pt_glDelete(gid, 0, H(o)); },
+        deleteProgram(o) { __pt_glDelete(gid, 1, H(o)); },
+        deleteBuffer(o) { __pt_glDelete(gid, 2, H(o)); },
+        deleteTexture(o) { __pt_glDelete(gid, 3, H(o)); },
+        deleteFramebuffer(o) { __pt_glDelete(gid, 4, H(o)); },
+        deleteRenderbuffer(o) { __pt_glDelete(gid, 5, H(o)); },
+        deleteVertexArray(o) { __pt_glDelete(gid, 6, H(o)); },
+        readPixels(x, y, w, h, format, type, dst) {
+          if (!dst) return dst;
+          // Straight from the bound framebuffer (which may be an offscreen target
+          // of its own size), bottom-up — exactly the order WebGL specifies.
+          const px = __pt_glReadPixels(gid, x | 0, y | 0, w | 0, h | 0, 0);
+          const n = Math.min(dst.length === undefined ? px.length : dst.length, px.length);
+          for (let i = 0; i < n; i++) dst[i] = px[i];
           return dst;
         },
-        __ptPixels() { return { w: GW, h: GH, data: __pt_glReadPixels(gid) }; },
+        // toDataURL is the *canvas*, so read the drawing buffer even mid-pass
+        // with an offscreen framebuffer bound, then put the binding back.
+        __ptPixels() {
+          if (boundFB) __pt_glBindFramebuffer(gid, 0x8D40, 0);
+          const data = __pt_glReadPixels(gid, 0, 0, GW, GH, 1);   // top-left origin
+          if (boundFB) __pt_glBindFramebuffer(gid, 0x8D40, H(boundFB));
+          return { w: GW, h: GH, data };
+        },
       });
+      // WebGL 1 reaches vertex arrays through the extension object, not the
+      // context — hand back a working one instead of the usual empty stub.
+      const getExt = gl.getExtension;
+      gl.getExtension = function getExtension(name) {
+        if (name === 'OES_vertex_array_object') return {
+          VERTEX_ARRAY_BINDING_OES: 0x85B5,
+          createVertexArrayOES: () => gl.createVertexArray(),
+          bindVertexArrayOES: (v) => gl.bindVertexArray(v),
+          deleteVertexArrayOES: (v) => gl.deleteVertexArray(v),
+          isVertexArrayOES: (v) => !!(v && v.__h),
+        };
+        return getExt.call(this, name);
+      };
     } else {
       // Fallback synthesis (no `webgl` feature): back the readback with the shared
       // surface — clears are exact, draws stamp a pattern keyed by the op log.
@@ -1737,15 +1837,36 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       });
     }
 
+    // Whatever is left unimplemented, `createX` still has to hand back an opaque
+    // object of the right type: a page that null-checks `createTexture()` (or
+    // runs `instanceof`) would otherwise see straight through the context.
+    for (const [m, n] of [['createShader','WebGLShader'],['createProgram','WebGLProgram'],
+      ['createBuffer','WebGLBuffer'],['createTexture','WebGLTexture'],['createFramebuffer','WebGLFramebuffer'],
+      ['createRenderbuffer','WebGLRenderbuffer'],['createVertexArray','WebGLVertexArrayObject']]) {
+      if (!gl[m]) gl[m] = function () { return Object.create(iface(n)); };
+    }
     // No-op the GL calls a fingerprinter drives before reading parameters.
     for (const m of ['viewport','clearColor','clear','enable','disable','createShader','shaderSource',
       'compileShader','getShaderParameter','createProgram','attachShader','linkProgram','getProgramParameter',
       'useProgram','createBuffer','bindBuffer','bufferData','getAttribLocation','vertexAttribPointer',
-      'enableVertexAttribArray','getUniformLocation','uniform2f','uniform1f','drawArrays','deleteShader',
-      'deleteProgram','deleteBuffer','activeTexture','bindTexture','createTexture','texParameteri','texImage2D',
-      'framebufferTexture2D','bindFramebuffer','createFramebuffer','readPixels','pixelStorei','depthFunc','flush','finish']) {
+      'enableVertexAttribArray','getUniformLocation','uniform1f','uniform2f','uniform3f','uniform4f',
+      'uniform1i','uniform2i','uniform3i','uniform4i','uniform1fv','uniform2fv','uniform3fv','uniform4fv',
+      'uniformMatrix2fv','uniformMatrix3fv','uniformMatrix4fv','drawElements','drawArrays','deleteShader',
+      'deleteProgram','deleteBuffer','activeTexture','bindTexture','createTexture','texParameteri','texParameterf',
+      'texImage2D','texSubImage2D','generateMipmap','deleteTexture','framebufferTexture2D','bindFramebuffer',
+      'createFramebuffer','deleteFramebuffer','bindRenderbuffer','renderbufferStorage','framebufferRenderbuffer',
+      'deleteRenderbuffer','bindVertexArray','deleteVertexArray','blendFunc','readPixels','pixelStorei','depthFunc',
+      'flush','finish']) {
       if (!gl[m]) gl[m] = function(){};
     }
+    // Calls whose *return* has to be plausible: `undefined` from any of these is
+    // a tell (and stops a page's render path dead at the framebuffer check).
+    if (!gl.checkFramebufferStatus) gl.checkFramebufferStatus = function () { return 0x8CD5; };
+    if (!gl.getError) gl.getError = function () { return 0; };
+    if (!gl.isContextLost) gl.isContextLost = function () { return false; };
+    if (!gl.getShaderInfoLog) gl.getShaderInfoLog = function () { return ''; };
+    if (!gl.getProgramInfoLog) gl.getProgramInfoLog = function () { return ''; };
+    if (!gl.getUniformLocation) gl.getUniformLocation = function () { return Object.create(iface('WebGLUniformLocation')); };
     return maskProto(gl);
   };
 

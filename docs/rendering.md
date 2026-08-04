@@ -1,6 +1,7 @@
 # Design: optional real rendering (`render` feature)
 
-Status: **Phase 1 landed (canvas 2D); WebGL pending.** Giving nokk *real*
+Status: **Phase 1 landed (canvas 2D); Phase 2 landed (WebGL: shaders, draws,
+textures, framebuffers).** Giving nokk *real*
 off-screen canvas-2D and WebGL rasterization behind an opt-in Cargo feature, so
 the default build stays lightweight (synthesis) and a `--features render` build
 produces genuine pixels for harder anti-bot.
@@ -11,7 +12,9 @@ Implemented today under `--features render`: 2D fills, **real glyph text**
 `bezierCurveTo`/`quadraticCurveTo` tessellated to a verb stream), **linear/radial
 gradients**, and image data `put`/`get`/`toDataURL` — all backed by `tiny-skia` +
 `ab_glyph`, in [crates/pool/src/canvas.rs](../crates/pool/src/canvas.rs). Only
-`drawImage` still falls back to the JS deterministic stamp; WebGL is Phase 2.
+`drawImage` still falls back to the JS deterministic stamp. Under the separate
+`--features webgl`: a real headless GL context (surfaceless EGL + Mesa) behind
+`getContext('webgl'|'webgl2')` — see Phase 2 below.
 
 ## Goal & non-goals
 
@@ -167,8 +170,19 @@ Effort: **medium-high** (glow) to **high** (SwiftShader).
    `getParameter`/extensions/precision stay synthesized for GPU-string coherence.
    Verified through the engine in a Mesa container and in CI (`render-tests.yml`):
    a page compiles shaders, uploads a triangle, `drawArrays`, and `readPixels`
-   returns real green pixels. Still native-TODO: textures, framebuffers, WebGL2-only
-   entry points (kept as no-ops for now). **Coherence:** Mesa reports `llvmpipe` (a
+   returns real green pixels. **Textures and framebuffers are native too**:
+   `createTexture`/`bindTexture`/`activeTexture`/`texParameteri`/`texImage2D`/
+   `texSubImage2D`/`generateMipmap` (both the pixels and the source overloads —
+   `ImageData` and another canvas upload their real bytes), the WebGL-only unpack
+   modes `UNPACK_FLIP_Y_WEBGL`/`UNPACK_PREMULTIPLY_ALPHA_WEBGL` (applied on the CPU,
+   as the browser does), render-to-texture framebuffers + renderbuffers, vertex
+   arrays, `blendFunc`/`depthFunc`, and the `deleteX` family. `bindFramebuffer(t,
+   null)` returns to *this canvas'* FBO — surfaceless has no framebuffer 0 — and
+   `toDataURL` reads the drawing buffer even mid-pass. A textured quad is the scene
+   most fingerprint probes actually draw, so a stubbed sampler (reading black)
+   collapsed every scene to one hash. Still native-TODO: cube maps beyond plain
+   `texImage2D` targets, and WebGL2-only entry points (kept as no-ops for now).
+   **Coherence:** Mesa reports `llvmpipe` (a
    headless tell), so the stealth layer keeps *reporting* a plausible GPU string and
    only borrows llvmpipe's pixels — a claimed-vs-actual mismatch only a deep probe
    catches.

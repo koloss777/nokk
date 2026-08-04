@@ -2962,4 +2962,75 @@ mod tests {
             eprintln!("skip strict check: webgl natives inactive (no EGL here)");
         }
     }
+
+    /// A textured quad — the shape most WebGL fingerprint probes actually draw.
+    /// With texturing stubbed the sampler reads black and every scene hashes the
+    /// same, so this asserts the uploaded texels come back out.
+    #[tokio::test]
+    async fn render_webgl_texture_upload_via_engine() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        let probe = r#"(() => {
+            const c = document.createElement('canvas'); c.width = 16; c.height = 16;
+            const gl = c.getContext('webgl');
+            const native = typeof __pt_glAvailable === 'function' && __pt_glAvailable();
+            gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+            const vs = gl.createShader(gl.VERTEX_SHADER);
+            gl.shaderSource(vs, 'attribute vec2 p; varying vec2 uv;' +
+              'void main(){ uv = p * 0.5 + 0.5; gl_Position = vec4(p,0.0,1.0); }');
+            gl.compileShader(vs);
+            const fs = gl.createShader(gl.FRAGMENT_SHADER);
+            gl.shaderSource(fs, 'precision mediump float; uniform sampler2D t; varying vec2 uv;' +
+              'void main(){ gl_FragColor = texture2D(t, uv); }');
+            gl.compileShader(fs);
+            const prog = gl.createProgram();
+            gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog); gl.useProgram(prog);
+            const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), 0x88E4);
+            const loc = gl.getAttribLocation(prog, 'p');
+            gl.enableVertexAttribArray(loc);
+            gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+            const tex = gl.createTexture();
+            const isTex = tex instanceof WebGLTexture;
+            gl.activeTexture(0x84C0);
+            gl.bindTexture(gl.TEXTURE_2D, tex);
+            gl.pixelStorei(0x9240, true);                       // UNPACK_FLIP_Y_WEBGL
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+              new Uint8Array([12, 220, 130, 255]));
+            gl.texParameteri(gl.TEXTURE_2D, 0x2801, 0x2600);    // MIN_FILTER = NEAREST
+            gl.texParameteri(gl.TEXTURE_2D, 0x2800, 0x2600);    // MAG_FILTER = NEAREST
+            gl.uniform1i(gl.getUniformLocation(prog, 't'), 0);
+            gl.drawArrays(0x0005, 0, 4);                        // TRIANGLE_STRIP
+
+            const px = new Uint8Array(16 * 16 * 4);
+            gl.readPixels(0, 0, 16, 16, gl.RGBA, gl.UNSIGNED_BYTE, px);
+            const i = 4 * (8 * 16 + 8);
+            gl.deleteTexture(tex);
+            return JSON.stringify({ native, isTex, r: px[i], g: px[i + 1], b: px[i + 2] });
+        })()"#;
+        let out = match ctx.evaluate(probe).await.unwrap() {
+            Value::String(s) => s,
+            v => panic!("expected string, got {v:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            v["isTex"].as_bool().unwrap(),
+            "createTexture returns a WebGLTexture in either backend"
+        );
+        if v["native"].as_bool().unwrap() {
+            assert_eq!(
+                (
+                    v["r"].as_u64().unwrap(),
+                    v["g"].as_u64().unwrap(),
+                    v["b"].as_u64().unwrap()
+                ),
+                (12, 220, 130),
+                "the quad samples the texel that was uploaded"
+            );
+        } else {
+            eprintln!("skip strict check: webgl natives inactive (no EGL here)");
+        }
+    }
 }

@@ -150,11 +150,15 @@ Move to native (Rust):
   `OffscreenCanvas` maps to a detached `<canvas>`, reusing its 2D/WebGL contexts; `MessageEvent`
   added; `SharedWorker` present. All native-masked (`toString` → `[native code]`) and instances
   carry no own properties.
-- ⬜ **Optional real rendering (`render` Cargo feature)** — off-screen canvas-2D + WebGL
-  **rasterization** (tiny-skia + cosmic-text/bundled fonts; glow/EGL or SwiftShader), bridged
-  via `natives.rs`, **off by default** so the standard build stays light and a
-  `--features render` build produces genuine pixels for harder anti-bot. Necessary-but-not-
-  sufficient for interactive Turnstile (still needs Workers + iframe execution). Full spec:
+- 🟡 **Optional real rendering (`render` / `webgl` Cargo features)** — off-screen
+  **rasterization** bridged via `natives.rs`, **off by default** so the standard build stays
+  light and a feature build produces genuine pixels for harder anti-bot. `render` (2D, done):
+  tiny-skia + `ab_glyph` fills, glyph text, vector paths, gradients, image data — only
+  `drawImage` still stamps. `webgl` (done): a real headless GL context (surfaceless EGL +
+  Mesa) behind `getContext('webgl')` — shaders, buffers, uniforms, draws, textures,
+  render-to-texture framebuffers, `readPixels`; `getParameter`/extensions stay synthesized so
+  the reported GPU string never contradicts llvmpipe's pixels. Necessary-but-not-sufficient
+  for interactive Turnstile (still needs Workers + iframe execution). Full spec:
   [docs/rendering.md](docs/rendering.md).
 
 Keep in JS (the advantage is real):
