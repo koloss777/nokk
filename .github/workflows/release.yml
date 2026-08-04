@@ -19,12 +19,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # BoringSSL (wreq) build deps — root runner, so straight from apt.
-      - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
-
-      - name: Build
-        run: cargo build --release --bin nokk
+      # Build inside Debian 11 (bullseye, glibc 2.31) so the binary runs on a broad
+      # range of Linux — RHEL/Alma 9 (2.34), Ubuntu 20.04+, Debian 11+ — instead of
+      # the runner's glibc 2.39 (which would need 2.38+). checkout/release stay on
+      # the host (JS actions need node, which the minimal container lacks).
+      - name: Build (Debian bullseye, glibc 2.31)
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w rust:1-bullseye bash -euc '
+            apt-get update
+            apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+            cargo build --release --bin nokk'
 
       - name: Package
         run: |

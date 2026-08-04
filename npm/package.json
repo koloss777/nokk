@@ -1,6 +1,6 @@
 {
   "name": "nokk",
-  "version": "0.1.20-alpha",
+  "version": "0.1.21-alpha",
   "description": "Undetectable headless-browser engine — a lightweight, Chrome-fingerprinted CDP server for Puppeteer/Playwright scraping. npm install and connect, no browser download.",
   "keywords": [
     "scraping",
