@@ -227,14 +227,14 @@ timezone disagrees with its IP is a classic tell. Both flags are off by default,
 context stays deterministic. From the Rust API these are `EngineConfig::rotate_fingerprint`
 and `EngineConfig::geoip_timezone`.
 
-### From Node (`npm install nokk`)
+### From Node (`npm install @koloss777/nokk`)
 
-nokk ships an [npm package](https://www.npmjs.com/package/nokk) that fetches the prebuilt
+nokk ships an [npm package](https://www.npmjs.com/package/@koloss777/nokk) that fetches the prebuilt
 binary on install — no Chromium download. `launch()` returns a `wsEndpoint` for Puppeteer or
 Playwright:
 
 ```js
-const nokk = require("nokk");
+const nokk = require("@koloss777/nokk");
 const puppeteer = require("puppeteer");
 
 const server = await nokk.launch({ rotateFingerprint: true });
@@ -246,7 +246,7 @@ await browser.close();
 await server.close();
 ```
 
-`npx nokk --port 9222` runs the CDP server directly.
+`npx @koloss777/nokk --port 9222` runs the CDP server directly.
 
 ### From Python (`pip install nokk`)
 

@@ -8,7 +8,7 @@ call `launch()`, and connect your existing **Puppeteer** or **Playwright** scrip
 over CDP — no Chromium download.
 
 ```bash
-npm install nokk
+npm install @koloss777/nokk
 ```
 
 > **Alpha:** the prebuilt binary is fetched on install and is currently **Linux
@@ -17,7 +17,7 @@ npm install nokk
 ## Puppeteer
 
 ```js
-const nokk = require("nokk");
+const nokk = require("@koloss777/nokk");
 const puppeteer = require("puppeteer");
 
 (async () => {
@@ -34,7 +34,7 @@ const puppeteer = require("puppeteer");
 ## Playwright
 
 ```js
-const nokk = require("nokk");
+const nokk = require("@koloss777/nokk");
 const { chromium } = require("playwright");
 
 (async () => {
@@ -66,7 +66,7 @@ const server = await nokk.launch({ rotateFingerprint: true, geoipTimezone: true 
 ## CLI
 
 ```bash
-npx nokk --port 9222 --workers 4      # run the CDP server directly
+npx @koloss777/nokk --port 9222 --workers 4      # run the CDP server directly
 ```
 
 Point at a locally built binary during development with the `NOKK_BINARY`
