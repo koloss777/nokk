@@ -1973,9 +1973,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // class body through `toString()` — an obvious tell).
     globalThis.CustomEvent, globalThis.UIEvent, globalThis.MouseEvent,
     globalThis.PointerEvent, globalThis.KeyboardEvent, globalThis.InputEvent,
-    globalThis.FocusEvent, globalThis.Text, globalThis.Comment,
+    globalThis.FocusEvent, globalThis.MessageEvent, globalThis.Text, globalThis.Comment,
     globalThis.Performance, globalThis.PerformanceTiming, globalThis.PerformanceNavigation,
-    globalThis.Crypto, globalThis.SubtleCrypto, globalThis.CryptoKey]) {
+    globalThis.Crypto, globalThis.SubtleCrypto, globalThis.CryptoKey,
+    // Web Workers / OffscreenCanvas (the DOM runtime's single-threaded shims).
+    globalThis.Worker, globalThis.SharedWorker, globalThis.OffscreenCanvas]) {
     if (C) { mask(C, C.name); if (C.prototype) maskProto(C.prototype); }
   }
 

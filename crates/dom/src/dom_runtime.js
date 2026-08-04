@@ -485,10 +485,137 @@
   }
   evtAccessors(FocusEvent, ['relatedTarget']);
 
+  class MessageEvent extends Event {
+    constructor(type, init) {
+      super(type, init); init = init || {};
+      this.__ptE.data = init.data !== undefined ? init.data : null;
+      this.__ptE.origin = init.origin || '';
+      this.__ptE.lastEventId = init.lastEventId || '';
+      this.__ptE.source = init.source || null;
+      this.__ptE.ports = init.ports || [];
+    }
+  }
+  evtAccessors(MessageEvent, ['data', 'origin', 'lastEventId', 'source', 'ports']);
+
   for (const [n, C] of [['UIEvent', UIEvent], ['MouseEvent', MouseEvent], ['PointerEvent', PointerEvent],
-    ['KeyboardEvent', KeyboardEvent], ['InputEvent', InputEvent], ['FocusEvent', FocusEvent]]) {
+    ['KeyboardEvent', KeyboardEvent], ['InputEvent', InputEvent], ['FocusEvent', FocusEvent],
+    ['MessageEvent', MessageEvent]]) {
     if (!globalThis[n]) globalThis[n] = C;
   }
+
+  // ---- Web Workers (single-threaded shim) -----------------------------------
+  // Real Chrome exposes Worker/OffscreenCanvas/SharedWorker; a missing `typeof
+  // Worker` is a passive fingerprint tell. This runs the worker script in an
+  // emulated global scope in the same isolate (no real threading), so `typeof
+  // Worker === "function"` holds and compute-style workers (message in → work →
+  // postMessage back) function. Not real parallelism, and blob: scripts need
+  // URL.createObjectURL support to load.
+  class Worker {
+    constructor(scriptURL, options) {
+      const W = { onmessage: null, onmessageerror: null, onerror: null, closed: false, listeners: {} };
+      Object.defineProperty(this, '__ptW', { value: W });
+      const worker = this;
+      const scope = {};
+      scope.self = scope; scope.globalThis = scope; scope.name = (options && options.name) || '';
+      scope.onmessage = null; scope.onerror = null;
+      scope.location = { href: String(scriptURL), origin: (globalThis.location && globalThis.location.origin) || '' };
+      scope.navigator = globalThis.navigator;
+      scope.setTimeout = globalThis.setTimeout; scope.clearTimeout = globalThis.clearTimeout;
+      scope.setInterval = globalThis.setInterval; scope.clearInterval = globalThis.clearInterval;
+      scope.queueMicrotask = globalThis.queueMicrotask;
+      scope.fetch = globalThis.fetch; scope.crypto = globalThis.crypto;
+      scope.URL = globalThis.URL; scope.Blob = globalThis.Blob;
+      scope.TextEncoder = globalThis.TextEncoder; scope.TextDecoder = globalThis.TextDecoder;
+      scope.atob = globalThis.atob; scope.btoa = globalThis.btoa;
+      const localL = {};
+      scope.addEventListener = (t, h) => { (localL[t] = localL[t] || []).push(h); };
+      scope.removeEventListener = (t, h) => { if (localL[t]) localL[t] = localL[t].filter(x => x !== h); };
+      scope.dispatchEvent = (ev) => { (localL[ev.type] || []).forEach(h => { try { h.call(scope, ev); } catch (e) {} }); return true; };
+      scope.close = () => { W.closed = true; };
+      scope.importScripts = () => {};
+      // worker → main
+      scope.postMessage = (data) => globalThis.queueMicrotask(() => {
+        if (W.closed) return;
+        const ev = new MessageEvent('message', { data });
+        try { if (typeof W.onmessage === 'function') W.onmessage.call(worker, ev); } catch (e) {}
+        (W.listeners.message || []).forEach(h => { try { h.call(worker, ev); } catch (e) {} });
+      });
+      // main → worker
+      W.deliver = (data) => {
+        const ev = new MessageEvent('message', { data });
+        try { if (typeof scope.onmessage === 'function') scope.onmessage.call(scope, ev); } catch (e) {}
+        (localL.message || []).forEach(h => { try { h.call(scope, ev); } catch (e) {} });
+      };
+      const run = (src) => {
+        try {
+          // `with(self)` so a worker's bareword globals (postMessage, self,
+          // onmessage, addEventListener…) resolve to the emulated scope.
+          const fn = new Function('self', 'with(self){\n' + String(src) + '\n}\n//# sourceURL=' + String(scriptURL));
+          fn.call(scope, scope);
+        } catch (e) {
+          const ev = new MessageEvent('error', {}); ev.__ptE.message = String((e && e.message) || e);
+          try { if (typeof W.onerror === 'function') W.onerror.call(worker, ev); } catch (_) {}
+          (W.listeners.error || []).forEach(h => { try { h.call(worker, ev); } catch (_) {} });
+        }
+      };
+      const u = String(scriptURL);
+      if (u.slice(0, 5) === 'data:') {
+        try {
+          const i = u.indexOf(','); let s = u.slice(i + 1);
+          s = u.slice(0, i).indexOf('base64') >= 0 ? globalThis.atob(s) : decodeURIComponent(s);
+          run(s);
+        } catch (e) { run(''); }
+      } else {
+        globalThis.fetch(u).then((r) => r.text()).then(run).catch(() => run(''));
+      }
+    }
+    postMessage(data) { const W = this.__ptW; if (!W.closed) globalThis.queueMicrotask(() => W.deliver(data)); }
+    terminate() { this.__ptW.closed = true; }
+    addEventListener(t, h) { const L = this.__ptW.listeners; (L[t] = L[t] || []).push(h); }
+    removeEventListener(t, h) { const L = this.__ptW.listeners; if (L[t]) L[t] = L[t].filter((x) => x !== h); }
+    dispatchEvent(ev) { (this.__ptW.listeners[ev.type] || []).forEach((h) => { try { h.call(this, ev); } catch (e) {} }); return true; }
+  }
+  for (const p of ['onmessage', 'onmessageerror', 'onerror']) {
+    Object.defineProperty(Worker.prototype, p, {
+      configurable: true,
+      get() { return this.__ptW[p]; },
+      set(v) { this.__ptW[p] = v; },
+    });
+  }
+
+  class SharedWorker {
+    constructor(scriptURL, options) {
+      const port = {
+        onmessage: null, onmessageerror: null,
+        postMessage() {}, start() {}, close() {},
+        addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
+      };
+      Object.defineProperty(this, '__ptW', { value: { onerror: null, port } });
+    }
+    get port() { return this.__ptW.port; }
+    get onerror() { return this.__ptW.onerror; }
+    set onerror(v) { this.__ptW.onerror = v; }
+  }
+
+  // OffscreenCanvas maps to a detached <canvas>, reusing its 2D/WebGL contexts.
+  class OffscreenCanvas {
+    constructor(width, height) {
+      const c = globalThis.document ? globalThis.document.createElement('canvas') : null;
+      if (c) { c.width = width | 0; c.height = height | 0; }
+      Object.defineProperty(this, '__ptO', { value: { c, w: width | 0, h: height | 0 } });
+    }
+    get width() { return this.__ptO.w; }
+    set width(v) { this.__ptO.w = v | 0; if (this.__ptO.c) this.__ptO.c.width = v | 0; }
+    get height() { return this.__ptO.h; }
+    set height(v) { this.__ptO.h = v | 0; if (this.__ptO.c) this.__ptO.c.height = v | 0; }
+    getContext(type, attrs) { const c = this.__ptO.c; return c ? c.getContext(type, attrs) : null; }
+    convertToBlob(opts) { return Promise.resolve(new Blob([], { type: (opts && opts.type) || 'image/png' })); }
+    transferToImageBitmap() { return {}; }
+  }
+
+  globalThis.Worker = Worker;
+  globalThis.SharedWorker = SharedWorker;
+  globalThis.OffscreenCanvas = OffscreenCanvas;
 
   // ---- helpers: classList, dataset, style -----------------------------------
   function makeClassList(el) {
