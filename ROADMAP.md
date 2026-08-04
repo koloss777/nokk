@@ -141,9 +141,15 @@ Move to native (Rust):
   an empirical probe (2026-08) shows the Phase-6 toString mask already reports
   `[native code]` for `getContext`/`querySelector`/`getParameter` and survives the
   self-reference bypass (`Function.prototype.toString.call(toString)`), so moving them to
-  native Rust is marginal. The measured real tell is missing **Web Workers / OffscreenCanvas**
-  (`typeof Worker === "undefined"`) — a single-threaded Worker/OffscreenCanvas shim is the
-  high-value passive-stealth item instead.
+  native Rust is marginal. The measured real tell was missing Web Workers — now **fixed**.
+- ✅ **Web Worker / OffscreenCanvas / SharedWorker shims.** `typeof Worker === "undefined"`
+  was the one real remaining passive tell (real Chrome has them; any fingerprinter checks it).
+  Added single-threaded shims: `Worker` runs the worker script in an emulated global scope
+  (`with(self)`) with the message channel wired both ways via microtasks — a data: worker
+  doubling 21→42 round-trips (not real parallelism; blob: scripts need `createObjectURL`).
+  `OffscreenCanvas` maps to a detached `<canvas>`, reusing its 2D/WebGL contexts; `MessageEvent`
+  added; `SharedWorker` present. All native-masked (`toString` → `[native code]`) and instances
+  carry no own properties.
 - ⬜ **Optional real rendering (`render` Cargo feature)** — off-screen canvas-2D + WebGL
   **rasterization** (tiny-skia + cosmic-text/bundled fonts; glow/EGL or SwiftShader), bridged
   via `natives.rs`, **off by default** so the standard build stays light and a
