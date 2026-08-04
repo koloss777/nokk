@@ -49,6 +49,11 @@ pub fn install(scope: &mut v8::HandleScope) {
         bind(scope, "__pt_canvasFillText", canvas_fill_text);
         bind(scope, "__pt_canvasMeasureText", canvas_measure_text);
         bind(scope, "__pt_canvasFillPath", canvas_fill_path);
+        bind(
+            scope,
+            "__pt_canvasFillPathGradient",
+            canvas_fill_path_gradient,
+        );
         bind(scope, "__pt_canvasStrokePath", canvas_stroke_path);
         bind(scope, "__pt_canvasPutImageData", canvas_put_image_data);
         bind(scope, "__pt_canvasGetImageData", canvas_get_image_data);
@@ -184,6 +189,20 @@ fn canvas_fill_path(
         arg_usize(scope, args.get(6)) as u8,
     ];
     crate::canvas::fill_path(id, &verbs, even_odd, rgba);
+}
+
+/// `__pt_canvasFillPathGradient(id, verbsF32, evenOdd, gradF32)` — gradient fill.
+#[cfg(feature = "render")]
+fn canvas_fill_path_gradient(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let verbs = arg_f32s(args.get(1));
+    let even_odd = arg_usize(scope, args.get(2)) != 0;
+    let grad = arg_f32s(args.get(3));
+    crate::canvas::fill_path_grad(id, &verbs, even_odd, &grad);
 }
 
 /// `__pt_canvasStrokePath(id, verbsF32, lineWidth, r, g, b, a)` — stroke a path.

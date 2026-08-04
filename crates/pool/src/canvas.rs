@@ -9,15 +9,18 @@
 //! contexts on other threads. The JS layer calls the `__pt_canvas*` natives that
 //! wrap these. Covered here: fills, real glyph text (`fill_text`/`measure_text`
 //! via a bundled font), vector paths (`fill_path`/`stroke_path` — the JS side
-//! tessellates curves/arcs to a move/line/close verb stream), and image data
-//! put/get. Gradients and `drawImage` still fall back to the JS deterministic
-//! stamp; WebGL is a separate phase.
+//! tessellates curves/arcs to a move/line/close verb stream), linear/radial
+//! gradients (`fill_path_grad`), and image data put/get. Only `drawImage` still
+//! falls back to the JS deterministic stamp; WebGL is a separate phase.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
-use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
+use tiny_skia::{
+    Color, FillRule, GradientStop, LinearGradient, Paint, PathBuilder, Pixmap, Point,
+    RadialGradient, Rect, Shader, SpreadMode, Stroke, Transform,
+};
 
 /// Bundled Liberation Sans (OFL, Arial-metric) — a plausible default sans for a
 /// Linux Chrome profile, so `fillText` glyphs are real *and* deterministic.
@@ -114,6 +117,90 @@ pub fn fill_path(id: u32, verbs: &[f32], even_odd: bool, rgba: [u8; 4]) {
             let mut paint = Paint::default();
             paint.set_color_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
             paint.anti_alias = true;
+            let rule = if even_odd {
+                FillRule::EvenOdd
+            } else {
+                FillRule::Winding
+            };
+            pm.fill_path(&path, &paint, rule, Transform::identity(), None);
+        }
+    });
+}
+
+/// Decode a flat gradient descriptor into a tiny-skia [`Shader`]:
+/// `[type, x0,y0, x1,y1, r0,r1, nstops, (pos,r,g,b,a)×nstops]` — `type` 0 linear,
+/// 1 radial; colors are straight-alpha 0..255. Canvas's inner radius `r0` is
+/// approximated away (mapped to the focal point), which is invisible for the
+/// usual `r0 = 0` fingerprint gradients.
+fn shader_from_grad(g: &[f32]) -> Option<Shader<'static>> {
+    if g.len() < 8 {
+        return None;
+    }
+    let ty = g[0].round() as i32;
+    let (x0, y0, x1, y1, r1) = (g[1], g[2], g[3], g[4], g[6]);
+    let n = g[7].max(0.0) as usize;
+    let mut raw: Vec<(f32, Color)> = Vec::with_capacity(n);
+    let mut idx = 8;
+    for _ in 0..n {
+        if idx + 5 > g.len() {
+            break;
+        }
+        let pos = g[idx].clamp(0.0, 1.0);
+        let color = Color::from_rgba8(
+            g[idx + 1] as u8,
+            g[idx + 2] as u8,
+            g[idx + 3] as u8,
+            g[idx + 4] as u8,
+        );
+        raw.push((pos, color));
+        idx += 5;
+    }
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.len() == 1 {
+        raw.push((1.0, raw[0].1)); // tiny-skia needs ≥2 stops; a lone stop → solid
+    }
+    let stops: Vec<GradientStop> = raw
+        .into_iter()
+        .map(|(p, c)| GradientStop::new(p, c))
+        .collect();
+    if ty == 1 {
+        RadialGradient::new(
+            Point::from_xy(x0, y0),
+            Point::from_xy(x1, y1),
+            r1.max(0.01),
+            stops,
+            SpreadMode::Pad,
+            Transform::identity(),
+        )
+    } else {
+        LinearGradient::new(
+            Point::from_xy(x0, y0),
+            Point::from_xy(x1, y1),
+            stops,
+            SpreadMode::Pad,
+            Transform::identity(),
+        )
+    }
+}
+
+/// `fill()` a tessellated path with a linear/radial gradient (see
+/// [`shader_from_grad`] for the descriptor layout).
+pub fn fill_path_grad(id: u32, verbs: &[f32], even_odd: bool, grad: &[f32]) {
+    let Some(path) = path_from_verbs(verbs) else {
+        return;
+    };
+    let Some(shader) = shader_from_grad(grad) else {
+        return;
+    };
+    CANVASES.with(|c| {
+        if let Some(pm) = c.borrow_mut().get_mut(&id) {
+            let paint = Paint {
+                shader,
+                anti_alias: true,
+                ..Paint::default()
+            };
             let rule = if even_odd {
                 FillRule::EvenOdd
             } else {
@@ -336,6 +423,32 @@ mod tests {
         );
         assert_eq!(corner[3], 0, "outside the triangle stays transparent");
         destroy(3);
+    }
+
+    #[test]
+    fn linear_gradient_fill_varies_across_the_rect() {
+        create(4, 20, 4);
+        // Linear red→blue across x=0..20, filling the whole surface via a rect path.
+        let grad = [
+            0.0, 0.0, 0.0, 20.0, 0.0, 0.0, 0.0, 2.0, // type,x0,y0,x1,y1,r0,r1,nstops
+            0.0, 255.0, 0.0, 0.0, 255.0, // stop 0 @0.0 = red
+            1.0, 0.0, 0.0, 255.0, 255.0, // stop 1 @1.0 = blue
+        ];
+        let verbs = [
+            0.0, 0.0, 0.0, 1.0, 20.0, 0.0, 1.0, 20.0, 4.0, 1.0, 0.0, 4.0, 4.0,
+        ];
+        fill_path_grad(4, &verbs, false, &grad);
+        let left = get_image_data(4, 1, 2, 1, 1);
+        let right = get_image_data(4, 18, 2, 1, 1);
+        assert!(
+            left[0] > 150 && left[2] < 100,
+            "left edge is red-ish, got {left:?}"
+        );
+        assert!(
+            right[2] > 150 && right[0] < 100,
+            "right edge is blue-ish, got {right:?}"
+        );
+        destroy(4);
     }
 
     #[test]

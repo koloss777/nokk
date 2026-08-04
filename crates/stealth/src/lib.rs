@@ -1288,6 +1288,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // Real vector paths: JS tessellates curves/arcs to a move/line/close verb
       // stream, tiny-skia fills or strokes it.
       fillPath(verbs, evenOdd, rgba) { sync(); __pt_canvasFillPath(id, new Float32Array(verbs), evenOdd ? 1 : 0, rgba[0], rgba[1], rgba[2], rgba[3]); },
+      fillPathGradient(verbs, evenOdd, grad) { sync(); __pt_canvasFillPathGradient(id, new Float32Array(verbs), evenOdd ? 1 : 0, new Float32Array(grad)); },
       strokePath(verbs, lw, rgba) { sync(); __pt_canvasStrokePath(id, new Float32Array(verbs), lw, rgba[0], rgba[1], rgba[2], rgba[3]); },
       // Images we still can't rasterize: a deterministic semi-transparent fill
       // keyed by the op-log, so the drawing still influences the pixels stably.
@@ -1427,13 +1428,32 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       else stamp(ox, oy - size, w, size * 1.3);
     };
 
+    // Gradient fillStyle/strokeStyle: real objects carrying coords + stops, flattened
+    // to the [type,x0,y0,x1,y1,r0,r1,n,(pos,r,g,b,a)…] descriptor the native decoder
+    // reads. A gradient object is detected by its `__ptGrad` marker.
+    const makeGradient = (type, coords) => ({
+      __ptGrad: { type, coords, stops: [] },
+      addColorStop(pos, color) { note('stop|' + [pos, color]); this.__ptGrad.stops.push([+pos || 0, parseColor(color)]); },
+    });
+    const encodeGrad = (g) => {
+      const a = [g.type, g.coords[0], g.coords[1], g.coords[2], g.coords[3], g.coords[4], g.coords[5], g.stops.length];
+      for (let k = 0; k < g.stops.length; k++) { const s = g.stops[k]; a.push(s[0], s[1][0], s[1][1], s[1][2], s[1][3]); }
+      return a;
+    };
+    const rectVerbs = (x, y, w, h) => { const X = +x || 0, Y = +y || 0, W2 = +w || 0, H2 = +h || 0; return [0, X, Y, 1, X + W2, Y, 1, X + W2, Y + H2, 1, X, Y + H2, 4]; };
+
     return maskProto(Object.assign(Object.create(globalThis.CanvasRenderingContext2D.prototype), {
       canvas,
       fillStyle: '#000000', strokeStyle: '#000000', font: '10px sans-serif',
       globalAlpha: 1.0, lineWidth: 1.0, textBaseline: 'alphabetic', textAlign: 'start',
       shadowColor: 'rgba(0, 0, 0, 0)', shadowBlur: 0, globalCompositeOperation: 'source-over',
 
-      fillRect(x, y, w, h) { note('fillRect|' + [x, y, w, h, this.fillStyle]); solid(x, y, w, h, parseColor(this.fillStyle)); },
+      fillRect(x, y, w, h) {
+        note('fillRect|' + [x, y, w, h, this.fillStyle]);
+        const fs = this.fillStyle;
+        if (S.native && fs && fs.__ptGrad) S.fillPathGradient(rectVerbs(x, y, w, h), false, encodeGrad(fs.__ptGrad));
+        else solid(x, y, w, h, parseColor(fs));
+      },
       clearRect(x, y, w, h) { note('clearRect|' + [x, y, w, h]); solid(x, y, w, h, [0, 0, 0, 0]); },
       strokeRect(x, y, w, h) {
         note('strokeRect|' + [x, y, w, h, this.strokeStyle, this.lineWidth]);
@@ -1482,8 +1502,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       quadraticCurveTo(a, b, c, d) { note('quadraticCurveTo|' + [a, b, c, d]); pathPoint(a, b); pathPoint(c, d); quadV(+a || 0, +b || 0, +c || 0, +d || 0); },
       fill(rule) {
         note('fill|' + this.fillStyle);
-        if (S.native) S.fillPath(verbs, String(rule) === 'evenodd', parseColor(this.fillStyle));
-        else paintPath();
+        if (!S.native) return paintPath();
+        const fs = this.fillStyle;
+        if (fs && fs.__ptGrad) S.fillPathGradient(verbs, String(rule) === 'evenodd', encodeGrad(fs.__ptGrad));
+        else S.fillPath(verbs, String(rule) === 'evenodd', parseColor(fs));
       },
       stroke() {
         note('stroke|' + [this.strokeStyle, this.lineWidth]);
@@ -1530,8 +1552,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         return { data: out, width: w, height: h, colorSpace: 'srgb' };
       },
       createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(0, (w | 0) * (h | 0) * 4)), width: w | 0, height: h | 0, colorSpace: 'srgb' }; },
-      createLinearGradient() { note('linearGradient'); return { addColorStop() {} }; },
-      createRadialGradient() { note('radialGradient'); return { addColorStop() {} }; },
+      createLinearGradient(x0, y0, x1, y1) { note('linearGradient|' + [x0, y0, x1, y1]); return makeGradient(0, [+x0 || 0, +y0 || 0, +x1 || 0, +y1 || 0, 0, 0]); },
+      createRadialGradient(x0, y0, r0, x1, y1, r1) { note('radialGradient|' + [x0, y0, r0, x1, y1, r1]); return makeGradient(1, [+x0 || 0, +y0 || 0, +x1 || 0, +y1 || 0, +r0 || 0, +r1 || 0]); },
       createPattern() { note('pattern'); return {}; },
       getContextAttributes() { return { alpha: true, colorSpace: 'srgb', desynchronized: false, willReadFrequently: false }; },
       // Hidden (filtered) accessor the canvas element uses to encode itself.

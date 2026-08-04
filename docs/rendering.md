@@ -8,10 +8,10 @@ produces genuine pixels for harder anti-bot.
 Implemented today under `--features render`: 2D fills, **real glyph text**
 (`fillText`/`strokeText`/`measureText` via a bundled Liberation Sans),
 **vector paths** (`fill`/`stroke`/`fillRect`/`strokeRect` + `arc`/`ellipse`/
-`bezierCurveTo`/`quadraticCurveTo` tessellated to a verb stream), and image data
-`put`/`get`/`toDataURL` — all backed by `tiny-skia` + `ab_glyph`, in
-[crates/pool/src/canvas.rs](../crates/pool/src/canvas.rs). Gradients and
-`drawImage` still fall back to the JS deterministic stamp; WebGL is Phase 2.
+`bezierCurveTo`/`quadraticCurveTo` tessellated to a verb stream), **linear/radial
+gradients**, and image data `put`/`get`/`toDataURL` — all backed by `tiny-skia` +
+`ab_glyph`, in [crates/pool/src/canvas.rs](../crates/pool/src/canvas.rs). Only
+`drawImage` still falls back to the JS deterministic stamp; WebGL is Phase 2.
 
 ## Goal & non-goals
 

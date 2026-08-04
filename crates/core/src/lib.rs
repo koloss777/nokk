@@ -2868,4 +2868,40 @@ mod tests {
             v["green"]
         );
     }
+
+    // A linear-gradient fillRect must actually vary across the rect (red→blue),
+    // proving the native gradient shader is wired, not a flat/stamped fill.
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn render_canvas_linear_gradient_varies() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        let probe = r#"(() => {
+            const c = document.createElement('canvas'); c.width = 60; c.height = 8;
+            const g = c.getContext('2d');
+            const grad = g.createLinearGradient(0, 0, 60, 0);
+            grad.addColorStop(0, '#ff0000'); grad.addColorStop(1, '#0000ff');
+            g.fillStyle = grad; g.fillRect(0, 0, 60, 8);
+            const d = g.getImageData(0, 0, 60, 8).data;
+            const px = (x) => { const i = (4 * 60 + x) * 4; return [d[i], d[i + 2], d[i + 3]]; };
+            const l = px(2), r = px(57);
+            return JSON.stringify({ l, r });
+        })()"#;
+        let out = match ctx.evaluate(probe).await.unwrap() {
+            Value::String(s) => s,
+            v => panic!("expected string, got {v:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let l = &v["l"];
+        let r = &v["r"];
+        assert!(
+            l[0].as_u64().unwrap() > 150 && l[1].as_u64().unwrap() < 100,
+            "left edge red-ish, got {l:?}"
+        );
+        assert!(
+            r[1].as_u64().unwrap() > 150 && r[0].as_u64().unwrap() < 100,
+            "right edge blue-ish, got {r:?}"
+        );
+    }
 }
