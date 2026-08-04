@@ -4,14 +4,12 @@ name: python-wheels
 # prebuilt `nokk` binary, so `pip install nokk` needs no Rust toolchain, no
 # BoringSSL build, and no Docker on the user's machine.
 #
-# Triggered by the same `v*` tags as the binary release. The Rust build is the
-# heavy part (BoringSSL via bindgen + a prebuilt V8), so it runs in a manylinux
-# container with cmake + libclang installed; `.cargo/config.toml` is gitignored,
-# so the container's system libclang is auto-detected (no machine-specific paths).
-#
-# NOTE: first-run shakeout — the BoringSSL/V8 build inside manylinux may need
-# extra deps beyond cmake/clang; see docs/BUILD.md. macOS/Windows wheels wait on
-# those binaries existing in the release workflow.
+# Built on a plain Ubuntu runner (same environment as release.yml, which builds
+# the binary green) rather than a manylinux container — maturin auditwheel-repairs
+# to a manylinux_2_XX tag automatically, matching a local `maturin build`. The
+# glibc floor is that of the runner (Ubuntu 22.04 → manylinux_2_35), which covers
+# current distros; a lower floor would need the BoringSSL build to work inside an
+# old manylinux image, which it doesn't yet.
 
 on:
   push:
@@ -22,51 +20,60 @@ permissions:
   contents: read
 
 jobs:
-  linux-x86_64:
-    name: Build manylinux x86_64 wheel
-    runs-on: ubuntu-latest
+  build:
+    name: Build Linux wheel
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build wheel (manylinux_2_28)
-        uses: PyO3/maturin-action@v1
+      - uses: actions/setup-python@v5
         with:
-          working-directory: python
-          target: x86_64-unknown-linux-gnu
-          manylinux: "2_28"
-          args: --release --out dist
-          # BoringSSL (bindgen) + prebuilt V8 build deps, inside the container.
-          before-script-linux: |
-            dnf install -y cmake clang clang-devel gcc gcc-c++ perl || \
-            yum install -y cmake clang clang-devel gcc gcc-c++ perl
+          python-version: "3.12"
 
-      - name: Sanity-check the wheel contents
+      # BoringSSL (wreq/bindgen) + prebuilt V8 build deps — same as release.yml.
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+
+      # Version comes from the tag: v0.1.20-alpha -> 0.1.20a1 (PEP 440).
+      - name: Sync wheel version from the tag
+        if: github.ref_type == 'tag'
         run: |
-          python -m pip install --upgrade pip
-          ls -la python/dist
+          RAW="${GITHUB_REF_NAME#v}"
+          PEP="${RAW/-alpha/a1}"; PEP="${PEP/-beta/b1}"; PEP="${PEP/-rc./rc}"
+          echo "wheel version: $PEP"
+          sed -i "s/^version = \".*\"/version = \"$PEP\"/" python/pyproject.toml
+
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip maturin
+          cd python && maturin build --release --out dist
+
+      - name: Sanity-check the wheel embeds the binary
+        run: |
           python - <<'PY'
           import glob, zipfile
           whl = glob.glob("python/dist/*.whl")[0]
           names = zipfile.ZipFile(whl).namelist()
-          assert any(n.endswith("nokk") or n.endswith("nokk.exe") for n in names), \
+          assert any(n.endswith(".data/scripts/nokk") for n in names), \
               f"binary not embedded in wheel: {names}"
           print("ok:", whl)
           PY
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-linux-x86_64
+          name: wheels-linux
           path: python/dist/*.whl
 
   publish:
     name: Publish to PyPI
-    needs: [linux-x86_64]
+    needs: [build]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.ref_type == 'tag'
     environment: pypi
     permissions:
       # PyPI Trusted Publishing (OIDC) — configure the publisher on the PyPI
-      # project first; no API token secret needed.
+      # project first (owner koloss777, repo nokk, workflow python-wheels.yml,
+      # environment pypi); no API token secret needed.
       id-token: write
     steps:
       - uses: actions/download-artifact@v4
