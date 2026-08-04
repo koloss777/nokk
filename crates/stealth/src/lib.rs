@@ -1262,6 +1262,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // text/put. Paths and images we still cannot rasterize keep the deterministic
   // stamp (fill) so different drawings still differ and repeat exactly.
   const NATIVE_CANVAS = typeof __pt_canvasCreate === 'function';
+  // Only take the native GL path when a real GL context can actually be created
+  // (the `webgl` build *and* Mesa/EGL present); otherwise the synthesis fallback.
+  const NATIVE_GL = typeof __pt_glAvailable === 'function' && __pt_glAvailable();
   const makeNativeSurface = (canvas) => {
     const id = (globalThis.__ptCanvasSeq = (globalThis.__ptCanvasSeq || 0) + 1);
     let W = -1, H = -1;
@@ -1630,44 +1633,109 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // WebGL fingerprinting renders a scene and reads it back (readPixels, or
     // toDataURL on the canvas). With every call a no-op the readback was all
     // zeroes no matter what was drawn, so two different scenes compared equal —
-    // the same differential tell the 2D context had. Back it with the shared
-    // surface: clears are exact, draws stamp a pattern keyed by the shader
-    // source, geometry and uniforms that produced them.
-    const S = makeSurface(canvas);
-    let clearRGBA = [0, 0, 0, 0];
-    Object.assign(gl, {
-      clearColor(r, g, b, a) {
-        S.note('clearColor|' + [r, g, b, a]);
-        const q = (v) => Math.max(0, Math.min(255, Math.round((+v || 0) * 255)));
-        clearRGBA = [q(r), q(g), q(b), q(a)];
-      },
-      clear(mask) {
-        S.note('clear|' + mask);
-        if ((mask | 0) & C.COLOR_BUFFER_BIT) { const p = S.pixels(); S.solid(0, 0, p.w, p.h, clearRGBA); }
-      },
-      viewport(x, y, w, h) { S.note('viewport|' + [x, y, w, h]); },
-      shaderSource(sh, src) { S.note('shaderSource|' + src); },
-      bufferData(target, data) { S.note('bufferData|' + [target, data && (data.length || data.byteLength)]); },
-      uniform1f(l, v) { S.note('uniform1f|' + v); },
-      uniform2f(l, a, b) { S.note('uniform2f|' + [a, b]); },
-      uniform3f(l, a, b, c2) { S.note('uniform3f|' + [a, b, c2]); },
-      uniform4f(l, a, b, c2, d) { S.note('uniform4f|' + [a, b, c2, d]); },
-      drawArrays(mode, first, count) {
-        S.note('drawArrays|' + [mode, first, count]);
-        const p = S.pixels(); S.stamp(0, 0, p.w, p.h);
-      },
-      drawElements(mode, count, type, offset) {
-        S.note('drawElements|' + [mode, count, type, offset]);
-        const p = S.pixels(); S.stamp(0, 0, p.w, p.h);
-      },
-      readPixels(x, y, w, h, format, type, dst) {
-        S.note('readPixels|' + [x, y, w, h, format, type]);
-        w = w | 0; h = h | 0;
-        if (dst && dst.length >= w * h * 4) S.read(x, y, w, h, dst);
-        return dst;
-      },
-      __ptPixels() { return S.pixels(); },
-    });
+    // the same differential tell the 2D context had.
+    if (NATIVE_GL) {
+      // Real headless GL (the `webgl` feature): the drawing pipeline runs on a
+      // Mesa context; getParameter/extensions above stay synthesized so the
+      // reported GPU string stays coherent (we only borrow the pixels).
+      const gid = (globalThis.__ptGlSeq = (globalThis.__ptGlSeq || 0) + 1);
+      const GW = canvas.width || 300, GH = canvas.height || 150;
+      __pt_glCreate(gid, GW, GH);
+      __pt_glViewport(gid, 0, 0, GW, GH);
+      const shProto = globalThis.WebGLShader ? globalThis.WebGLShader.prototype : Object.prototype;
+      const prProto = globalThis.WebGLProgram ? globalThis.WebGLProgram.prototype : Object.prototype;
+      const bfProto = globalThis.WebGLBuffer ? globalThis.WebGLBuffer.prototype : Object.prototype;
+      let clearRGBA = [0, 0, 0, 0];
+      const H = (o) => (o ? (o.__h | 0) : 0);              // JS wrapper -> native handle
+      const L = (l) => (l && typeof l.__loc === 'number' ? l.__loc : -1);
+      const bytesOf = (d) => (typeof d === 'number' ? new Uint8Array(Math.max(0, d)) : d);
+      Object.assign(gl, {
+        createShader(type) { const o = Object.create(shProto); o.__h = __pt_glCreateShader(gid, type >>> 0); o.__type = type; return o; },
+        shaderSource(sh, src) { if (sh) sh.__src = String(src); },
+        compileShader(sh) { if (sh) __pt_glCompileShader(gid, H(sh), sh.__src || ''); },
+        getShaderParameter(sh, pn) { if (pn === C.COMPILE_STATUS) return __pt_glShaderCompiled(gid, H(sh)); if (pn === 0x8B4F) return sh && sh.__type; return true; },
+        getShaderInfoLog(sh) { return __pt_glShaderInfoLog(gid, H(sh)); },
+        createProgram() { const o = Object.create(prProto); o.__h = __pt_glCreateProgram(gid); return o; },
+        attachShader(p, sh) { __pt_glAttachShader(gid, H(p), H(sh)); },
+        linkProgram(p) { __pt_glLinkProgram(gid, H(p)); },
+        getProgramParameter(p, pn) { if (pn === C.LINK_STATUS) return __pt_glProgramLinked(gid, H(p)); return 0; },
+        getProgramInfoLog() { return ''; },
+        useProgram(p) { __pt_glUseProgram(gid, H(p)); },
+        getAttribLocation(p, name) { return __pt_glAttribLocation(gid, H(p), String(name)); },
+        getUniformLocation(p, name) { const l = __pt_glUniformLocation(gid, H(p), String(name)); return l >= 0 ? { __loc: l } : null; },
+        createBuffer() { const o = Object.create(bfProto); o.__h = __pt_glCreateBuffer(gid); return o; },
+        bindBuffer(t, b) { __pt_glBindBuffer(gid, t >>> 0, H(b)); },
+        bufferData(t, data, usage) { __pt_glBufferData(gid, t >>> 0, bytesOf(data), (usage || 0) >>> 0); },
+        enableVertexAttribArray(i) { __pt_glEnableVertexAttribArray(gid, i >>> 0); },
+        vertexAttribPointer(i, size, type, norm, stride, offset) { __pt_glVertexAttribPointer(gid, i >>> 0, size | 0, type >>> 0, norm ? 1 : 0, stride | 0, offset | 0); },
+        uniform1f(l, x) { __pt_glUniformF(gid, L(l), new Float32Array([x])); },
+        uniform2f(l, a, b) { __pt_glUniformF(gid, L(l), new Float32Array([a, b])); },
+        uniform3f(l, a, b, c2) { __pt_glUniformF(gid, L(l), new Float32Array([a, b, c2])); },
+        uniform4f(l, a, b, c2, d) { __pt_glUniformF(gid, L(l), new Float32Array([a, b, c2, d])); },
+        uniform1i(l, x) { __pt_glUniform1i(gid, L(l), x | 0); },
+        uniformMatrix4fv(l, transpose, v) { __pt_glUniformMatrix4(gid, L(l), transpose ? 1 : 0, new Float32Array(v)); },
+        clearColor(r, g, b, a) { const q = (v) => Math.max(0, Math.min(255, Math.round((+v || 0) * 255))); clearRGBA = [q(r), q(g), q(b), q(a)]; },
+        clear(mask) { if ((mask | 0) & C.COLOR_BUFFER_BIT) __pt_glClear(gid, clearRGBA[0], clearRGBA[1], clearRGBA[2], clearRGBA[3]); },
+        viewport(x, y, w, h) { __pt_glViewport(gid, x | 0, y | 0, w | 0, h | 0); },
+        enable(cap) { __pt_glEnable(gid, cap >>> 0, 1); },
+        disable(cap) { __pt_glEnable(gid, cap >>> 0, 0); },
+        drawArrays(mode, first, count) { __pt_glDrawArrays(gid, mode >>> 0, first | 0, count | 0); },
+        drawElements(mode, count, type, offset) { __pt_glDrawElements(gid, mode >>> 0, count | 0, type >>> 0, offset | 0); },
+        readPixels(x, y, w, h, format, type, dst) {
+          w = w | 0; h = h | 0; if (!dst) return dst;
+          const full = __pt_glReadPixels(gid);            // whole surface, top-left origin
+          for (let row = 0; row < h; row++) {
+            const sy = GH - 1 - ((y | 0) + row);          // WebGL readPixels is bottom-left
+            if (sy < 0 || sy >= GH) continue;
+            for (let col = 0; col < w; col++) {
+              const sx = (x | 0) + col; if (sx < 0 || sx >= GW) continue;
+              const si = (sy * GW + sx) * 4, di = (row * w + col) * 4;
+              dst[di] = full[si]; dst[di + 1] = full[si + 1]; dst[di + 2] = full[si + 2]; dst[di + 3] = full[si + 3];
+            }
+          }
+          return dst;
+        },
+        __ptPixels() { return { w: GW, h: GH, data: __pt_glReadPixels(gid) }; },
+      });
+    } else {
+      // Fallback synthesis (no `webgl` feature): back the readback with the shared
+      // surface — clears are exact, draws stamp a pattern keyed by the op log.
+      const S = makeSurface(canvas);
+      let clearRGBA = [0, 0, 0, 0];
+      Object.assign(gl, {
+        clearColor(r, g, b, a) {
+          S.note('clearColor|' + [r, g, b, a]);
+          const q = (v) => Math.max(0, Math.min(255, Math.round((+v || 0) * 255)));
+          clearRGBA = [q(r), q(g), q(b), q(a)];
+        },
+        clear(mask) {
+          S.note('clear|' + mask);
+          if ((mask | 0) & C.COLOR_BUFFER_BIT) { const p = S.pixels(); S.solid(0, 0, p.w, p.h, clearRGBA); }
+        },
+        viewport(x, y, w, h) { S.note('viewport|' + [x, y, w, h]); },
+        shaderSource(sh, src) { S.note('shaderSource|' + src); },
+        bufferData(target, data) { S.note('bufferData|' + [target, data && (data.length || data.byteLength)]); },
+        uniform1f(l, v) { S.note('uniform1f|' + v); },
+        uniform2f(l, a, b) { S.note('uniform2f|' + [a, b]); },
+        uniform3f(l, a, b, c2) { S.note('uniform3f|' + [a, b, c2]); },
+        uniform4f(l, a, b, c2, d) { S.note('uniform4f|' + [a, b, c2, d]); },
+        drawArrays(mode, first, count) {
+          S.note('drawArrays|' + [mode, first, count]);
+          const p = S.pixels(); S.stamp(0, 0, p.w, p.h);
+        },
+        drawElements(mode, count, type, offset) {
+          S.note('drawElements|' + [mode, count, type, offset]);
+          const p = S.pixels(); S.stamp(0, 0, p.w, p.h);
+        },
+        readPixels(x, y, w, h, format, type, dst) {
+          S.note('readPixels|' + [x, y, w, h, format, type]);
+          w = w | 0; h = h | 0;
+          if (dst && dst.length >= w * h * 4) S.read(x, y, w, h, dst);
+          return dst;
+        },
+        __ptPixels() { return S.pixels(); },
+      });
+    }
 
     // No-op the GL calls a fingerprinter drives before reading parameters.
     for (const m of ['viewport','clearColor','clear','enable','disable','createShader','shaderSource',

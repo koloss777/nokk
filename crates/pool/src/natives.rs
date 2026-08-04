@@ -58,6 +58,48 @@ pub fn install(scope: &mut v8::HandleScope) {
         bind(scope, "__pt_canvasPutImageData", canvas_put_image_data);
         bind(scope, "__pt_canvasGetImageData", canvas_get_image_data);
     }
+
+    // Optional real WebGL (the `webgl` feature) — a headless Mesa GL context. Their
+    // presence tells the JS WebGL context to draw for real instead of stamping.
+    #[cfg(feature = "webgl")]
+    {
+        bind(scope, "__pt_glAvailable", gl_available);
+        bind(scope, "__pt_glCreate", gl_create);
+        bind(scope, "__pt_glDestroy", gl_destroy);
+        bind(scope, "__pt_glClear", gl_clear);
+        bind(scope, "__pt_glViewport", gl_viewport);
+        bind(scope, "__pt_glEnable", gl_enable);
+        bind(scope, "__pt_glCreateShader", gl_create_shader);
+        bind(scope, "__pt_glCompileShader", gl_compile_shader);
+        bind(scope, "__pt_glShaderCompiled", gl_shader_compiled);
+        bind(scope, "__pt_glShaderInfoLog", gl_shader_info_log);
+        bind(scope, "__pt_glCreateProgram", gl_create_program);
+        bind(scope, "__pt_glAttachShader", gl_attach_shader);
+        bind(scope, "__pt_glLinkProgram", gl_link_program);
+        bind(scope, "__pt_glProgramLinked", gl_program_linked);
+        bind(scope, "__pt_glUseProgram", gl_use_program);
+        bind(scope, "__pt_glAttribLocation", gl_attrib_location);
+        bind(scope, "__pt_glUniformLocation", gl_uniform_location);
+        bind(scope, "__pt_glCreateBuffer", gl_create_buffer);
+        bind(scope, "__pt_glBindBuffer", gl_bind_buffer);
+        bind(scope, "__pt_glBufferData", gl_buffer_data);
+        bind(
+            scope,
+            "__pt_glEnableVertexAttribArray",
+            gl_enable_vertex_attrib_array,
+        );
+        bind(
+            scope,
+            "__pt_glVertexAttribPointer",
+            gl_vertex_attrib_pointer,
+        );
+        bind(scope, "__pt_glUniformF", gl_uniform_f);
+        bind(scope, "__pt_glUniform1i", gl_uniform_1i);
+        bind(scope, "__pt_glUniformMatrix4", gl_uniform_matrix4);
+        bind(scope, "__pt_glDrawArrays", gl_draw_arrays);
+        bind(scope, "__pt_glDrawElements", gl_draw_elements);
+        bind(scope, "__pt_glReadPixels", gl_read_pixels);
+    }
 }
 
 #[cfg(feature = "render")]
@@ -65,8 +107,13 @@ fn arg_f32(scope: &mut v8::HandleScope, value: v8::Local<v8::Value>) -> f32 {
     value.number_value(scope).unwrap_or(0.0) as f32
 }
 
+#[cfg(feature = "webgl")]
+fn arg_i32(scope: &mut v8::HandleScope, value: v8::Local<v8::Value>) -> i32 {
+    value.integer_value(scope).unwrap_or(0) as i32
+}
+
 /// Little-endian `f32`s behind a `Float32Array` argument (the path verb stream).
-#[cfg(feature = "render")]
+#[cfg(any(feature = "render", feature = "webgl"))]
 fn arg_f32s(value: v8::Local<v8::Value>) -> Vec<f32> {
     arg_bytes(value)
         .chunks_exact(4)
@@ -254,6 +301,395 @@ fn canvas_get_image_data(
         arg_usize(scope, args.get(3)) as u32,
         arg_usize(scope, args.get(4)) as u32,
     );
+    set_bytes(scope, &mut rv, &bytes);
+}
+
+// ---- WebGL (`webgl` feature) --------------------------------------------
+// Each maps one WebGL call onto the headless GL backend in `crate::webgl`. GL
+// object handles cross as plain numbers (0 = null). `getParameter`, extensions and
+// precision stay synthesized in JS for renderer-string coherence; only the drawing
+// pipeline is native.
+
+/// `__pt_glAvailable()` → whether a real headless GL context can be created here.
+#[cfg(feature = "webgl")]
+fn gl_available(
+    _scope: &mut v8::HandleScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    rv.set_bool(crate::webgl::available());
+}
+
+/// `__pt_glCreate(id, w, h)`
+#[cfg(feature = "webgl")]
+fn gl_create(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::webgl::create(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_usize(scope, args.get(1)) as u32,
+        arg_usize(scope, args.get(2)) as u32,
+    );
+}
+
+/// `__pt_glDestroy(id)`
+#[cfg(feature = "webgl")]
+fn gl_destroy(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::webgl::destroy(arg_usize(scope, args.get(0)) as u32);
+}
+
+/// `__pt_glClear(id, r, g, b, a)`
+#[cfg(feature = "webgl")]
+fn gl_clear(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::webgl::clear(
+        arg_usize(scope, args.get(0)) as u32,
+        [
+            arg_usize(scope, args.get(1)) as u8,
+            arg_usize(scope, args.get(2)) as u8,
+            arg_usize(scope, args.get(3)) as u8,
+            arg_usize(scope, args.get(4)) as u8,
+        ],
+    );
+}
+
+/// `__pt_glViewport(id, x, y, w, h)`
+#[cfg(feature = "webgl")]
+fn gl_viewport(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::webgl::viewport(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_i32(scope, args.get(1)),
+        arg_i32(scope, args.get(2)),
+        arg_i32(scope, args.get(3)),
+        arg_i32(scope, args.get(4)),
+    );
+}
+
+/// `__pt_glEnable(id, cap, on)`
+#[cfg(feature = "webgl")]
+fn gl_enable(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::webgl::enable(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_usize(scope, args.get(1)) as u32,
+        arg_usize(scope, args.get(2)) != 0,
+    );
+}
+
+/// `__pt_glCreateShader(id, type)` → handle
+#[cfg(feature = "webgl")]
+fn gl_create_shader(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let h = crate::webgl::create_shader(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_usize(scope, args.get(1)) as u32,
+    );
+    rv.set_uint32(h);
+}
+
+/// `__pt_glCompileShader(id, shader, source)`
+#[cfg(feature = "webgl")]
+fn gl_compile_shader(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let shader = arg_usize(scope, args.get(1)) as u32;
+    let src = arg_string(scope, args.get(2));
+    crate::webgl::compile_shader(id, shader, &src);
+}
+
+/// `__pt_glShaderCompiled(id, shader)` → bool
+#[cfg(feature = "webgl")]
+fn gl_shader_compiled(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    rv.set_bool(crate::webgl::shader_compiled(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_usize(scope, args.get(1)) as u32,
+    ));
+}
+
+/// `__pt_glShaderInfoLog(id, shader)` → string
+#[cfg(feature = "webgl")]
+fn gl_shader_info_log(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let log = crate::webgl::shader_info_log(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_usize(scope, args.get(1)) as u32,
+    );
+    if let Some(s) = v8::String::new(scope, &log) {
+        rv.set(s.into());
+    }
+}
+
+/// `__pt_glCreateProgram(id)` → handle
+#[cfg(feature = "webgl")]
+fn gl_create_program(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    rv.set_uint32(crate::webgl::create_program(
+        arg_usize(scope, args.get(0)) as u32
+    ));
+}
+
+/// `__pt_glAttachShader(id, program, shader)`
+#[cfg(feature = "webgl")]
+fn gl_attach_shader(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::webgl::attach_shader(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_usize(scope, args.get(1)) as u32,
+        arg_usize(scope, args.get(2)) as u32,
+    );
+}
+
+/// `__pt_glLinkProgram(id, program)`
+#[cfg(feature = "webgl")]
+fn gl_link_program(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::webgl::link_program(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_usize(scope, args.get(1)) as u32,
+    );
+}
+
+/// `__pt_glProgramLinked(id, program)` → bool
+#[cfg(feature = "webgl")]
+fn gl_program_linked(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    rv.set_bool(crate::webgl::program_linked(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_usize(scope, args.get(1)) as u32,
+    ));
+}
+
+/// `__pt_glUseProgram(id, program)`
+#[cfg(feature = "webgl")]
+fn gl_use_program(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::webgl::use_program(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_usize(scope, args.get(1)) as u32,
+    );
+}
+
+/// `__pt_glAttribLocation(id, program, name)` → i32
+#[cfg(feature = "webgl")]
+fn gl_attrib_location(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let program = arg_usize(scope, args.get(1)) as u32;
+    let name = arg_string(scope, args.get(2));
+    rv.set_int32(crate::webgl::attrib_location(id, program, &name));
+}
+
+/// `__pt_glUniformLocation(id, program, name)` → i32 (-1 = null)
+#[cfg(feature = "webgl")]
+fn gl_uniform_location(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let program = arg_usize(scope, args.get(1)) as u32;
+    let name = arg_string(scope, args.get(2));
+    rv.set_int32(crate::webgl::uniform_location(id, program, &name));
+}
+
+/// `__pt_glCreateBuffer(id)` → handle
+#[cfg(feature = "webgl")]
+fn gl_create_buffer(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    rv.set_uint32(crate::webgl::create_buffer(
+        arg_usize(scope, args.get(0)) as u32
+    ));
+}
+
+/// `__pt_glBindBuffer(id, target, buffer)`
+#[cfg(feature = "webgl")]
+fn gl_bind_buffer(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::webgl::bind_buffer(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_usize(scope, args.get(1)) as u32,
+        arg_usize(scope, args.get(2)) as u32,
+    );
+}
+
+/// `__pt_glBufferData(id, target, data, usage)`
+#[cfg(feature = "webgl")]
+fn gl_buffer_data(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let target = arg_usize(scope, args.get(1)) as u32;
+    let data = arg_bytes(args.get(2));
+    let usage = arg_usize(scope, args.get(3)) as u32;
+    crate::webgl::buffer_data(id, target, &data, usage);
+}
+
+/// `__pt_glEnableVertexAttribArray(id, index)`
+#[cfg(feature = "webgl")]
+fn gl_enable_vertex_attrib_array(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::webgl::enable_vertex_attrib_array(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_usize(scope, args.get(1)) as u32,
+    );
+}
+
+/// `__pt_glVertexAttribPointer(id, index, size, type, normalized, stride, offset)`
+#[cfg(feature = "webgl")]
+fn gl_vertex_attrib_pointer(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::webgl::vertex_attrib_pointer(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_usize(scope, args.get(1)) as u32,
+        arg_i32(scope, args.get(2)),
+        arg_usize(scope, args.get(3)) as u32,
+        arg_usize(scope, args.get(4)) != 0,
+        arg_i32(scope, args.get(5)),
+        arg_i32(scope, args.get(6)),
+    );
+}
+
+/// `__pt_glUniformF(id, location, valuesF32)` — uniform{1,2,3,4}f by array length.
+#[cfg(feature = "webgl")]
+fn gl_uniform_f(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let loc = arg_i32(scope, args.get(1));
+    let vals = arg_f32s(args.get(2));
+    crate::webgl::uniform_f(id, loc, &vals);
+}
+
+/// `__pt_glUniform1i(id, location, v)`
+#[cfg(feature = "webgl")]
+fn gl_uniform_1i(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::webgl::uniform_1i(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_i32(scope, args.get(1)),
+        arg_i32(scope, args.get(2)),
+    );
+}
+
+/// `__pt_glUniformMatrix4(id, location, transpose, valuesF32)`
+#[cfg(feature = "webgl")]
+fn gl_uniform_matrix4(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let loc = arg_i32(scope, args.get(1));
+    let transpose = arg_usize(scope, args.get(2)) != 0;
+    let vals = arg_f32s(args.get(3));
+    crate::webgl::uniform_matrix4(id, loc, transpose, &vals);
+}
+
+/// `__pt_glDrawArrays(id, mode, first, count)`
+#[cfg(feature = "webgl")]
+fn gl_draw_arrays(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::webgl::draw_arrays(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_usize(scope, args.get(1)) as u32,
+        arg_i32(scope, args.get(2)),
+        arg_i32(scope, args.get(3)),
+    );
+}
+
+/// `__pt_glDrawElements(id, mode, count, type, offset)`
+#[cfg(feature = "webgl")]
+fn gl_draw_elements(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::webgl::draw_elements(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_usize(scope, args.get(1)) as u32,
+        arg_i32(scope, args.get(2)),
+        arg_usize(scope, args.get(3)) as u32,
+        arg_i32(scope, args.get(4)),
+    );
+}
+
+/// `__pt_glReadPixels(id)` → straight-alpha RGBA `Uint8Array` of the whole surface.
+#[cfg(feature = "webgl")]
+fn gl_read_pixels(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let bytes = crate::webgl::read_pixels(arg_usize(scope, args.get(0)) as u32);
     set_bytes(scope, &mut rv, &bytes);
 }
 

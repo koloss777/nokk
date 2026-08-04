@@ -14,6 +14,8 @@ default = []
 # `cargo build --release --bin nokk --features render` → real off-screen canvas
 # rasterization (docs/rendering.md). Off by default; the standard binary stays light.
 render = ["nokk/render"]
+# `--features webgl` → real headless WebGL (Mesa). Runs only where Mesa/EGL exists.
+webgl = ["nokk/webgl"]
 
 [[bin]]
 name = "nokk"

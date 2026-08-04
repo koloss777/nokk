@@ -14,6 +14,9 @@ default = []
 # Opt-in real off-screen canvas rasterization (docs/rendering.md); forwarded to
 # nokk-pool. Off by default so the standard build stays light.
 render = ["nokk-pool/render"]
+# Opt-in real WebGL (headless Mesa GL); forwarded to nokk-pool. Runs only where
+# Mesa/EGL is present. Off by default. See docs/rendering.md.
+webgl = ["nokk-pool/webgl"]
 
 [dependencies]
 nokk-pool = { workspace = true }

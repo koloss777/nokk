@@ -2904,4 +2904,62 @@ mod tests {
             "right edge blue-ish, got {r:?}"
         );
     }
+
+    // End-to-end WebGL through the engine: a real page-style draw (compile shaders,
+    // upload a triangle, drawArrays) must produce genuine pixels in readPixels via
+    // the Mesa backend. Runs for real only where EGL is present (mesa container/CI);
+    // the JS detects the absence of the natives and the assert on a green pixel
+    // still holds because the fallback stamp is deterministic — so we gate the
+    // strict color check on the natives being active.
+    #[cfg(feature = "webgl")]
+    #[tokio::test]
+    async fn render_webgl_draw_triangle_via_engine() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        let probe = r#"(() => {
+            const c = document.createElement('canvas'); c.width = 32; c.height = 32;
+            const gl = c.getContext('webgl');
+            const native = typeof __pt_glAvailable === 'function' && __pt_glAvailable();
+            gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+            const vs = gl.createShader(gl.VERTEX_SHADER);
+            gl.shaderSource(vs, 'attribute vec2 p; void main(){ gl_Position = vec4(p,0.0,1.0); }');
+            gl.compileShader(vs);
+            const fs = gl.createShader(gl.FRAGMENT_SHADER);
+            gl.shaderSource(fs, 'precision mediump float; void main(){ gl_FragColor = vec4(0.0,1.0,0.0,1.0); }');
+            gl.compileShader(fs);
+            const prog = gl.createProgram();
+            gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog); gl.useProgram(prog);
+            const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-0.8,-0.8, 0.8,-0.8, 0.0,0.8]), 0x88E4);
+            const loc = gl.getAttribLocation(prog, 'p');
+            gl.enableVertexAttribArray(loc);
+            gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+            gl.drawArrays(0x0004, 0, 3);
+            const px = new Uint8Array(32 * 32 * 4);
+            gl.readPixels(0, 0, 32, 32, gl.RGBA, gl.UNSIGNED_BYTE, px);
+            const center = 4 * (16 * 32 + 16);
+            const compiled = native ? gl.getShaderParameter(vs, gl.COMPILE_STATUS) : true;
+            return JSON.stringify({ native, compiled, cg: px[center + 1], ca: px[center + 3] });
+        })()"#;
+        let out = match ctx.evaluate(probe).await.unwrap() {
+            Value::String(s) => s,
+            v => panic!("expected string, got {v:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        // Whether or not EGL is live, the pipeline must run without throwing.
+        if v["native"].as_bool().unwrap() {
+            assert!(
+                v["compiled"].as_bool().unwrap(),
+                "shader compiles on the GL backend"
+            );
+            assert!(
+                v["cg"].as_u64().unwrap() > 150,
+                "triangle center is green via real GL, got {}",
+                v["cg"]
+            );
+        } else {
+            eprintln!("skip strict check: webgl natives inactive (no EGL here)");
+        }
+    }
 }

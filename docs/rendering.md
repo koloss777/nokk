@@ -159,11 +159,19 @@ Effort: **medium-high** (glow) to **high** (SwiftShader).
    `render` because it links a GL stack; EGL is loaded at runtime, so it *builds*
    anywhere but only *runs* where Mesa/EGL is present. Landed: surfaceless context
    + off-screen RGBA8 FBO + `clear`/`readPixels` (real pixels, row-flipped to
-   canvas origin), tested in a Mesa container and in CI (`render-tests.yml`). Next:
-   shader compile/link, buffers/attribs, `drawArrays`/`drawElements`, then the JS
-   WebGL context wiring. **Coherence:** Mesa reports `llvmpipe` (a headless tell),
-   so the stealth layer keeps *reporting* a plausible GPU string and only borrows
-   llvmpipe's pixels — a claimed-vs-actual mismatch that only a deep probe catches.
+   canvas origin). Now wired end to end: shaders (compile/link + status/info log),
+   programs, buffers, attribs, uniforms (`1..4f`/`1i`/`matrix4fv`), `drawArrays`/
+   `drawElements`, `clear`/`viewport`/`enable`, `readPixels`. The JS `getContext
+   ('webgl'|'webgl2')` routes the drawing pipeline to the native context when a real
+   GL context is available (`__pt_glAvailable()`), else keeps the synthesis stamp;
+   `getParameter`/extensions/precision stay synthesized for GPU-string coherence.
+   Verified through the engine in a Mesa container and in CI (`render-tests.yml`):
+   a page compiles shaders, uploads a triangle, `drawArrays`, and `readPixels`
+   returns real green pixels. Still native-TODO: textures, framebuffers, WebGL2-only
+   entry points (kept as no-ops for now). **Coherence:** Mesa reports `llvmpipe` (a
+   headless tell), so the stealth layer keeps *reporting* a plausible GPU string and
+   only borrows llvmpipe's pixels — a claimed-vs-actual mismatch only a deep probe
+   catches.
 3. **Phase 3 — SwiftShader (optional, `render-swiftshader`?).** Closest Chrome
    match, C++ FFI. Only if the Chrome-exactness matters.
 4. **Distribution.** Build + release `nokk-render` artifacts / `:render` Docker

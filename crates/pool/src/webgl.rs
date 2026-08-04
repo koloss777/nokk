@@ -85,11 +85,11 @@ fn egl_display() -> Result<(&'static EglInstance, egl::Display), String> {
 /// if EGL is unavailable — callers fall back to the JS synthesis.
 pub fn create(id: u32, w: u32, h: u32) {
     let (w, h) = (w.clamp(1, 8192) as i32, h.clamp(1, 8192) as i32);
-    match make_surface(w, h) {
-        Ok(surface) => SURFACES.with(|s| {
+    // On failure there's simply no GL here; the JS layer keeps the stamp.
+    if let Ok(surface) = make_surface(w, h) {
+        SURFACES.with(|s| {
             s.borrow_mut().insert(id, surface);
-        }),
-        Err(_) => {} // no GL here; JS layer keeps the stamp
+        });
     }
 }
 
@@ -333,9 +333,77 @@ pub fn draw_arrays(id: u32, mode: u32, first: i32, count: i32) {
     with_gl(id, |gl| unsafe { gl.draw_arrays(mode, first, count) });
 }
 
+/// `drawElements(mode, count, type, offset)` (indexed draw; ELEMENT_ARRAY_BUFFER
+/// must already be bound + filled via `bind_buffer`/`buffer_data`).
+pub fn draw_elements(id: u32, mode: u32, count: i32, element_type: u32, offset: i32) {
+    with_gl(id, |gl| unsafe {
+        gl.draw_elements(mode, count, element_type, offset)
+    });
+}
+
 /// `viewport(x, y, w, h)`.
 pub fn viewport(id: u32, x: i32, y: i32, w: i32, h: i32) {
     with_gl(id, |gl| unsafe { gl.viewport(x, y, w, h) });
+}
+
+/// `enable(cap)` / `disable(cap)` — GL state toggles (e.g. DEPTH_TEST, BLEND).
+pub fn enable(id: u32, cap: u32, on: bool) {
+    with_gl(id, |gl| unsafe {
+        if on {
+            gl.enable(cap)
+        } else {
+            gl.disable(cap)
+        }
+    });
+}
+
+/// `getUniformLocation(program, name)` → location, or -1 if not found.
+pub fn uniform_location(id: u32, program: u32, name: &str) -> i32 {
+    let Some(p) = program_h(program) else {
+        return -1;
+    };
+    with_gl(id, |gl| unsafe {
+        gl.get_uniform_location(p, name)
+            .map(|l| l.0 as i32)
+            .unwrap_or(-1)
+    })
+    .unwrap_or(-1)
+}
+
+/// `uniform{1,2,3,4}f(location, …)` — dispatched by the number of components.
+pub fn uniform_f(id: u32, location: i32, v: &[f32]) {
+    if location < 0 {
+        return;
+    }
+    let loc = glow::NativeUniformLocation(location as u32);
+    with_gl(id, |gl| unsafe {
+        match v.len() {
+            1 => gl.uniform_1_f32(Some(&loc), v[0]),
+            2 => gl.uniform_2_f32(Some(&loc), v[0], v[1]),
+            3 => gl.uniform_3_f32(Some(&loc), v[0], v[1], v[2]),
+            _ => gl.uniform_4_f32(Some(&loc), v[0], v[1], v[2], v[3]),
+        }
+    });
+}
+
+/// `uniform1i(location, v)` (samplers / ints).
+pub fn uniform_1i(id: u32, location: i32, v: i32) {
+    if location < 0 {
+        return;
+    }
+    let loc = glow::NativeUniformLocation(location as u32);
+    with_gl(id, |gl| unsafe { gl.uniform_1_i32(Some(&loc), v) });
+}
+
+/// `uniformMatrix4fv(location, transpose, values)`.
+pub fn uniform_matrix4(id: u32, location: i32, transpose: bool, values: &[f32]) {
+    if location < 0 || values.len() < 16 {
+        return;
+    }
+    let loc = glow::NativeUniformLocation(location as u32);
+    with_gl(id, |gl| unsafe {
+        gl.uniform_matrix_4_f32_slice(Some(&loc), transpose, &values[..16])
+    });
 }
 
 /// `readPixels(0,0,w,h,RGBA,UNSIGNED_BYTE)` of the whole surface, row-flipped to
