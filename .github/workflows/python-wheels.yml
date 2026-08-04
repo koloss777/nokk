@@ -39,13 +39,14 @@ jobs:
       # Build in Debian 11 (bullseye, glibc 2.31) so the embedded binary runs on a
       # broad range of Linux (RHEL/Alma 9, Ubuntu 20.04+, Debian 11+) — matching the
       # release binary. maturin auditwheel-repairs to a manylinux_2_31 tag.
-      - name: Build wheel (Debian bullseye, glibc 2.31)
+      - name: Build wheel (Debian bullseye — broad glibc floor ~2.30)
         run: |
-          docker run --rm -v "$PWD:/w" -w /w rust:1-bullseye bash -euc '
-            apt-get update
-            apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config python3 python3-pip patchelf
+          docker run --rm -v "$PWD:/w" -w /w rust:1-bullseye bash -euo pipefail -c '
+            apt-get update -qq
+            apt-get install -y --no-install-recommends clang libclang-dev pkg-config python3 python3-pip patchelf
             pip3 install --upgrade pip
-            pip3 install maturin
+            pip3 install cmake maturin                            # apt cmake (3.18) < BoringSSL req (3.22)
+            export LIBCLANG_PATH="$(dirname "$(find /usr/lib -name "libclang.so*" | head -1)")"
             cd python && maturin build --release --out dist'
 
       - name: Sanity-check the wheel embeds the binary

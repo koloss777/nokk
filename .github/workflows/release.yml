@@ -23,11 +23,13 @@ jobs:
       # range of Linux — RHEL/Alma 9 (2.34), Ubuntu 20.04+, Debian 11+ — instead of
       # the runner's glibc 2.39 (which would need 2.38+). checkout/release stay on
       # the host (JS actions need node, which the minimal container lacks).
-      - name: Build (Debian bullseye, glibc 2.31)
+      - name: Build (Debian bullseye — broad glibc floor ~2.30)
         run: |
-          docker run --rm -v "$PWD:/w" -w /w rust:1-bullseye bash -euc '
-            apt-get update
-            apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+          docker run --rm -v "$PWD:/w" -w /w rust:1-bullseye bash -euo pipefail -c '
+            apt-get update -qq
+            apt-get install -y --no-install-recommends clang libclang-dev pkg-config python3-pip
+            pip3 install cmake                                    # apt cmake (3.18) < BoringSSL req (3.22)
+            export LIBCLANG_PATH="$(dirname "$(find /usr/lib -name "libclang.so*" | head -1)")"
             cargo build --release --bin nokk'
 
       - name: Package
