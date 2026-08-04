@@ -22,19 +22,12 @@ permissions:
 jobs:
   build:
     name: Build Linux wheel
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      # BoringSSL (wreq/bindgen) + prebuilt V8 build deps — same as release.yml.
-      - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
-
-      # Version comes from the tag: v0.1.20-alpha -> 0.1.20a1 (PEP 440).
+      # Version comes from the tag: v0.1.20-alpha -> 0.1.20a1 (PEP 440). Done on the
+      # host; the container builds against the edited python/pyproject.toml.
       - name: Sync wheel version from the tag
         if: github.ref_type == 'tag'
         run: |
@@ -43,14 +36,21 @@ jobs:
           echo "wheel version: $PEP"
           sed -i "s/^version = \".*\"/version = \"$PEP\"/" python/pyproject.toml
 
-      - name: Build wheel
+      # Build in Debian 11 (bullseye, glibc 2.31) so the embedded binary runs on a
+      # broad range of Linux (RHEL/Alma 9, Ubuntu 20.04+, Debian 11+) — matching the
+      # release binary. maturin auditwheel-repairs to a manylinux_2_31 tag.
+      - name: Build wheel (Debian bullseye, glibc 2.31)
         run: |
-          python -m pip install --upgrade pip maturin
-          cd python && maturin build --release --out dist
+          docker run --rm -v "$PWD:/w" -w /w rust:1-bullseye bash -euc '
+            apt-get update
+            apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config python3 python3-pip patchelf
+            pip3 install --upgrade pip
+            pip3 install maturin
+            cd python && maturin build --release --out dist'
 
       - name: Sanity-check the wheel embeds the binary
         run: |
-          python - <<'PY'
+          python3 - <<'PY'
           import glob, zipfile
           whl = glob.glob("python/dist/*.whl")[0]
           names = zipfile.ZipFile(whl).namelist()
