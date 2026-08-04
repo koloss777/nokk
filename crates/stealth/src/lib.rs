@@ -1255,9 +1255,59 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     return [0, 0, 0, 255];
   };
 
+  // With the optional `render` build, the `__pt_canvas*` natives back the surface
+  // with a real tiny-skia rasterizer: fills and (crucially) text are genuine
+  // glyph pixels, so canvas fingerprints look like a real device instead of a
+  // synthesized pattern. Same method shape as the JS surface below, plus native
+  // text/put. Paths and images we still cannot rasterize keep the deterministic
+  // stamp (fill) so different drawings still differ and repeat exactly.
+  const NATIVE_CANVAS = typeof __pt_canvasCreate === 'function';
+  const makeNativeSurface = (canvas) => {
+    const id = (globalThis.__ptCanvasSeq = (globalThis.__ptCanvasSeq || 0) + 1);
+    let W = -1, H = -1;
+    let ops = 2166136261 >>> 0;                 // FNV-1a, drives the path/image stamp
+    const sync = () => {
+      const w = Math.max(0, canvas.width | 0), h = Math.max(0, canvas.height | 0);
+      if (w !== W || h !== H) { W = w; H = h; __pt_canvasCreate(id, w, h); } // create resets
+    };
+    sync();
+    return {
+      native: true,
+      note(s) {
+        s = String(s);
+        for (let i = 0; i < s.length; i++) { ops ^= s.charCodeAt(i); ops = Math.imul(ops, 16777619) >>> 0; }
+      },
+      solid(x, y, w, h, rgba) {
+        sync();
+        if ((rgba[3] | 0) === 0) __pt_canvasClearRect(id, x, y, w, h);
+        else __pt_canvasFillRect(id, x, y, w, h, rgba[0], rgba[1], rgba[2], rgba[3]);
+      },
+      // Real glyphs. `y` is the alphabetic baseline, matching canvas semantics.
+      text(t, x, y, size, rgba) { sync(); __pt_canvasFillText(id, String(t), x, y, size, rgba[0], rgba[1], rgba[2], rgba[3]); },
+      width(t, size) { return __pt_canvasMeasureText(String(t), size); },
+      // Paths / images we can't rasterize: a deterministic semi-transparent fill
+      // keyed by the op-log, so the drawing still influences the pixels stably.
+      stamp(x, y, w, h) {
+        sync();
+        let v = (ops ^ SEED) >>> 0;
+        v = Math.imul(v ^ (v >>> 15), 2246822519) >>> 0; v = (v ^ (v >>> 13)) >>> 0;
+        __pt_canvasFillRect(id, x, y, w, h, v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, 48);
+      },
+      put(data, x, y, w, h) { sync(); __pt_canvasPutImageData(id, x, y, w, h, data); },
+      read(x, y, w, h, dst) {
+        sync();
+        const b = __pt_canvasGetImageData(id, x | 0, y | 0, w | 0, h | 0);
+        dst.set(b.subarray(0, Math.min(b.length, dst.length)));
+        return dst;
+      },
+      pixels() { sync(); return { w: W, h: H, data: __pt_canvasGetImageData(id, 0, 0, Math.max(0, W), Math.max(0, H)) }; },
+    };
+  };
+
   // A canvas-backed pixel surface, shared by the 2D and WebGL contexts: both have
   // to answer readback probes with something that actually reflects the drawing.
   const makeSurface = (canvas) => {
+    if (NATIVE_CANVAS) return makeNativeSurface(canvas);
     let W = -1, H = -1, px = new Uint8ClampedArray(0);
     let ops = 2166136261 >>> 0;                 // FNV-1a over every draw call
     const sync = () => {
@@ -1323,10 +1373,19 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       bx0 = Math.min(bx0, x); by0 = Math.min(by0, y); bx1 = Math.max(bx1, x); by1 = Math.max(by1, y);
     };
     const paintPath = () => { stamp(bx0 - 1, by0 - 1, (bx1 - bx0) + 2, (by1 - by0) + 2); };
-    const textBox = function (t, x, y) {
+    const fontSize = (f) => { const m = /(\d+(?:\.\d+)?)px/.exec(String(f)); return m ? parseFloat(m[1]) : 10; };
+    const drawText = function (t, x, y, rgba) {
+      const size = fontSize(this.font);
       const w = this.measureText(t).width;
-      const size = parseFloat(this.font) || 10;
-      stamp(x, y - size, w, size * 1.3);
+      let ox = +x || 0, oy = +y || 0;
+      const a = this.textAlign;                 // shift origin for align/baseline
+      if (a === 'center') ox -= w / 2; else if (a === 'right' || a === 'end') ox -= w;
+      const b = this.textBaseline;
+      if (b === 'top' || b === 'hanging') oy += size * 0.8;
+      else if (b === 'middle') oy += size * 0.3;
+      else if (b === 'bottom' || b === 'ideographic') oy -= size * 0.2;
+      if (S.native) S.text(t, ox, oy, size, rgba);
+      else stamp(ox, oy - size, w, size * 1.3);
     };
 
     return maskProto(Object.assign(Object.create(globalThis.CanvasRenderingContext2D.prototype), {
@@ -1343,8 +1402,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
         stamp(x, y, w, lw); stamp(x, (+y || 0) + (+h || 0) - lw, w, lw);
         stamp(x, y, lw, h); stamp((+x || 0) + (+w || 0) - lw, y, lw, h);
       },
-      fillText(t, x, y) { note('fillText|' + [t, x, y, this.font, this.fillStyle, this.textAlign, this.textBaseline]); textBox.call(this, t, +x || 0, +y || 0); },
-      strokeText(t, x, y) { note('strokeText|' + [t, x, y, this.font, this.strokeStyle]); textBox.call(this, t, +x || 0, +y || 0); },
+      fillText(t, x, y) { note('fillText|' + [t, x, y, this.font, this.fillStyle, this.textAlign, this.textBaseline]); drawText.call(this, t, +x || 0, +y || 0, parseColor(this.fillStyle)); },
+      strokeText(t, x, y) { note('strokeText|' + [t, x, y, this.font, this.strokeStyle]); drawText.call(this, t, +x || 0, +y || 0, parseColor(this.strokeStyle)); },
 
       beginPath() { note('beginPath'); bx0 = by0 = bx1 = by1 = 0; },
       closePath() { note('closePath'); },
@@ -1375,6 +1434,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       putImageData(data, x, y) {
         note('putImageData|' + [x, y, data && data.width, data && data.height]);
         if (!data || !data.data) return;
+        if (S.native) { S.put(data.data, x | 0, y | 0, data.width | 0, data.height | 0); return; }
         const p = S.pixels(), W = p.w, H = p.h, px = p.data;
         const dw = data.width | 0, dh = data.height | 0;
         for (let yy = 0; yy < dh; yy++) for (let xx = 0; xx < dw; xx++) {
@@ -1387,8 +1447,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       },
       isPointInPath() { return false; },
       measureText(t) {
-        const w = String(t).length * 6.7;
-        return { width: w, actualBoundingBoxLeft: 0, actualBoundingBoxRight: w, actualBoundingBoxAscent: 8, actualBoundingBoxDescent: 2, fontBoundingBoxAscent: 9, fontBoundingBoxDescent: 2 };
+        const size = fontSize(this.font);
+        const w = S.native ? S.width(t, size) : String(t).length * 6.7;
+        return { width: w, actualBoundingBoxLeft: 0, actualBoundingBoxRight: w, actualBoundingBoxAscent: size * 0.7, actualBoundingBoxDescent: size * 0.2, fontBoundingBoxAscent: size * 0.9, fontBoundingBoxDescent: size * 0.2 };
       },
       getImageData(x, y, w, h) {
         w = w | 0; h = h | 0;

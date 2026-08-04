@@ -2782,4 +2782,49 @@ mod tests {
             .unwrap();
         assert_eq!(v, Value::String("true".into()));
     }
+
+    // With `--features render`, the canvas is backed by the real rasterizer, so
+    // `fillText` must produce genuine glyph pixels (not the JS synthesis stamp) and
+    // `measureText` must return a real font advance. Off by default; this only runs
+    // for the render build.
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn render_canvas_fill_text_makes_real_glyph_pixels() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        let probe = r#"(() => {
+            const c = document.createElement('canvas'); c.width = 120; c.height = 40;
+            const g = c.getContext('2d');
+            g.fillStyle = '#ff0000'; g.font = '20px sans-serif';
+            g.fillText('nokk', 4, 28);
+            const d = g.getImageData(0, 0, 120, 40).data;
+            let opaque = 0, red = 0;
+            for (let i = 0; i < d.length; i += 4) {
+                if (d[i + 3] > 0) { opaque++; if (d[i] > 100 && d[i + 1] < 80) red++; }
+            }
+            const w = g.measureText('nokk').width;
+            return JSON.stringify({ opaque, red, w: Math.round(w) });
+        })()"#;
+        let out = match ctx.evaluate(probe).await.unwrap() {
+            Value::String(s) => s,
+            v => panic!("expected string, got {v:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let opaque = v["opaque"].as_u64().unwrap();
+        let red = v["red"].as_u64().unwrap();
+        let w = v["w"].as_u64().unwrap();
+        assert!(
+            opaque > 30,
+            "fillText must cover real glyph pixels, got {opaque}"
+        );
+        assert!(
+            red > 20,
+            "glyph pixels must carry the fill color, got {red} red of {opaque}"
+        );
+        assert!(
+            w > 20 && w < 90,
+            "measureText advance should be a real width, got {w}"
+        );
+    }
 }

@@ -14,15 +14,18 @@ default = []
 # Opt-in real off-screen rasterization: back the JS canvas with a real tiny-skia
 # 2D rasterizer (genuine getImageData/toDataURL pixels) instead of the default JS
 # synthesis. Heavier build; see docs/rendering.md. Not on by default.
-render = ["dep:tiny-skia"]
+render = ["dep:tiny-skia", "dep:ab_glyph"]
 
 [dependencies]
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
-# Real 2D rasterizer for the optional `render` feature (pure Rust, no GPU).
+# Real 2D rasterizer + glyph rasterizer for the optional `render` feature
+# (pure Rust, no GPU). A bundled Liberation Sans (fonts/) gives fillText real,
+# deterministic glyphs.
 tiny-skia = { version = "0.11", optional = true }
+ab_glyph = { version = "0.2", optional = true }
 
 # Embedded JavaScript engine (Phase 1). Uses a prebuilt V8 static library, so it
 # does not compile V8 from source. One `v8::OwnedIsolate` lives per worker thread.

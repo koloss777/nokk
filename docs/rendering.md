@@ -1,9 +1,15 @@
 # Design: optional real rendering (`render` feature)
 
-Status: **spec / not implemented.** A plan for giving nokk *real* off-screen
-canvas-2D and WebGL rasterization behind an opt-in Cargo feature, so the default
-build stays lightweight (synthesis) and a `--features render` build produces
-genuine pixels for harder anti-bot.
+Status: **Phase 1 landed (canvas 2D); WebGL pending.** Giving nokk *real*
+off-screen canvas-2D and WebGL rasterization behind an opt-in Cargo feature, so
+the default build stays lightweight (synthesis) and a `--features render` build
+produces genuine pixels for harder anti-bot.
+
+Implemented today under `--features render`: 2D fills, **real glyph text**
+(`fillText`/`strokeText`/`measureText` via a bundled Liberation Sans, in
+[crates/pool/src/canvas.rs](../crates/pool/src/canvas.rs)), and image data
+`put`/`get`/`toDataURL` — all backed by `tiny-skia` + `ab_glyph`. Paths and
+gradients still fall back to the JS deterministic stamp; WebGL is Phase 2.
 
 ## Goal & non-goals
 
@@ -141,9 +147,10 @@ Effort: **medium-high** (glow) to **high** (SwiftShader).
 
 ## Phasing
 
-1. **Phase 1 — Canvas 2D (`render`).** tiny-skia + cosmic-text/ab_glyph + bundled
-   fonts, wired through a `Canvas2d` backend trait and `natives.rs`. Biggest bang
-   for the buck; no GPU/FFI.
+1. **Phase 1 — Canvas 2D (`render`). ✅ done.** tiny-skia + ab_glyph + a bundled
+   font, wired through `natives.rs` (`__pt_canvas*`) and the JS canvas surface.
+   Fills, real glyph text, and image data put/get/toDataURL; biggest bang for the
+   buck, no GPU/FFI.
 2. **Phase 2 — WebGL (`render`).** glow + headless GL (Mesa software for
    determinism, or host GPU). `readPixels` real; keep params coherent.
 3. **Phase 3 — SwiftShader (optional, `render-swiftshader`?).** Closest Chrome

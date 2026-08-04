@@ -46,6 +46,9 @@ pub fn install(scope: &mut v8::HandleScope) {
         bind(scope, "__pt_canvasDestroy", canvas_destroy);
         bind(scope, "__pt_canvasFillRect", canvas_fill_rect);
         bind(scope, "__pt_canvasClearRect", canvas_clear_rect);
+        bind(scope, "__pt_canvasFillText", canvas_fill_text);
+        bind(scope, "__pt_canvasMeasureText", canvas_measure_text);
+        bind(scope, "__pt_canvasPutImageData", canvas_put_image_data);
         bind(scope, "__pt_canvasGetImageData", canvas_get_image_data);
     }
 }
@@ -116,6 +119,57 @@ fn canvas_clear_rect(
         arg_f32(scope, args.get(3)),
         arg_f32(scope, args.get(4)),
     );
+}
+
+/// `__pt_canvasFillText(id, text, x, y, size, r, g, b, a)` — real glyph pixels.
+#[cfg(feature = "render")]
+fn canvas_fill_text(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let text = arg_string(scope, args.get(1));
+    let (x, y, size) = (
+        arg_f32(scope, args.get(2)),
+        arg_f32(scope, args.get(3)),
+        arg_f32(scope, args.get(4)),
+    );
+    let rgba = [
+        arg_usize(scope, args.get(5)) as u8,
+        arg_usize(scope, args.get(6)) as u8,
+        arg_usize(scope, args.get(7)) as u8,
+        arg_usize(scope, args.get(8)) as u8,
+    ];
+    crate::canvas::fill_text(id, &text, x, y, size, rgba);
+}
+
+/// `__pt_canvasMeasureText(text, size)` → advance width in CSS px (a number).
+#[cfg(feature = "render")]
+fn canvas_measure_text(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let text = arg_string(scope, args.get(0));
+    let size = arg_f32(scope, args.get(1));
+    rv.set_double(crate::canvas::measure_text(&text, size) as f64);
+}
+
+/// `__pt_canvasPutImageData(id, x, y, w, h, data)` — overwrite from straight-alpha RGBA.
+#[cfg(feature = "render")]
+fn canvas_put_image_data(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let x = arg_f32(scope, args.get(1)) as i32;
+    let y = arg_f32(scope, args.get(2)) as i32;
+    let w = arg_usize(scope, args.get(3)) as u32;
+    let h = arg_usize(scope, args.get(4)) as u32;
+    let data = arg_bytes(args.get(5));
+    crate::canvas::put_image_data(id, x, y, w, h, &data);
 }
 
 /// `__pt_canvasGetImageData(id, x, y, w, h)` → straight-alpha RGBA `Uint8Array`.
