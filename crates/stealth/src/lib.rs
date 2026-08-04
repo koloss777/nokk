@@ -1285,7 +1285,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // Real glyphs. `y` is the alphabetic baseline, matching canvas semantics.
       text(t, x, y, size, rgba) { sync(); __pt_canvasFillText(id, String(t), x, y, size, rgba[0], rgba[1], rgba[2], rgba[3]); },
       width(t, size) { return __pt_canvasMeasureText(String(t), size); },
-      // Paths / images we can't rasterize: a deterministic semi-transparent fill
+      // Real vector paths: JS tessellates curves/arcs to a move/line/close verb
+      // stream, tiny-skia fills or strokes it.
+      fillPath(verbs, evenOdd, rgba) { sync(); __pt_canvasFillPath(id, new Float32Array(verbs), evenOdd ? 1 : 0, rgba[0], rgba[1], rgba[2], rgba[3]); },
+      strokePath(verbs, lw, rgba) { sync(); __pt_canvasStrokePath(id, new Float32Array(verbs), lw, rgba[0], rgba[1], rgba[2], rgba[3]); },
+      // Images we still can't rasterize: a deterministic semi-transparent fill
       // keyed by the op-log, so the drawing still influences the pixels stably.
       stamp(x, y, w, h) {
         sync();
@@ -1373,6 +1377,41 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       bx0 = Math.min(bx0, x); by0 = Math.min(by0, y); bx1 = Math.max(bx1, x); by1 = Math.max(by1, y);
     };
     const paintPath = () => { stamp(bx0 - 1, by0 - 1, (bx1 - bx0) + 2, (by1 - by0) + 2); };
+
+    // Path verb stream (0,x,y=move · 1,x,y=line · 4=close) for the native
+    // rasterizer: curves and arcs are tessellated to line segments here so the
+    // Rust side stays a trivial, robust decoder. Built only when the surface is
+    // native; the JS fallback keeps using the bounding-box stamp above.
+    let verbs = [], cx = 0, cy = 0, sub = false;
+    const moveV = (x, y) => { x = +x || 0; y = +y || 0; verbs.push(0, x, y); cx = x; cy = y; sub = true; };
+    const lineV = (x, y) => { x = +x || 0; y = +y || 0; if (!sub) return moveV(x, y); verbs.push(1, x, y); cx = x; cy = y; };
+    const closeV = () => { if (sub) { verbs.push(4); sub = false; } };
+    const sampleN = (fn) => { const N = 18; for (let k = 1; k <= N; k++) fn(k / N); };
+    const cubicV = (c1x, c1y, c2x, c2y, x, y) => {
+      const x0 = cx, y0 = cy;
+      sampleN((t) => { const u = 1 - t;
+        const bx = u*u*u*x0 + 3*u*u*t*c1x + 3*u*t*t*c2x + t*t*t*x;
+        const by = u*u*u*y0 + 3*u*u*t*c1y + 3*u*t*t*c2y + t*t*t*y;
+        lineV(bx, by); });
+    };
+    const quadV = (cpx, cpy, x, y) => {
+      const x0 = cx, y0 = cy;
+      sampleN((t) => { const u = 1 - t;
+        lineV(u*u*x0 + 2*u*t*cpx + t*t*x, u*u*y0 + 2*u*t*cpy + t*t*y); });
+    };
+    const arcV = (x, y, r, a0, a1, ccw) => {
+      x = +x || 0; y = +y || 0; r = +r || 0;
+      let sweep = a1 - a0;
+      if (!ccw && sweep < 0) sweep = (sweep % (2*Math.PI)) + 2*Math.PI;
+      if (ccw && sweep > 0) sweep = (sweep % (2*Math.PI)) - 2*Math.PI;
+      const steps = Math.max(2, Math.ceil(Math.abs(sweep) / (Math.PI / 16)));
+      for (let k = 0; k <= steps; k++) {
+        const a = a0 + sweep * (k / steps);
+        const px = x + r * Math.cos(a), py = y + r * Math.sin(a);
+        if (k === 0 && !sub) moveV(px, py); else lineV(px, py);
+      }
+    };
+
     const fontSize = (f) => { const m = /(\d+(?:\.\d+)?)px/.exec(String(f)); return m ? parseFloat(m[1]) : 10; };
     const drawText = function (t, x, y, rgba) {
       const size = fontSize(this.font);
@@ -1398,25 +1437,59 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       clearRect(x, y, w, h) { note('clearRect|' + [x, y, w, h]); solid(x, y, w, h, [0, 0, 0, 0]); },
       strokeRect(x, y, w, h) {
         note('strokeRect|' + [x, y, w, h, this.strokeStyle, this.lineWidth]);
+        const X = +x || 0, Y = +y || 0, W2 = +w || 0, H2 = +h || 0;
+        if (S.native) {
+          S.strokePath([0, X, Y, 1, X + W2, Y, 1, X + W2, Y + H2, 1, X, Y + H2, 4],
+            Math.max(0, +this.lineWidth || 1), parseColor(this.strokeStyle));
+          return;
+        }
         const lw = Math.max(1, this.lineWidth | 0);
-        stamp(x, y, w, lw); stamp(x, (+y || 0) + (+h || 0) - lw, w, lw);
-        stamp(x, y, lw, h); stamp((+x || 0) + (+w || 0) - lw, y, lw, h);
+        stamp(X, Y, W2, lw); stamp(X, Y + H2 - lw, W2, lw);
+        stamp(X, Y, lw, H2); stamp(X + W2 - lw, Y, lw, H2);
       },
       fillText(t, x, y) { note('fillText|' + [t, x, y, this.font, this.fillStyle, this.textAlign, this.textBaseline]); drawText.call(this, t, +x || 0, +y || 0, parseColor(this.fillStyle)); },
       strokeText(t, x, y) { note('strokeText|' + [t, x, y, this.font, this.strokeStyle]); drawText.call(this, t, +x || 0, +y || 0, parseColor(this.strokeStyle)); },
 
-      beginPath() { note('beginPath'); bx0 = by0 = bx1 = by1 = 0; },
-      closePath() { note('closePath'); },
-      moveTo(x, y) { note('moveTo|' + [x, y]); pathPoint(x, y); },
-      lineTo(x, y) { note('lineTo|' + [x, y]); pathPoint(x, y); },
-      rect(x, y, w, h) { note('rect|' + [x, y, w, h]); pathPoint(x, y); pathPoint((+x || 0) + (+w || 0), (+y || 0) + (+h || 0)); },
-      arc(x, y, r) { note('arc|' + [x, y, r]); pathPoint((+x || 0) - (+r || 0), (+y || 0) - (+r || 0)); pathPoint((+x || 0) + (+r || 0), (+y || 0) + (+r || 0)); },
-      arcTo(x1, y1, x2, y2) { note('arcTo|' + [x1, y1, x2, y2]); pathPoint(x1, y1); pathPoint(x2, y2); },
-      ellipse(x, y, rx, ry) { note('ellipse|' + [x, y, rx, ry]); pathPoint((+x || 0) - (+rx || 0), (+y || 0) - (+ry || 0)); pathPoint((+x || 0) + (+rx || 0), (+y || 0) + (+ry || 0)); },
-      bezierCurveTo(a, b, c, d, e, f) { note('bezierCurveTo|' + [a, b, c, d, e, f]); pathPoint(a, b); pathPoint(e, f); },
-      quadraticCurveTo(a, b, c, d) { note('quadraticCurveTo|' + [a, b, c, d]); pathPoint(a, b); pathPoint(c, d); },
-      fill() { note('fill|' + this.fillStyle); paintPath(); },
-      stroke() { note('stroke|' + [this.strokeStyle, this.lineWidth]); paintPath(); },
+      beginPath() { note('beginPath'); bx0 = by0 = bx1 = by1 = 0; verbs = []; sub = false; },
+      closePath() { note('closePath'); closeV(); },
+      moveTo(x, y) { note('moveTo|' + [x, y]); pathPoint(x, y); moveV(x, y); },
+      lineTo(x, y) { note('lineTo|' + [x, y]); pathPoint(x, y); lineV(x, y); },
+      rect(x, y, w, h) {
+        note('rect|' + [x, y, w, h]);
+        const X = +x || 0, Y = +y || 0, W2 = +w || 0, H2 = +h || 0;
+        pathPoint(X, Y); pathPoint(X + W2, Y + H2);
+        moveV(X, Y); lineV(X + W2, Y); lineV(X + W2, Y + H2); lineV(X, Y + H2); closeV();
+      },
+      arc(x, y, r, a0, a1, ccw) {
+        note('arc|' + [x, y, r, a0, a1, ccw]);
+        pathPoint((+x || 0) - (+r || 0), (+y || 0) - (+r || 0)); pathPoint((+x || 0) + (+r || 0), (+y || 0) + (+r || 0));
+        arcV(x, y, r, +a0 || 0, a1 === undefined ? 2 * Math.PI : +a1, !!ccw);
+      },
+      arcTo(x1, y1, x2, y2) { note('arcTo|' + [x1, y1, x2, y2]); pathPoint(x1, y1); pathPoint(x2, y2); lineV(x1, y1); lineV(x2, y2); },
+      ellipse(x, y, rx, ry, rot, a0, a1, ccw) {
+        note('ellipse|' + [x, y, rx, ry]);
+        pathPoint((+x || 0) - (+rx || 0), (+y || 0) - (+ry || 0)); pathPoint((+x || 0) + (+rx || 0), (+y || 0) + (+ry || 0));
+        // Approximate as a circle of radius rx then squash y — good enough, deterministic.
+        const X = +x || 0, Y = +y || 0, RX = +rx || 0, RY = +ry || 0;
+        const s0 = +a0 || 0, s1 = a1 === undefined ? 2 * Math.PI : +a1;
+        let sweep = s1 - s0; if (!ccw && sweep < 0) sweep += 2 * Math.PI; if (ccw && sweep > 0) sweep -= 2 * Math.PI;
+        const steps = Math.max(2, Math.ceil(Math.abs(sweep) / (Math.PI / 16)));
+        for (let k = 0; k <= steps; k++) { const a = s0 + sweep * (k / steps);
+          const px = X + RX * Math.cos(a), py = Y + RY * Math.sin(a);
+          if (k === 0 && !sub) moveV(px, py); else lineV(px, py); }
+      },
+      bezierCurveTo(a, b, c, d, e, f) { note('bezierCurveTo|' + [a, b, c, d, e, f]); pathPoint(a, b); pathPoint(e, f); cubicV(+a || 0, +b || 0, +c || 0, +d || 0, +e || 0, +f || 0); },
+      quadraticCurveTo(a, b, c, d) { note('quadraticCurveTo|' + [a, b, c, d]); pathPoint(a, b); pathPoint(c, d); quadV(+a || 0, +b || 0, +c || 0, +d || 0); },
+      fill(rule) {
+        note('fill|' + this.fillStyle);
+        if (S.native) S.fillPath(verbs, String(rule) === 'evenodd', parseColor(this.fillStyle));
+        else paintPath();
+      },
+      stroke() {
+        note('stroke|' + [this.strokeStyle, this.lineWidth]);
+        if (S.native) S.strokePath(verbs, Math.max(0, +this.lineWidth || 1), parseColor(this.strokeStyle));
+        else paintPath();
+      },
       clip() { note('clip'); },
 
       save() { note('save'); }, restore() { note('restore'); },

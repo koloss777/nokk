@@ -48,6 +48,8 @@ pub fn install(scope: &mut v8::HandleScope) {
         bind(scope, "__pt_canvasClearRect", canvas_clear_rect);
         bind(scope, "__pt_canvasFillText", canvas_fill_text);
         bind(scope, "__pt_canvasMeasureText", canvas_measure_text);
+        bind(scope, "__pt_canvasFillPath", canvas_fill_path);
+        bind(scope, "__pt_canvasStrokePath", canvas_stroke_path);
         bind(scope, "__pt_canvasPutImageData", canvas_put_image_data);
         bind(scope, "__pt_canvasGetImageData", canvas_get_image_data);
     }
@@ -56,6 +58,15 @@ pub fn install(scope: &mut v8::HandleScope) {
 #[cfg(feature = "render")]
 fn arg_f32(scope: &mut v8::HandleScope, value: v8::Local<v8::Value>) -> f32 {
     value.number_value(scope).unwrap_or(0.0) as f32
+}
+
+/// Little-endian `f32`s behind a `Float32Array` argument (the path verb stream).
+#[cfg(feature = "render")]
+fn arg_f32s(value: v8::Local<v8::Value>) -> Vec<f32> {
+    arg_bytes(value)
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
 }
 
 /// `__pt_canvasCreate(id, w, h)`
@@ -154,6 +165,44 @@ fn canvas_measure_text(
     let text = arg_string(scope, args.get(0));
     let size = arg_f32(scope, args.get(1));
     rv.set_double(crate::canvas::measure_text(&text, size) as f64);
+}
+
+/// `__pt_canvasFillPath(id, verbsF32, evenOdd, r, g, b, a)` — fill a tessellated path.
+#[cfg(feature = "render")]
+fn canvas_fill_path(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let verbs = arg_f32s(args.get(1));
+    let even_odd = arg_usize(scope, args.get(2)) != 0;
+    let rgba = [
+        arg_usize(scope, args.get(3)) as u8,
+        arg_usize(scope, args.get(4)) as u8,
+        arg_usize(scope, args.get(5)) as u8,
+        arg_usize(scope, args.get(6)) as u8,
+    ];
+    crate::canvas::fill_path(id, &verbs, even_odd, rgba);
+}
+
+/// `__pt_canvasStrokePath(id, verbsF32, lineWidth, r, g, b, a)` — stroke a path.
+#[cfg(feature = "render")]
+fn canvas_stroke_path(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let verbs = arg_f32s(args.get(1));
+    let line_width = arg_f32(scope, args.get(2));
+    let rgba = [
+        arg_usize(scope, args.get(3)) as u8,
+        arg_usize(scope, args.get(4)) as u8,
+        arg_usize(scope, args.get(5)) as u8,
+        arg_usize(scope, args.get(6)) as u8,
+    ];
+    crate::canvas::stroke_path(id, &verbs, line_width, rgba);
 }
 
 /// `__pt_canvasPutImageData(id, x, y, w, h, data)` — overwrite from straight-alpha RGBA.

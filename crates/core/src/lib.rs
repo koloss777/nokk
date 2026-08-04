@@ -2827,4 +2827,45 @@ mod tests {
             "measureText advance should be a real width, got {w}"
         );
     }
+
+    // A filled arc (the classic canvas-fingerprint shape) must rasterize to a real
+    // disc of pixels via native paths — not the deterministic bbox stamp.
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn render_canvas_fill_arc_makes_a_real_disc() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        let probe = r#"(() => {
+            const c = document.createElement('canvas'); c.width = 40; c.height = 40;
+            const g = c.getContext('2d');
+            g.fillStyle = '#00ff00';
+            g.beginPath(); g.arc(20, 20, 15, 0, 2 * Math.PI); g.fill();
+            const d = g.getImageData(0, 0, 40, 40).data;
+            const at = (x, y) => d[(y * 40 + x) * 4 + 3]; // alpha
+            let green = 0;
+            for (let i = 0; i < d.length; i += 4) if (d[i + 1] > 100 && d[i + 3] > 0) green++;
+            return JSON.stringify({ center: at(20, 20), corner: at(1, 1), green });
+        })()"#;
+        let out = match ctx.evaluate(probe).await.unwrap() {
+            Value::String(s) => s,
+            v => panic!("expected string, got {v:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            v["center"].as_u64().unwrap() > 0,
+            "arc center must be filled"
+        );
+        assert_eq!(
+            v["corner"].as_u64().unwrap(),
+            0,
+            "outside the disc stays transparent"
+        );
+        // A r=15 disc is ~700px; well above any bbox-stamp artifact.
+        assert!(
+            v["green"].as_u64().unwrap() > 500,
+            "filled disc must be green pixels, got {}",
+            v["green"]
+        );
+    }
 }

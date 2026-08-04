@@ -8,14 +8,16 @@
 //! per worker thread, so a per-thread store needs no locking and can't leak across
 //! contexts on other threads. The JS layer calls the `__pt_canvas*` natives that
 //! wrap these. Covered here: fills, real glyph text (`fill_text`/`measure_text`
-//! via a bundled font), image data put/get. Paths and gradients still fall back to
-//! the JS deterministic stamp; WebGL is a separate phase.
+//! via a bundled font), vector paths (`fill_path`/`stroke_path` — the JS side
+//! tessellates curves/arcs to a move/line/close verb stream), and image data
+//! put/get. Gradients and `drawImage` still fall back to the JS deterministic
+//! stamp; WebGL is a separate phase.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
-use tiny_skia::{Paint, Pixmap, Rect, Transform};
+use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
 
 /// Bundled Liberation Sans (OFL, Arial-metric) — a plausible default sans for a
 /// Linux Chrome profile, so `fillText` glyphs are real *and* deterministic.
@@ -71,6 +73,72 @@ pub fn clear_rect(id: u32, x: f32, y: f32, w: f32, h: f32) {
             if let Some(rect) = Rect::from_xywh(x, y, w, h) {
                 pm.fill_rect(rect, &paint, Transform::identity(), None);
             }
+        }
+    });
+}
+
+/// Build a [`tiny_skia::Path`] from a flat verb stream: `0,x,y` = moveTo,
+/// `1,x,y` = lineTo, `4` = close. Curves and arcs are tessellated to line
+/// segments on the JS side, so this stays a simple, robust decoder.
+fn path_from_verbs(verbs: &[f32]) -> Option<tiny_skia::Path> {
+    let mut pb = PathBuilder::new();
+    let mut i = 0;
+    while i < verbs.len() {
+        match verbs[i].round() as i32 {
+            0 if i + 2 < verbs.len() => {
+                pb.move_to(verbs[i + 1], verbs[i + 2]);
+                i += 3;
+            }
+            1 if i + 2 < verbs.len() => {
+                pb.line_to(verbs[i + 1], verbs[i + 2]);
+                i += 3;
+            }
+            4 => {
+                pb.close();
+                i += 1;
+            }
+            _ => break, // unknown/truncated verb — stop rather than misread
+        }
+    }
+    pb.finish()
+}
+
+/// `fill()` a tessellated path with a straight-alpha RGBA color. `even_odd`
+/// selects the fill rule (canvas `'evenodd'` vs default nonzero winding).
+pub fn fill_path(id: u32, verbs: &[f32], even_odd: bool, rgba: [u8; 4]) {
+    let Some(path) = path_from_verbs(verbs) else {
+        return;
+    };
+    CANVASES.with(|c| {
+        if let Some(pm) = c.borrow_mut().get_mut(&id) {
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
+            paint.anti_alias = true;
+            let rule = if even_odd {
+                FillRule::EvenOdd
+            } else {
+                FillRule::Winding
+            };
+            pm.fill_path(&path, &paint, rule, Transform::identity(), None);
+        }
+    });
+}
+
+/// `stroke()` a tessellated path with `line_width` and a straight-alpha color.
+pub fn stroke_path(id: u32, verbs: &[f32], line_width: f32, rgba: [u8; 4]) {
+    let Some(path) = path_from_verbs(verbs) else {
+        return;
+    };
+    CANVASES.with(|c| {
+        if let Some(pm) = c.borrow_mut().get_mut(&id) {
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
+            paint.anti_alias = true;
+            let stroke = Stroke {
+                width: line_width.max(0.0),
+                ..Stroke::default()
+            };
+            pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
         }
     });
 }
@@ -251,6 +319,23 @@ mod tests {
             "glyph 'H' must cover real pixels, got {opaque}"
         );
         destroy(2);
+    }
+
+    #[test]
+    fn fill_path_triangle_covers_interior() {
+        create(3, 20, 20);
+        // A filled triangle: (2,2) (18,2) (10,18).
+        let verbs = [0.0, 2.0, 2.0, 1.0, 18.0, 2.0, 1.0, 10.0, 18.0, 4.0];
+        fill_path(3, &verbs, false, [0, 0, 255, 255]);
+        // Center of mass ~ (10, 7) is inside; a far corner is outside.
+        let inside = get_image_data(3, 10, 7, 1, 1);
+        let corner = get_image_data(3, 0, 19, 1, 1);
+        assert!(
+            inside[3] > 0 && inside[2] > 100,
+            "interior filled blue, got {inside:?}"
+        );
+        assert_eq!(corner[3], 0, "outside the triangle stays transparent");
+        destroy(3);
     }
 
     #[test]
