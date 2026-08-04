@@ -9,6 +9,12 @@ repository.workspace = true
 keywords = ["headless-browser", "stealth", "scraping", "cli", "puppeteer"]
 categories = ["command-line-utilities", "web-programming"]
 
+[features]
+default = []
+# `cargo build --release --bin nokk --features render` → real off-screen canvas
+# rasterization (docs/rendering.md). Off by default; the standard binary stays light.
+render = ["nokk/render"]
+
 [[bin]]
 name = "nokk"
 path = "src/main.rs"

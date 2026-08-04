@@ -9,6 +9,12 @@ repository.workspace = true
 keywords = ["headless-browser", "stealth", "anti-bot", "fingerprint", "scraping"]
 categories = ["web-programming", "emulators"]
 
+[features]
+default = []
+# Opt-in real off-screen canvas rasterization (docs/rendering.md); forwarded to
+# nokk-pool. Off by default so the standard build stays light.
+render = ["nokk-pool/render"]
+
 [dependencies]
 nokk-pool = { workspace = true }
 nokk-net = { workspace = true }

@@ -37,6 +37,102 @@ pub fn install(scope: &mut v8::HandleScope) {
     bind(scope, "__pt_aesgcm", aes_gcm_op);
     bind(scope, "__pt_aescbc", aes_cbc_op);
     bind(scope, "__pt_pngDataUrl", png_data_url);
+
+    // Optional real 2D rasterization (the `render` feature). Their presence is the
+    // signal the JS canvas checks to use real pixels instead of synthesis.
+    #[cfg(feature = "render")]
+    {
+        bind(scope, "__pt_canvasCreate", canvas_create);
+        bind(scope, "__pt_canvasDestroy", canvas_destroy);
+        bind(scope, "__pt_canvasFillRect", canvas_fill_rect);
+        bind(scope, "__pt_canvasClearRect", canvas_clear_rect);
+        bind(scope, "__pt_canvasGetImageData", canvas_get_image_data);
+    }
+}
+
+#[cfg(feature = "render")]
+fn arg_f32(scope: &mut v8::HandleScope, value: v8::Local<v8::Value>) -> f32 {
+    value.number_value(scope).unwrap_or(0.0) as f32
+}
+
+/// `__pt_canvasCreate(id, w, h)`
+#[cfg(feature = "render")]
+fn canvas_create(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::canvas::create(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_usize(scope, args.get(1)) as u32,
+        arg_usize(scope, args.get(2)) as u32,
+    );
+}
+
+/// `__pt_canvasDestroy(id)`
+#[cfg(feature = "render")]
+fn canvas_destroy(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::canvas::destroy(arg_usize(scope, args.get(0)) as u32);
+}
+
+/// `__pt_canvasFillRect(id, x, y, w, h, r, g, b, a)`
+#[cfg(feature = "render")]
+fn canvas_fill_rect(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let id = arg_usize(scope, args.get(0)) as u32;
+    let (x, y, w, h) = (
+        arg_f32(scope, args.get(1)),
+        arg_f32(scope, args.get(2)),
+        arg_f32(scope, args.get(3)),
+        arg_f32(scope, args.get(4)),
+    );
+    let rgba = [
+        arg_usize(scope, args.get(5)) as u8,
+        arg_usize(scope, args.get(6)) as u8,
+        arg_usize(scope, args.get(7)) as u8,
+        arg_usize(scope, args.get(8)) as u8,
+    ];
+    crate::canvas::fill_rect(id, x, y, w, h, rgba);
+}
+
+/// `__pt_canvasClearRect(id, x, y, w, h)`
+#[cfg(feature = "render")]
+fn canvas_clear_rect(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::canvas::clear_rect(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_f32(scope, args.get(1)),
+        arg_f32(scope, args.get(2)),
+        arg_f32(scope, args.get(3)),
+        arg_f32(scope, args.get(4)),
+    );
+}
+
+/// `__pt_canvasGetImageData(id, x, y, w, h)` → straight-alpha RGBA `Uint8Array`.
+#[cfg(feature = "render")]
+fn canvas_get_image_data(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let bytes = crate::canvas::get_image_data(
+        arg_usize(scope, args.get(0)) as u32,
+        arg_usize(scope, args.get(1)) as u32,
+        arg_usize(scope, args.get(2)) as u32,
+        arg_usize(scope, args.get(3)) as u32,
+        arg_usize(scope, args.get(4)) as u32,
+    );
+    set_bytes(scope, &mut rv, &bytes);
 }
 
 fn bind(scope: &mut v8::HandleScope, name: &str, cb: impl v8::MapFnTo<v8::FunctionCallback>) {

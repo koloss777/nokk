@@ -21,6 +21,8 @@ use std::thread::JoinHandle;
 
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
+#[cfg(feature = "render")]
+mod canvas;
 mod isolate;
 mod natives;
 

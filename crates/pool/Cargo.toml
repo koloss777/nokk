@@ -9,10 +9,20 @@ repository.workspace = true
 keywords = ["v8", "isolate", "concurrency", "browser", "pool"]
 categories = ["concurrency", "web-programming"]
 
+[features]
+default = []
+# Opt-in real off-screen rasterization: back the JS canvas with a real tiny-skia
+# 2D rasterizer (genuine getImageData/toDataURL pixels) instead of the default JS
+# synthesis. Heavier build; see docs/rendering.md. Not on by default.
+render = ["dep:tiny-skia"]
+
 [dependencies]
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+
+# Real 2D rasterizer for the optional `render` feature (pure Rust, no GPU).
+tiny-skia = { version = "0.11", optional = true }
 
 # Embedded JavaScript engine (Phase 1). Uses a prebuilt V8 static library, so it
 # does not compile V8 from source. One `v8::OwnedIsolate` lives per worker thread.
