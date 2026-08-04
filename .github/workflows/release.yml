@@ -99,7 +99,7 @@ jobs:
           tags: ${{ steps.meta_distroless.outputs.tags }}
           labels: ${{ steps.meta_distroless.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=max,ignore-error=true
 
       # Debian variant (has a shell for debugging): :debian + :<version>-debian.
       - name: Build and push (debian)
@@ -112,4 +112,4 @@ jobs:
             ghcr.io/${{ github.repository }}:debian
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}-debian
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=max,ignore-error=true
