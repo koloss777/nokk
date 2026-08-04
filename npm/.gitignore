@@ -1,0 +1,5 @@
+# Downloaded at install time, never committed / published from git
+/vendor/
+/node_modules/
+/dist/
+*.tgz

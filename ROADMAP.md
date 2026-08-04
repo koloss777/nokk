@@ -277,10 +277,13 @@ value-to-effort:
   document it.*
 - ⬜ **docs.rs** (Rust API docs). Free and automatic once on crates.io; needs the public
   API documented and a `[package.metadata.docs.rs]` config for the heavy build deps.
-- ⬜ **npm** (Node) — likely the **highest-value** channel, since the primary driver is
-  Puppeteer/Playwright (JS). Ship a package that bundles/downloads the right prebuilt
-  binary per platform and exposes `launch()` → a `browserWSEndpoint` to `puppeteer.connect`
-  / `chromium.connectOverCDP`. `npx nokk` starts the server.
+- 🟡 **npm** (Node) — the **highest-value** channel (primary driver is Puppeteer/Playwright).
+  **Scaffolded** in [`npm/`](npm/): a package that **downloads the prebuilt binary on install**
+  (postinstall pulls the matching GitHub Release asset) and exposes `launch(opts)` →
+  `server.wsEndpoint` for `puppeteer.connect` / `chromium.connectOverCDP`, plus `npx nokk` to
+  run the server and a `.d.ts`. Launcher **validated end-to-end** against a local binary.
+  Remaining: `npm publish` (manual first, then a tag-triggered publish workflow with npm
+  provenance/OIDC), and macOS/Windows binaries for those platforms (Linux x64 only today).
 - 🟡 **PyPI** (`pip`) — **published**: [`pip install nokk`](https://pypi.org/project/nokk/)
   works (name claimed, `0.1.18a1` live). A thin launcher wheel in [`python/`](python/) bundles
   the binary (the `ruff`/`uv` pattern), built with `maturin` (`bindings = "bin"`,

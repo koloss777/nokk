@@ -1,0 +1,33 @@
+{
+  "name": "nokk",
+  "version": "0.1.20-alpha",
+  "description": "Undetectable headless-browser engine — a lightweight, Chrome-fingerprinted CDP server for Puppeteer/Playwright scraping. npm install and connect, no browser download.",
+  "keywords": [
+    "scraping",
+    "web-scraping",
+    "puppeteer",
+    "playwright",
+    "cdp",
+    "chrome-devtools-protocol",
+    "headless-browser",
+    "browser-automation",
+    "stealth",
+    "anti-bot",
+    "fingerprint",
+    "ja3",
+    "cloudflare"
+  ],
+  "license": "(MIT OR Apache-2.0)",
+  "author": "koloss777",
+  "homepage": "https://github.com/koloss777/nokk",
+  "repository": { "type": "git", "url": "git+https://github.com/koloss777/nokk.git" },
+  "bugs": { "url": "https://github.com/koloss777/nokk/issues" },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "bin": { "nokk": "bin/nokk.js" },
+  "files": ["index.js", "index.d.ts", "install.js", "bin/", "README.md"],
+  "scripts": { "postinstall": "node install.js" },
+  "engines": { "node": ">=16" },
+  "os": ["linux"],
+  "cpu": ["x64"]
+}
