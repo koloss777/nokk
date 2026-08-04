@@ -137,10 +137,19 @@ Move to native (Rust):
   own properties, `[native code]`, and spec-shaped rejections. Pinned by known-answer
   vectors, so a page that digests a known input and checks the result sees what Chrome
   would; verified live in a page using `crypto.subtle` + `TextEncoder`.
-- ⬜ **Hot / most-probed DOM + graphics methods as native functions** — at minimum the
-  ones fingerprinters read (`getContext`, `getParameter`, `toDataURL`, `getImageData`,
-  `querySelector`), so `Function.prototype.toString` on them is `[native code]` without
-  a masking layer. (Interim: the Phase 6 toString mask above.)
+- 🟡 **Hot / most-probed DOM + graphics methods as native functions** — deprioritized:
+  an empirical probe (2026-08) shows the Phase-6 toString mask already reports
+  `[native code]` for `getContext`/`querySelector`/`getParameter` and survives the
+  self-reference bypass (`Function.prototype.toString.call(toString)`), so moving them to
+  native Rust is marginal. The measured real tell is missing **Web Workers / OffscreenCanvas**
+  (`typeof Worker === "undefined"`) — a single-threaded Worker/OffscreenCanvas shim is the
+  high-value passive-stealth item instead.
+- ⬜ **Optional real rendering (`render` Cargo feature)** — off-screen canvas-2D + WebGL
+  **rasterization** (tiny-skia + cosmic-text/bundled fonts; glow/EGL or SwiftShader), bridged
+  via `natives.rs`, **off by default** so the standard build stays light and a
+  `--features render` build produces genuine pixels for harder anti-bot. Necessary-but-not-
+  sufficient for interactive Turnstile (still needs Workers + iframe execution). Full spec:
+  [docs/rendering.md](docs/rendering.md).
 
 Keep in JS (the advantage is real):
 - Environment assembly (navigator/window/screen/timers), the virtual-time event loop,
