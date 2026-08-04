@@ -25,7 +25,10 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 mod canvas;
 mod isolate;
 mod natives;
+// Some GL ops (viewport, …) are the API surface the `__pt_gl*` natives wire next;
+// allow them ahead of that so the backend can land and be tested on its own.
 #[cfg(feature = "webgl")]
+#[allow(dead_code)]
 mod webgl;
 
 pub use isolate::Isolate;
