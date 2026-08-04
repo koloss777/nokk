@@ -1,0 +1,48 @@
+name: npm-publish
+
+# Publish the Node launcher package (@koloss777/nokk) to npm on a v* tag, the same
+# way python-wheels publishes to PyPI. Uses npm **trusted publishing (OIDC)** — no
+# long-lived token — plus provenance. Configure the trusted publisher on npm once:
+# npmjs.com → the package → Settings → Trusted Publisher → GitHub Actions
+# (repository koloss777/nokk, workflow npm-publish.yml).
+#
+# The package only carries the launcher (~5 kB); it downloads the matching prebuilt
+# binary from the GitHub Release at install time, so this job just needs the version
+# to line up with the release tag.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: read
+      id-token: write # OIDC for npm trusted publishing + provenance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      # npm >= 11.5.1 is needed for OIDC trusted publishing.
+      - name: Use a recent npm
+        run: npm install -g npm@latest
+
+      # Tag v0.1.21-alpha -> npm version 0.1.21-alpha (valid semver prerelease).
+      - name: Sync package version to the tag
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          cd npm && npm version "$V" --no-git-tag-version --allow-same-version
+
+      - name: Publish
+        run: cd npm && npm publish --access public --provenance --tag latest
