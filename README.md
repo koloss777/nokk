@@ -8,8 +8,9 @@ Real V8 JavaScript and a full DOM, with a Chrome TLS/HTTP fingerprint and JS-lev
 stealth — driven over the Chrome DevTools Protocol, so your existing Puppeteer code
 just connects. No Chromium process, no rendering, no `navigator.webdriver`.
 
-Also usable from **Python** — `pip install nokk` (embeds the binary, no browser download) —
-and as an **MCP server**, to give an AI agent a stealth browser.
+Also usable from **Node** (`npm install @koloss777/nokk`) and **Python** (`pip install nokk`) —
+each ships the prebuilt binary, no browser download — and as an **MCP server**, to give an
+AI agent a stealth browser.
 
 <sub><i>The nøkk is a shapeshifting water-spirit of Norse myth that takes on a
 familiar shape to pass unnoticed. This one takes the shape of Chrome.</i></sub>
@@ -17,6 +18,7 @@ familiar shape to pass unnoticed. This one takes the shape of Chrome.</i></sub>
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![PyPI](https://img.shields.io/pypi/v/nokk.svg)](https://pypi.org/project/nokk/)
+[![npm](https://img.shields.io/npm/v/@koloss777/nokk.svg)](https://www.npmjs.com/package/@koloss777/nokk)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-yellow.svg)](#project-status)
 
 </div>
