@@ -153,8 +153,17 @@ Effort: **medium-high** (glow) to **high** (SwiftShader).
    font, wired through `natives.rs` (`__pt_canvas*`) and the JS canvas surface.
    Fills, real glyph text, and image data put/get/toDataURL; biggest bang for the
    buck, no GPU/FFI.
-2. **Phase 2 — WebGL (`render`).** glow + headless GL (Mesa software for
-   determinism, or host GPU). `readPixels` real; keep params coherent.
+2. **Phase 2 — WebGL (`webgl` feature). 🚧 in progress.** Real headless GL via
+   **surfaceless EGL + Mesa software** (`glow` + `khronos-egl` dynamic), in
+   [crates/pool/src/webgl.rs](../crates/pool/src/webgl.rs). Separate feature from
+   `render` because it links a GL stack; EGL is loaded at runtime, so it *builds*
+   anywhere but only *runs* where Mesa/EGL is present. Landed: surfaceless context
+   + off-screen RGBA8 FBO + `clear`/`readPixels` (real pixels, row-flipped to
+   canvas origin), tested in a Mesa container and in CI (`render-tests.yml`). Next:
+   shader compile/link, buffers/attribs, `drawArrays`/`drawElements`, then the JS
+   WebGL context wiring. **Coherence:** Mesa reports `llvmpipe` (a headless tell),
+   so the stealth layer keeps *reporting* a plausible GPU string and only borrows
+   llvmpipe's pixels — a claimed-vs-actual mismatch that only a deep probe catches.
 3. **Phase 3 — SwiftShader (optional, `render-swiftshader`?).** Closest Chrome
    match, C++ FFI. Only if the Chrome-exactness matters.
 4. **Distribution.** Build + release `nokk-render` artifacts / `:render` Docker

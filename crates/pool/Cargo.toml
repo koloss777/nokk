@@ -15,6 +15,11 @@ default = []
 # 2D rasterizer (genuine getImageData/toDataURL pixels) instead of the default JS
 # synthesis. Heavier build; see docs/rendering.md. Not on by default.
 render = ["dep:tiny-skia", "dep:ab_glyph"]
+# Opt-in real WebGL: back the JS WebGL context with a headless Mesa GL context
+# (surfaceless EGL). Separate from `render` because it links a real GL stack;
+# EGL is loaded dynamically, so it *builds* anywhere but only *runs* where Mesa/EGL
+# is installed (see docs/rendering.md). Heaviest option; not on by default.
+webgl = ["dep:glow", "dep:khronos-egl", "dep:libloading"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -26,6 +31,12 @@ thiserror = { workspace = true }
 # deterministic glyphs.
 tiny-skia = { version = "0.11", optional = true }
 ab_glyph = { version = "0.2", optional = true }
+
+# Headless GL stack for the optional `webgl` feature. `khronos-egl` in `dynamic`
+# mode loads libEGL at runtime (no build-time GL needed); `glow` is the GL API.
+glow = { version = "0.14", optional = true }
+khronos-egl = { version = "6", features = ["dynamic"], optional = true }
+libloading = { version = "0.8", optional = true }
 
 # Embedded JavaScript engine (Phase 1). Uses a prebuilt V8 static library, so it
 # does not compile V8 from source. One `v8::OwnedIsolate` lives per worker thread.

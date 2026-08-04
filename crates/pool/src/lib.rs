@@ -25,6 +25,8 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 mod canvas;
 mod isolate;
 mod natives;
+#[cfg(feature = "webgl")]
+mod webgl;
 
 pub use isolate::Isolate;
 

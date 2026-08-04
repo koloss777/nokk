@@ -1,0 +1,64 @@
+name: render-tests
+
+# Exercises the opt-in rendering features, which the default CI never builds:
+#   * render (2D)  — tiny-skia + ab_glyph rasterizer (fills, text, paths, gradients)
+#   * webgl        — headless Mesa GL context (surfaceless EGL), real readPixels
+# Runs on changes that touch the rasterizer, its natives, or the JS canvas wiring.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/pool/**"
+      - "crates/stealth/src/lib.rs"
+      - "crates/core/src/lib.rs"
+      - ".github/workflows/render-tests.yml"
+  pull_request:
+    paths:
+      - "crates/pool/**"
+      - "crates/stealth/src/lib.rs"
+      - "crates/core/src/lib.rs"
+  workflow_dispatch:
+
+jobs:
+  # Rasterizer + WebGL unit tests. Pool has no BoringSSL dependency, so this stays
+  # a light job — it just needs Mesa for the surfaceless-EGL WebGL test.
+  pool-render:
+    name: pool rasterizer + webgl (Mesa)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Mesa (headless GL for the webgl feature)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1-mesa-dri libglx-mesa0
+
+      - name: Test — render (2D) + webgl
+        env:
+          EGL_PLATFORM: surfaceless
+        run: |
+          cargo test -p nokk-pool --features render canvas
+          cargo test -p nokk-pool --features webgl webgl -- --nocapture
+
+  # End-to-end: JS canvas ops -> native rasterizer, through the engine. Needs the
+  # BoringSSL build toolchain (nokk -> nokk-net), matching release.yml's bootstrap.
+  engine-render:
+    name: engine render integration (2D)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build deps (clang/cmake for BoringSSL)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang libclang-dev pkg-config
+          pip3 install --user cmake       # apt cmake (3.18) < BoringSSL req (3.22)
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Test — engine render (fillText/paths/gradients -> pixels)
+        run: |
+          export LIBCLANG_PATH="$(dirname "$(find /usr/lib -name 'libclang.so*' | head -1)")"
+          cargo test -p nokk --features render render_canvas
