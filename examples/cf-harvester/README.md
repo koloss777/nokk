@@ -15,12 +15,15 @@ hands the `cf_clearance` cookie to nokk to **replay**.
 > **HTTP 200** past a live managed-Turnstile site. See [docs/RESEARCH.md](docs/RESEARCH.md).
 >
 > **The auto-click works** — verified solving a live managed Turnstile autonomously. It
-> walks the shadow DOM to find the `.cf-turnstile` container and clicks the checkbox by
-> coordinate with a real `Input` mouse event (`isTrusted`). It can still miss if a site
-> positions the widget unusually or uses a closed shadow root with no locatable container;
-> a **manual click** in the opened window is the fallback (the poll loop picks up the
-> cookie either way). Use `--headless` at your own risk — managed challenges are far more
-> reliable headful (run under Xvfb on a server).
+> locates the widget through the CDP **DOM** domain (`DOM.getDocument(pierce=True)` +
+> `DOM.getBoxModel`) and clicks the checkbox by coordinate with a real `Input` mouse
+> event (`isTrusted`). Piercing matters: Cloudflare renders the widget inside a
+> **closed** shadow root, where `element.shadowRoot` is null, so a JS walker sees zero
+> iframes and only the hidden 0x0 `input#cf-chl-widget-*_response` — the JS probe is
+> kept as a fallback for layouts without the iframe. A **manual click** in the opened
+> window still works if both miss (the poll loop picks up the cookie either way). Use
+> `--headless` at your own risk — managed challenges are far more reliable headful
+> (run under Xvfb on a server).
 
 ## The hybrid, and why not “solve it in nokk”
 

@@ -71,6 +71,48 @@ _DOM_PROBE_JS = (
 )
 
 
+# Seconds to wait before re-clicking the widget. The CDP locator now hits the
+# real checkbox rather than a phantom 0x0 box, so a missed click is rare and the
+# long settle time mostly showed up as dead waiting: harvests took ~30 s where
+# the challenge itself resolves in a few.
+CLICK_COOLDOWN = 0.5
+
+
+def _node_attrs(node: dict) -> Dict[str, str]:
+    """CDP returns attributes as a flat [name, value, name, value, …] list."""
+    flat = node.get("attributes") or []
+    return dict(zip(flat[0::2], flat[1::2]))
+
+
+def _find_widget_node(node: dict) -> Optional[int]:
+    """Depth-first search for the Turnstile iframe in a `DOM.getDocument` tree.
+
+    Cloudflare renders the widget inside a **closed** shadow root, where
+    `element.shadowRoot` is null — so `_DOM_PROBE_JS` above cannot reach it and
+    reports zero iframes. Verified on loker.id: the JS probe saw only the hidden
+    0x0 `input#cf-chl-widget-*_response`, while `DOM.getDocument(pierce=True)`
+    showed `iframe#cf-chl-widget-*` one level inside a CLOSED root. The DOM
+    domain pierces closed roots, so the node is reachable here.
+    """
+    if (node.get("nodeName") or "").upper() == "IFRAME":
+        attrs = _node_attrs(node)
+        if attrs.get("id", "").startswith("cf-chl-widget") or (
+            "challenges.cloudflare.com" in attrs.get("src", "")
+        ):
+            return node.get("nodeId")
+
+    for key in ("children", "shadowRoots", "pseudoElements"):
+        for child in node.get(key) or []:
+            found = _find_widget_node(child)
+            if found:
+                return found
+
+    content = node.get("contentDocument")
+    if content:
+        return _find_widget_node(content)
+    return None
+
+
 @dataclass
 class ClearanceResult:
     """A harvested clearance — everything a consumer needs to *replay* it."""
@@ -195,6 +237,36 @@ async def harvest(
             last_click = 0.0
             last_sig = ""
 
+            async def _widget_box() -> Optional[dict]:
+                """Widget rect straight from the DOM domain (pierces closed roots).
+
+                Returns the same shape the JS probe produces, so the caller can
+                treat both sources identically.
+                """
+                if not page_session:
+                    return None
+                doc = await cdp.call(
+                    "DOM.getDocument",
+                    {"depth": -1, "pierce": True},
+                    timeout=10,
+                    session_id=page_session,
+                )
+                node_id = _find_widget_node(doc.get("root") or {})
+                if not node_id:
+                    return None
+                box = await cdp.call(
+                    "DOM.getBoxModel", {"nodeId": node_id}, timeout=5,
+                    session_id=page_session,
+                )
+                quad = (box.get("model") or {}).get("border") or []
+                if len(quad) < 8:
+                    return None
+                xs, ys = quad[0::2], quad[1::2]
+                w, h = max(xs) - min(xs), max(ys) - min(ys)
+                if w <= 0 or h <= 0:
+                    return None
+                return {"x": min(xs), "y": min(ys), "w": w, "h": h, "tag": "iframe(cdp)"}
+
             async def _probe_dom() -> dict:
                 res = await cdp.call(
                     "Runtime.evaluate",
@@ -225,7 +297,7 @@ async def harvest(
                 if not (auto_click and page_session):
                     return
                 now = loop.time()
-                if now - last_click < 12:  # let a click settle before retrying
+                if now - last_click < CLICK_COOLDOWN:  # let a click settle before retrying
                     return
 
                 dom = await _probe_dom()
@@ -245,8 +317,12 @@ async def harvest(
                         _log(f"  el <{c['tag']}> {c['w']:.0f}x{c['h']:.0f} @({c['x']:.0f},{c['y']:.0f}) "
                              f"id={c.get('id','')!r} cls={c.get('cls','')!r} role={c.get('role','')!r}")
 
-                # Prefer a visible iframe (the real widget); else a visible container.
-                target = _pick_widget(frames)
+                # The DOM domain sees through the closed shadow root the widget
+                # lives in, so it is the reliable source; the JS probe below is
+                # the fallback for layouts where the iframe is absent.
+                target = await _widget_box()
+                if not target:
+                    target = _pick_widget(frames)
                 if not target:
                     visible = [c for c in conts if c["w"] > 0 and c["h"] > 0]
                     target = visible[0] if visible else next((c for c in conts if c["w"] > 0), None)
