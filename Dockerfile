@@ -44,9 +44,12 @@ CMD ["--host", "0.0.0.0", "--port", "9222"]
 # the swrast DRI driver); without it the engine silently falls back to the JS
 # synthesis, so the packages are the whole point of this image.
 FROM debian:bookworm-slim AS render
+# No libglx-mesa0: the backend talks surfaceless EGL, never GLX. The bulk of what
+# is left is libLLVM (~112 MB) — llvmpipe JITs shaders through it, so it is the
+# renderer, not overhead that can be trimmed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libstdc++6 \
-        libegl1 libgl1-mesa-dri libglx-mesa0 \
+        libegl1 libgl1-mesa-dri \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build-render /src/target/release/nokk /usr/local/bin/nokk
 RUN useradd --system --uid 10001 --user-group nokk
