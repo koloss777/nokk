@@ -18,6 +18,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # annotated tag objects, for the release notes below
+
+      # What actually changed in *this* release comes from the tag's own
+      # annotation (`git tag -a v0.1.23-alpha -m '…'`), so the notes are written
+      # once, at the moment of tagging, by whoever knows what shipped — instead of
+      # the same boilerplate on every release. Empty for a lightweight tag, in
+      # which case the auto-generated commit list below carries the whole story.
+      - name: Release notes from the tag annotation
+        id: notes
+        run: |
+          git fetch --force --tags --depth=1 origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}" || true
+          {
+            echo "body<<NOKK_EOF"
+            git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME"
+            echo "NOKK_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       # Build inside Debian 11 (bullseye, glibc 2.31) so the binary runs on a broad
       # range of Linux — RHEL/Alma 9 (2.34), Ubuntu 20.04+, Debian 11+ — instead of
@@ -58,37 +75,25 @@ jobs:
             nokk-${{ github.ref_name }}-linux-x86_64.tar.gz
             nokk-render-${{ github.ref_name }}-linux-x86_64.tar.gz
           generate_release_notes: true
-          # SEO-oriented lead (keyword-rich); the auto-generated changelog is
-          # appended below it by generate_release_notes.
+          # One-line lead (what nokk is, for anyone landing here cold), then what
+          # *this* tag shipped, then run instructions. The commit changelog is
+          # appended underneath by generate_release_notes.
           body: |
-            **nokk ${{ github.ref_name }}** — an **undetectable headless browser engine** in
-            **Rust**: real **V8** JavaScript + a DOM with a coherent **Chrome TLS/HTTP
-            fingerprint (JA3/JA4)** and JS-level **anti-bot stealth**, driven over the
-            **Chrome DevTools Protocol** so existing **Puppeteer** code just connects. No
-            Chromium, no rendering. Good for **stealth web scraping**, **Cloudflare / anti-bot
-            bypass**, and high-concurrency automation with **per-context proxy rotation**.
+            An undetectable headless browser engine in Rust — real V8 + DOM behind a
+            coherent Chrome TLS/HTTP fingerprint (JA3/JA4), driven over CDP so existing
+            Puppeteer code just connects. No Chromium.
 
-            ### Run it
+            ## What's in ${{ github.ref_name }}
+
+            ${{ steps.notes.outputs.body }}
+
+            ## Run it
             ```bash
             docker run --rm -p 9222:9222 ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            # or the Linux x86_64 binary attached below
+            # :<version>-render for real canvas/WebGL pixels · or the binaries below
             ```
             Point Puppeteer at `ws://localhost:9222/devtools/browser/nokk`.
-
-            ### Real canvas / WebGL rasterization (optional)
-            The `nokk-render-*` binary and the `:render` image below carry the
-            opt-in rasterizers: a real `tiny-skia` canvas 2D and a genuine headless
-            WebGL context, so `toDataURL` / `getImageData` / `readPixels` return
-            true pixels instead of a synthesized pattern. The `:render` image ships
-            the Mesa stack WebGL needs; the standalone binary needs `libegl1` +
-            `libgl1-mesa-dri` on the host for WebGL (canvas 2D needs nothing).
-            ```bash
-            docker run --rm -p 9222:9222 ghcr.io/${{ github.repository }}:${{ github.ref_name }}-render
-            ```
-
-            > Keywords: undetectable headless browser · anti-bot bypass · Cloudflare bypass ·
-            > JA3/JA4 TLS fingerprint · browser fingerprint spoofing · stealth web scraping ·
-            > Puppeteer-compatible · headless Chrome alternative · Rust.
+            Full docs: [README](https://github.com/${{ github.repository }}#readme).
 
             ---
 

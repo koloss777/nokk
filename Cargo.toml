@@ -34,7 +34,11 @@ url = "2"
 # Chrome-fingerprinted HTTP client (Phase 2). BoringSSL-backed; emits a Chrome
 # ClientHello (JA3/JA4) + HTTP/2 fingerprint. Build needs cmake + libclang (see
 # docs/BUILD.md).
-wreq = { version = "6.0.0-rc.29", features = ["cookies"] }
+# `ws` adds the WebSocket upgrade to the *same* fingerprinted client, so a page's
+# socket carries the same JA3/JA4 and header order as its fetches (see
+# docs/websockets.md — two fingerprints from one "browser" is a louder tell than
+# no WebSocket at all).
+wreq = { version = "6.0.0-rc.29", features = ["cookies", "ws"] }
 wreq-util = "3.0.0-rc.14"
 
 # Async runtime

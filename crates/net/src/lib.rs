@@ -19,9 +19,11 @@ use serde::{Deserialize, Serialize};
 mod blocklist;
 mod geoip;
 mod session;
+mod websocket;
 pub use blocklist::{host_of, is_blocked, is_blocked_url};
 pub use geoip::{parse_geo, GeoInfo, GEO_LOOKUP_URL};
 pub use session::{CookieRecord, SessionJar};
+pub use websocket::{open as open_websocket, WsCommand, WsEvent, WsHandle};
 
 /// Errors from the network layer.
 #[derive(Debug, thiserror::Error)]
