@@ -81,15 +81,16 @@ docker run --rm ghcr.io/koloss777/nokk:latest --eval 'navigator.webdriver'   # -
 docker run --rm ghcr.io/koloss777/nokk:latest --load https://example.com --eval 'document.title'
 ```
 
-Two variants are published per release:
+Three variants are published per release:
 
 | Tag | Base | Notes |
 |-----|------|-------|
 | `:latest`, `:<version>`, `:distroless` | distroless | Smallest; no shell. The default. |
 | `:debian`, `:<version>-debian` | debian-slim | Larger, but has a shell for `docker exec` debugging. |
+| `:render`, `:<version>-render` | debian-slim + Mesa | **Real** canvas/WebGL pixels instead of synthesis — see [`docs/rendering.md`](docs/rendering.md). |
 
 Or build the image yourself from a checkout: `docker build -t nokk .` (add
-`--target debian` for the debian variant).
+`--target debian` or `--target render` for the other variants).
 
 ### Run the prebuilt binary
 
@@ -99,6 +100,10 @@ Grab the Linux x86_64 tarball from the [latest release](../../releases/latest):
 tar -xzf nokk-*-linux-x86_64.tar.gz
 ./nokk --eval 'navigator.webdriver'
 ```
+
+The release also carries `nokk-render-*-linux-x86_64.tar.gz`: the same engine with
+real canvas/WebGL rasterization compiled in. Canvas 2D works anywhere; WebGL needs
+Mesa on the host (`libegl1 libgl1-mesa-dri`) and falls back to synthesis without it.
 
 ### Build from source
 

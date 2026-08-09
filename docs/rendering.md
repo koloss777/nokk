@@ -36,22 +36,20 @@ Default nokk must stay light and dependency-thin. Real rendering pulls in a 2D
 rasterizer, font stack, and a GL backend — weight and build cost that most users
 (scraping JS apps, passive fingerprinting) don't need.
 
-So it is a **Cargo feature**, off by default:
+So they are **Cargo features**, off by default — `render` (canvas 2D, pure Rust)
+and `webgl` (a real GL stack), split because only the second one needs anything
+installed at runtime:
 
-```toml
-# crates/dom/Cargo.toml
-[features]
-default = []
-render = ["dep:tiny-skia", "dep:cosmic-text", "dep:glow", "dep:glutin"]   # etc.
-```
+- `cargo build --release --bin nokk` → light (synthesis, the default behavior)
+- `cargo build --release -p nokk-cli --features render,webgl --bin nokk` → real
+  canvas/WebGL rasterization
 
-- `cargo build --release --bin nokk`                     → light (synthesis, today's behavior)
-- `cargo build --release --bin nokk --features render`   → real canvas/WebGL rasterization
-
-Two release artifacts (`nokk` and `nokk-render`), two Docker tags
-(`:latest` / `:render`), and — for npm/pip — an env/flag to pick which binary the
-launcher downloads. The JS/DOM surface is identical either way; only the pixel
-backend differs.
+Both ship from a tag: a second release binary `nokk-render-<tag>-linux-x86_64.tar.gz`
+and a second image tag (`ghcr.io/…:render` / `:<version>-render`, which carries the
+Mesa runtime `webgl` dlopen's). The JS/DOM surface is identical either way; only
+the pixel backend differs — and where Mesa is absent, the WebGL half falls back to
+the synthesis on its own. Still open: teaching the npm/pip launchers to select the
+render binary.
 
 ## Where the seam goes
 
@@ -188,8 +186,11 @@ Effort: **medium-high** (glow) to **high** (SwiftShader).
    catches.
 3. **Phase 3 — SwiftShader (optional, `render-swiftshader`?).** Closest Chrome
    match, C++ FFI. Only if the Chrome-exactness matters.
-4. **Distribution.** Build + release `nokk-render` artifacts / `:render` Docker
-   tag; teach the npm/pip launchers to select the render binary on request.
+4. **Distribution. 🟡 partial.** Done: every tag builds the `nokk-render` binary
+   artifact and pushes the `:render` image (Mesa included) alongside the light
+   ones — see `.github/workflows/release.yml` and the `render` stage in the
+   Dockerfile. Left: teach the npm/pip launchers to select the render binary on
+   request (an env var or install flag).
 
 ## Related
 

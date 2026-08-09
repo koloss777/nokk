@@ -36,10 +36,27 @@ jobs:
         run: |
           tar -czf "nokk-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" -C target/release nokk
 
+      # Second artifact: the same binary with the opt-in rasterizers compiled in
+      # (docs/rendering.md). `render` needs nothing extra at runtime; `webgl`
+      # dlopen's libEGL, so it only lights up where Mesa is installed (and falls
+      # back to the JS synthesis where it isn't). Built in the same bullseye
+      # container for the same broad glibc floor.
+      - name: Build render variant (--features render,webgl)
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w rust:1-bullseye bash -euo pipefail -c '
+            apt-get update -qq
+            apt-get install -y --no-install-recommends clang libclang-dev pkg-config python3-pip
+            pip3 install cmake
+            export LIBCLANG_PATH="$(dirname "$(find /usr/lib -name "libclang.so*" | head -1)")"
+            cargo build --release -p nokk-cli --features render,webgl --bin nokk'
+          tar -czf "nokk-render-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" -C target/release nokk
+
       - name: Publish to the Release
         uses: softprops/action-gh-release@v2
         with:
-          files: nokk-*-linux-x86_64.tar.gz
+          files: |
+            nokk-${{ github.ref_name }}-linux-x86_64.tar.gz
+            nokk-render-${{ github.ref_name }}-linux-x86_64.tar.gz
           generate_release_notes: true
           # SEO-oriented lead (keyword-rich); the auto-generated changelog is
           # appended below it by generate_release_notes.
@@ -57,6 +74,17 @@ jobs:
             # or the Linux x86_64 binary attached below
             ```
             Point Puppeteer at `ws://localhost:9222/devtools/browser/nokk`.
+
+            ### Real canvas / WebGL rasterization (optional)
+            The `nokk-render-*` binary and the `:render` image below carry the
+            opt-in rasterizers: a real `tiny-skia` canvas 2D and a genuine headless
+            WebGL context, so `toDataURL` / `getImageData` / `readPixels` return
+            true pixels instead of a synthesized pattern. The `:render` image ships
+            the Mesa stack WebGL needs; the standalone binary needs `libegl1` +
+            `libgl1-mesa-dri` on the host for WebGL (canvas 2D needs nothing).
+            ```bash
+            docker run --rm -p 9222:9222 ghcr.io/${{ github.repository }}:${{ github.ref_name }}-render
+            ```
 
             > Keywords: undetectable headless browser · anti-bot bypass · Cloudflare bypass ·
             > JA3/JA4 TLS fingerprint · browser fingerprint spoofing · stealth web scraping ·
@@ -111,5 +139,19 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}:debian
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}-debian
+          cache-from: type=gha
+          cache-to: type=gha,mode=max,ignore-error=true
+
+      # Render variant: the binary built with --features render,webgl plus the
+      # Mesa runtime the WebGL backend dlopen's. :render + :<version>-render.
+      - name: Build and push (render)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: render
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:render
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}-render
           cache-from: type=gha
           cache-to: type=gha,mode=max,ignore-error=true

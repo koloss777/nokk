@@ -150,6 +150,20 @@ Move to native (Rust):
   `OffscreenCanvas` maps to a detached `<canvas>`, reusing its 2D/WebGL contexts; `MessageEvent`
   added; `SharedWorker` present. All native-masked (`toString` → `[native code]`) and instances
   carry no own properties.
+- ⬜ **`WebSocket` in the page — the top gap, functional *and* passive.**
+  `typeof WebSocket === 'undefined'` today (verified against the live engine), so a
+  socket-driven app loads, executes, and then silently does nothing, while a
+  one-line probe separates us from every browser since 2011 — the same differential
+  tell canvas/WebGL spent months closing. Design decided in
+  [docs/websockets.md](docs/websockets.md): **the socket and its frame queues go in
+  Rust, the spec surface in JS.** The isolate has no I/O (JS can only enqueue and be
+  called back, exactly like `fetch`), and the upgrade *must* ride the same `wreq`
+  client — `client.websocket(uri)` behind wreq's `ws` feature — or one "browser"
+  presents two different TLS fingerprints, a louder tell than having no WebSocket.
+  The real work isn't the socket: it's teaching `pump_event_loop` that an open
+  socket means "not idle" and that server-pushed frames arrive unprompted, without
+  letting one context monopolise a shared worker. `EventSource` (also `undefined`)
+  rides the same rails afterwards. The sibling engine (obscura) hasn't got either.
 - 🟡 **Optional real rendering (`render` / `webgl` Cargo features)** — off-screen
   **rasterization** bridged via `natives.rs`, **off by default** so the standard build stays
   light and a feature build produces genuine pixels for harder anti-bot. `render` (2D, done):
@@ -168,6 +182,34 @@ Keep in JS (the advantage is real):
 
 ## Near-term: protocol & DOM completeness (Phase 5)
 
+The four entries below come from a field report against a live Akamai-protected,
+WebSocket-driven app — the run where nokk *cleared a challenge headless Chrome
+failed* and then couldn't use the session. They share one root cause worth fixing
+first.
+
+- ⬜ **Unknown CDP commands must not silently succeed.** `crates/cdp/src/server.rs`
+  ends its dispatch with `_ => ok(id, {})`, so every unimplemented method returns an
+  empty *success*. A client cannot tell "not implemented" from "nothing to report"
+  and waits forever, and Playwright crashes on the shape (`ctx.cookies()` →
+  `Cannot read properties of undefined (reading 'map')`, because `Network.getCookies`
+  answered `{}` with no `cookies` key). Return a proper `-32601` for methods we
+  don't implement, keeping an explicit allow-list of the harmless no-ops
+  (`Log.enable`, `Performance.enable`, …) that clients call for effect.
+- ⬜ **`Network` domain emits nothing.** `Network.enable` is in that no-op list, so
+  a 452 KB navigation with subresources produces zero `requestWillBeSent` /
+  `responseReceived`. Downstream, Playwright's `page.goto()` returns `None` — it
+  builds the response object from those events. The engine already records every
+  request (the interception audit trail); wire that into CDP events.
+- ⬜ **`Network.getCookies` / `Storage.getCookies` return real cookies**, HttpOnly
+  included. Today: unimplemented → `{}`. This is the only way to export a warmed
+  session (Akamai's `ak_bmsc`/`bm_s*`, a `cf_clearance`) to another process, and
+  `document.cookie` can't substitute — everything that matters is HttpOnly. The jar
+  is already there in `nokk-net`; this is plumbing.
+- ⬜ **`/json`, `/json/list`, `/json/new` return `[]`.** Only `/json/version` is
+  real; everything else matches `p if p.starts_with("/json") => json!([])`. Generic
+  CDP clients probe these, get an empty list, fall back to the browser endpoint, and
+  then send page-level commands with no `sessionId` — which vanish into the no-op
+  path above. Implement target listing/creation, or answer with an explicit error.
 - 🟡 **CDP registry lifecycle** — honor `removeScriptToEvaluateOnNewDocument` and
   `releaseObjectGroup`; bound per-connection registry growth.
 - ✅ **Puppeteer `page.$` / `$eval` / `$$eval`** — work now. The blocker was
