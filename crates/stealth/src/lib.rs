@@ -1144,6 +1144,149 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   if (!globalThis.TextEncoder) {
     globalThis.TextEncoder = class { encode(s) { s = String(s); const a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i) & 0xff; return a; } };
   }
+
+  // --- WebSocket ----------------------------------------------------------
+  // Same shape as fetch above: JS owns the object and its state machine, Rust
+  // owns the socket. Operations pile onto a queue the event loop drains
+  // (`__pt_drainWsQueue`), and everything the socket produces comes back in as
+  // `__pt_ws{Open,Message,Close,Error}`. See docs/websockets.md for why the
+  // connection itself cannot live here (no I/O in the isolate) nor in a separate
+  // client (it would present a second TLS fingerprint).
+  //
+  // Every field lives in a WeakMap rather than on the instance: WebIDL attributes
+  // are accessors on the prototype, so a real socket has *no* own properties and
+  // `Object.keys(ws)` is `[]`. Storing state on `this` would have been the same
+  // kind of tell as the object itself missing.
+  let wsid = 1;
+  const wsOps = [];
+  const wsLive = new Map();       // id -> socket
+  const wsState = new WeakMap();  // socket -> internals
+
+  const wsFire = (sock, type, evt) => {
+    const st = wsState.get(sock); if (!st) return;
+    evt = Object.assign({
+      target: sock, currentTarget: sock, srcElement: sock, isTrusted: true,
+      eventPhase: 2, bubbles: false, cancelable: false,
+      timeStamp: globalThis.performance ? performance.now() : 0,
+    }, evt);
+    const on = st['on' + type];
+    try { if (typeof on === 'function') on.call(sock, evt); } catch (e) {}
+    for (const fn of (st.listeners.get(type) || []).slice()) {
+      try { fn.call(sock, evt); } catch (e) {}
+    }
+  };
+
+  globalThis.__pt_drainWsQueue = () => wsOps.splice(0);
+  globalThis.__pt_wsOpen = (id, protocol) => {
+    const sock = wsLive.get(id); if (!sock) return;
+    const st = wsState.get(sock);
+    st.readyState = 1; st.protocol = String(protocol || '');
+    wsFire(sock, 'open', { type: 'open' });
+  };
+  globalThis.__pt_wsMessage = (id, data, isBinary) => {
+    const sock = wsLive.get(id); if (!sock) return;
+    const st = wsState.get(sock); if (st.readyState !== 1) return;
+    let payload = data;
+    if (isBinary) {
+      const bytes = new Uint8Array(data);
+      payload = st.binaryType === 'arraybuffer' ? bytes.buffer : new Blob([bytes]);
+    }
+    wsFire(sock, 'message', { type: 'message', data: payload, origin: st.origin, lastEventId: '', source: null, ports: [] });
+  };
+  globalThis.__pt_wsClose = (id, code, reason, clean) => {
+    const sock = wsLive.get(id); if (!sock) return;
+    wsLive.delete(id);
+    wsState.get(sock).readyState = 3;
+    wsFire(sock, 'close', { type: 'close', code: code | 0, reason: String(reason || ''), wasClean: !!clean });
+  };
+  globalThis.__pt_wsError = (id, msg) => {
+    const sock = wsLive.get(id); if (!sock) return;
+    wsLive.delete(id);
+    wsState.get(sock).readyState = 3;
+    wsFire(sock, 'error', { type: 'error', message: String(msg || '') });
+    // A failed connection is always paired with a close event, code 1006.
+    wsFire(sock, 'close', { type: 'close', code: 1006, reason: '', wasClean: false });
+  };
+
+  globalThis.WebSocket = class WebSocket {
+    constructor(url, protocols) {
+      if (arguments.length < 1) throw new TypeError("Failed to construct 'WebSocket': 1 argument required, but only 0 present.");
+      // ws:/wss: only. http(s) is upgraded as the URL parser does; anything else
+      // is a SyntaxError, exactly as in a browser.
+      const base = globalThis.location ? String(location.href) : 'https://localhost/';
+      let abs;
+      try { abs = new globalThis.URL(String(url), base).href; } catch (e) { abs = String(url); }
+      const scheme = String((/^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(abs) || [])[1] || '').toLowerCase();
+      if (scheme === 'http') abs = 'ws' + abs.slice(4);
+      else if (scheme === 'https') abs = 'wss' + abs.slice(5);
+      else if (scheme !== 'ws' && scheme !== 'wss') {
+        throw new SyntaxError("Failed to construct 'WebSocket': The URL's scheme must be either 'ws' or 'wss'. '" + scheme + ":' is not allowed.");
+      }
+      const list = protocols == null ? [] : (Array.isArray(protocols) ? protocols.map(String) : [String(protocols)]);
+      const id = wsid++;
+      wsState.set(this, {
+        id, url: abs, protocol: '', extensions: '', binaryType: 'blob',
+        bufferedAmount: 0, readyState: 0, listeners: new Map(),
+        origin: abs.replace(/^ws/, 'http').replace(/^([a-z]+:\/\/[^/]*).*$/, '$1'),
+        onopen: null, onmessage: null, onclose: null, onerror: null,
+      });
+      wsLive.set(id, this);
+      wsOps.push({ op: 'open', id, url: abs, protocols: list });
+    }
+    send(data) {
+      const st = wsState.get(this);
+      if (st.readyState === 0) {
+        const msg = "Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.";
+        throw (typeof DOMException === 'function' ? new DOMException(msg, 'InvalidStateError')
+          : Object.assign(new Error(msg), { name: 'InvalidStateError' }));
+      }
+      if (st.readyState !== 1) return;                       // closing/closed: dropped
+      if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+        const v = data instanceof ArrayBuffer ? new Uint8Array(data)
+          : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        wsOps.push({ op: 'send', id: st.id, bytes: Array.from(v) });
+      } else {
+        wsOps.push({ op: 'send', id: st.id, data: String(data) });
+      }
+    }
+    close(code, reason) {
+      const st = wsState.get(this);
+      if (st.readyState === 2 || st.readyState === 3) return;
+      st.readyState = 2;
+      wsOps.push({ op: 'close', id: st.id, code: code == null ? 1000 : (code | 0), reason: reason == null ? '' : String(reason) });
+    }
+    addEventListener(type, fn) {
+      if (typeof fn !== 'function') return;
+      const st = wsState.get(this), k = String(type);
+      if (!st.listeners.has(k)) st.listeners.set(k, []);
+      st.listeners.get(k).push(fn);
+    }
+    removeEventListener(type, fn) {
+      const l = wsState.get(this).listeners.get(String(type)); if (!l) return;
+      const i = l.indexOf(fn); if (i >= 0) l.splice(i, 1);
+    }
+    dispatchEvent(evt) { wsFire(this, evt && evt.type, evt); return true; }
+  };
+  // WebIDL attributes: accessors on the prototype (enumerable there, absent from
+  // the instance), so `Object.keys(ws)` is `[]` like a real socket's.
+  for (const name of ['url', 'protocol', 'extensions', 'readyState', 'bufferedAmount']) {
+    Object.defineProperty(globalThis.WebSocket.prototype, name, {
+      get: function () { const st = wsState.get(this); return st ? st[name] : undefined; },
+      enumerable: true, configurable: true,
+    });
+  }
+  for (const name of ['binaryType', 'onopen', 'onmessage', 'onclose', 'onerror']) {
+    Object.defineProperty(globalThis.WebSocket.prototype, name, {
+      get: function () { const st = wsState.get(this); return st ? st[name] : undefined; },
+      set: function (v) { const st = wsState.get(this); if (st) st[name] = v; },
+      enumerable: true, configurable: true,
+    });
+  }
+  for (const [k, v] of [['CONNECTING', 0], ['OPEN', 1], ['CLOSING', 2], ['CLOSED', 3]]) {
+    Object.defineProperty(globalThis.WebSocket, k, { value: v, enumerable: true });
+    Object.defineProperty(globalThis.WebSocket.prototype, k, { value: v, enumerable: true });
+  }
+
 })();"#;
 
 /// Deterministic canvas / WebGL / audio fingerprints + plugins + permissions +
@@ -2303,9 +2446,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     [globalThis, 'requestAnimationFrame'], [globalThis, 'cancelAnimationFrame'], [globalThis, 'requestIdleCallback'],
     [globalThis, 'XMLHttpRequest'], [globalThis, 'AudioContext'], [globalThis, 'Image'],
     [globalThis, 'getComputedStyle'], [globalThis, 'matchMedia'], [globalThis, 'TextEncoder'],
-    [globalThis, 'TextDecoder'], [globalThis, 'Blob'], [globalThis, 'FormData'], [globalThis, 'URL']]) {
+    [globalThis, 'TextDecoder'], [globalThis, 'Blob'], [globalThis, 'FormData'], [globalThis, 'URL'],
+    [globalThis, 'WebSocket']]) {
     if (obj[key]) mask(obj[key], key);
   }
+  // `send`/`close`/`addEventListener` on a socket must read native too — the
+  // class body is otherwise readable through `WebSocket.prototype.send.toString()`.
+  if (globalThis.WebSocket) maskProto(globalThis.WebSocket.prototype);
   // Real DOM/Web-API methods and accessors are all native — mark the ones on our
   // prototypes so `document.querySelector.toString()` and
   // `Object.getOwnPropertyDescriptor(Navigator.prototype,'userAgent').get.toString()`

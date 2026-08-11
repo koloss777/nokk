@@ -267,6 +267,12 @@ const FP_OWNED_HEADERS: &[&str] = &[
 ];
 
 impl FingerprintClient {
+    /// The underlying `wreq` client, so a WebSocket upgrade rides the same
+    /// emulation, cookie jar and proxy as every request (see [`crate::websocket`]).
+    pub(crate) fn inner(&self) -> &wreq::Client {
+        &self.inner
+    }
+
     /// The default Chrome profile we impersonate; must agree with the stealth JS
     /// profile (its UA / sec-ch-ua / `CHROME_MAJOR`). Newer emulations track
     /// Chrome's current TLS + request-header set more closely, and a stale version

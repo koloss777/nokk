@@ -610,6 +610,7 @@ impl Engine {
             index,
             base_url: std::sync::Mutex::new("about:blank".to_string()),
             requests: std::sync::Mutex::new(Vec::new()),
+            sockets: tokio::sync::Mutex::new(PageSockets::new()),
             session,
             _permit: permit,
             _load: load,
@@ -717,8 +718,30 @@ pub struct BrowserContext {
     /// Name of the persistent session this context belongs to, if any. On drop
     /// its cookie jar is flushed to the session store.
     session: Option<String>,
+    /// The page's live `WebSocket`s (docs/websockets.md).
+    sockets: tokio::sync::Mutex<PageSockets>,
     _permit: tokio::sync::OwnedSemaphorePermit,
     _load: nokk_pool::ContextLoadGuard,
+}
+
+/// One page's open sockets, plus the single queue everything they produce lands
+/// on. Sharing one queue (rather than a receiver per socket) is what lets the
+/// event loop drain every socket in arrival order, and wait on *any* of them.
+struct PageSockets {
+    open: HashMap<u32, nokk_net::WsHandle>,
+    tx: tokio::sync::mpsc::UnboundedSender<(u32, nokk_net::WsEvent)>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<(u32, nokk_net::WsEvent)>,
+}
+
+impl PageSockets {
+    fn new() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            open: HashMap::new(),
+            tx,
+            rx,
+        }
+    }
 }
 
 impl Drop for BrowserContext {
@@ -898,6 +921,10 @@ impl BrowserContext {
         const TIMER_CAP: u32 = 10_000;
         const MAX_FETCHES: usize = 200;
         const MAX_ROUNDS: usize = 2_000;
+        /// How long an otherwise-idle round waits for a socket frame. Short on
+        /// purpose: this keeps a CDP command from blocking for the whole budget
+        /// just because the page holds a socket open.
+        const SOCKET_IDLE_GRACE: std::time::Duration = std::time::Duration::from_millis(25);
         // Total wall-clock the post-load event loop may run. Kept short because it
         // executes on the (shared) isolate worker: a page with endless ad/tracker
         // `setInterval`s would otherwise monopolise a worker for the full budget
@@ -937,19 +964,34 @@ impl BrowserContext {
                 .map_err(EngineError::Js)?;
             total_timers += ran;
 
-            // 2. Pull any fetch requests the JS queued.
+            // 2. Pull the I/O the JS queued — fetches and socket operations in one
+            //    round trip, so adding sockets costs no extra worker dispatch.
             let qjson = self
                 .engine
                 .pool
-                .dispatch(self.worker, move |iso| {
-                    iso.eval(index, "__pt_drainFetchQueue()")
-                })
+                .dispatch(self.worker, move |iso| iso.eval(index, DRAIN_IO))
                 .await?
                 .map_err(EngineError::Js)?;
-            let reqs: Vec<Value> = serde_json::from_str(&qjson).unwrap_or_default();
+            let queues: Value = serde_json::from_str(&qjson).unwrap_or_default();
+            let reqs: Vec<Value> = queues["fetch"].as_array().cloned().unwrap_or_default();
+            let ws_ops: Vec<Value> = queues["ws"].as_array().cloned().unwrap_or_default();
 
-            if ran == 0 && reqs.is_empty() {
-                break; // idle: no timers ran and nothing to fetch
+            // 3. Sockets: apply what the page asked for, then hand it whatever the
+            //    sockets have produced since the last round.
+            self.apply_ws_ops(&base, &ws_ops).await;
+            let delivered = self.deliver_ws_events(index).await?;
+
+            if ran == 0 && reqs.is_empty() && ws_ops.is_empty() && delivered == 0 {
+                // Idle — but an open socket means "not finished", only "nothing
+                // right now". Wait briefly for a frame rather than spinning, and
+                // still return promptly: continuous delivery is the caller's job
+                // (the CDP server pumps periodically), not this call's.
+                if !self.has_open_sockets().await {
+                    break;
+                }
+                if !self.await_ws_event(SOCKET_IDLE_GRACE).await {
+                    break;
+                }
             }
 
             // 3. Perform each fetch off the isolate thread, then settle its
@@ -968,6 +1010,162 @@ impl BrowserContext {
             }
         }
         Ok(total_timers)
+    }
+
+    /// Whether this page is holding any socket open. The event loop treats that
+    /// as "not finished" and the CDP server as "keep pumping".
+    pub async fn has_open_sockets(&self) -> bool {
+        !self.sockets.lock().await.open.is_empty()
+    }
+
+    /// Wait up to `grace` for any socket to produce something, putting it back on
+    /// the queue for the next drain. False means nothing arrived in time.
+    async fn await_ws_event(&self, grace: std::time::Duration) -> bool {
+        let mut sockets = self.sockets.lock().await;
+        match tokio::time::timeout(grace, sockets.rx.recv()).await {
+            Ok(Some(evt)) => {
+                // Push it back so `deliver_ws_events` handles every event on one
+                // path — this function only decides whether to keep looping.
+                sockets.tx.send(evt).is_ok()
+            }
+            _ => false,
+        }
+    }
+
+    /// Carry out the `open`/`send`/`close` operations the page queued.
+    async fn apply_ws_ops(&self, base: &str, ops: &[Value]) {
+        const MAX_SOCKETS: usize = 64;
+        for op in ops {
+            let id = op["id"].as_u64().unwrap_or(0) as u32;
+            match op["op"].as_str().unwrap_or("") {
+                "open" => {
+                    let raw = op["url"].as_str().unwrap_or("");
+                    let url = resolve_url(base, raw).unwrap_or_else(|| raw.to_string());
+                    let protocols: Vec<String> = op["protocols"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let mut sockets = self.sockets.lock().await;
+                    // A page that opens sockets without bound would otherwise pin
+                    // unbounded tasks to a shared worker.
+                    if sockets.open.len() >= MAX_SOCKETS {
+                        let _ = sockets.tx.send((
+                            id,
+                            nokk_net::WsEvent::Error("too many open WebSockets".into()),
+                        ));
+                        continue;
+                    }
+                    // Blocked tracker hosts don't get a socket either — the filter
+                    // has to cover every way out, not just `fetch`.
+                    if self.engine.block_trackers && nokk_net::is_blocked_url(&url) {
+                        self.record("WS", &url, "websocket", 0, &[]);
+                        let _ = sockets.tx.send((
+                            id,
+                            nokk_net::WsEvent::Error("blocked by tracker filter".into()),
+                        ));
+                        continue;
+                    }
+                    self.record("WS", &url, "websocket", 101, &[]);
+                    let handle = nokk_net::open_websocket(
+                        &self.client,
+                        id,
+                        &url,
+                        &protocols,
+                        &origin_of(base),
+                        sockets.tx.clone(),
+                    );
+                    sockets.open.insert(id, handle);
+                }
+                "send" => {
+                    let sockets = self.sockets.lock().await;
+                    if let Some(h) = sockets.open.get(&id) {
+                        let cmd = match op["bytes"].as_array() {
+                            Some(a) => nokk_net::WsCommand::Binary(
+                                a.iter().map(|v| v.as_u64().unwrap_or(0) as u8).collect(),
+                            ),
+                            None => nokk_net::WsCommand::Text(
+                                op["data"].as_str().unwrap_or("").to_string(),
+                            ),
+                        };
+                        h.send(cmd);
+                    }
+                }
+                "close" => {
+                    let sockets = self.sockets.lock().await;
+                    if let Some(h) = sockets.open.get(&id) {
+                        h.send(nokk_net::WsCommand::Close {
+                            code: op["code"].as_u64().unwrap_or(1000) as u16,
+                            reason: op["reason"].as_str().unwrap_or("").to_string(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Hand every socket event that has arrived to the page, as one batch of JS
+    /// calls. Returns how many were delivered.
+    async fn deliver_ws_events(&self, index: usize) -> Result<usize, EngineError> {
+        // Bounded per round so a firehose socket can't starve timers.
+        const MAX_PER_ROUND: usize = 256;
+        let mut script = String::new();
+        let mut n = 0;
+        {
+            let mut sockets = self.sockets.lock().await;
+            while n < MAX_PER_ROUND {
+                let Ok((id, evt)) = sockets.rx.try_recv() else {
+                    break;
+                };
+                n += 1;
+                match evt {
+                    nokk_net::WsEvent::Open { protocol } => {
+                        script.push_str(&format!("__pt_wsOpen({id},{});", js_str(&protocol)));
+                    }
+                    nokk_net::WsEvent::Text(t) => {
+                        script.push_str(&format!("__pt_wsMessage({id},{},0);", js_str(&t)));
+                    }
+                    nokk_net::WsEvent::Binary(b) => {
+                        let bytes = b
+                            .iter()
+                            .map(|x| x.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        script.push_str(&format!("__pt_wsMessage({id},[{bytes}],1);"));
+                    }
+                    nokk_net::WsEvent::Closed {
+                        code,
+                        reason,
+                        clean,
+                    } => {
+                        sockets.open.remove(&id);
+                        script.push_str(&format!(
+                            "__pt_wsClose({id},{code},{},{});",
+                            js_str(&reason),
+                            clean
+                        ));
+                    }
+                    nokk_net::WsEvent::Error(msg) => {
+                        // A failed connection is terminal: the page gets `error`
+                        // then `close`, and the socket leaves the table.
+                        sockets.open.remove(&id);
+                        script.push_str(&format!("__pt_wsError({id},{});", js_str(&msg)));
+                    }
+                }
+            }
+        }
+        if n > 0 {
+            self.engine
+                .pool
+                .dispatch(self.worker, move |iso| iso.eval(index, &script))
+                .await?
+                .map_err(EngineError::Js)?;
+        }
+        Ok(n)
     }
 
     /// Run one queued `fetch` request and build the JS call that settles it.
@@ -1102,6 +1300,28 @@ impl BrowserContext {
     /// document, external scripts, and every page `fetch`/`XHR`.
     pub fn requests(&self) -> Vec<NetworkRecord> {
         self.requests.lock().map(|r| r.clone()).unwrap_or_default()
+    }
+}
+
+/// One round trip that empties both JS-side I/O queues. Written as an expression
+/// so a bare context (no stealth bootstrap, as in some tests) answers with empty
+/// queues instead of throwing.
+const DRAIN_IO: &str = "JSON.stringify({\
+    fetch: typeof __pt_drainFetchQueue === 'function' ? JSON.parse(__pt_drainFetchQueue()) : [],\
+    ws: typeof __pt_drainWsQueue === 'function' ? __pt_drainWsQueue() : []})";
+
+/// A JS string literal for `s` (safely quoted/escaped).
+fn js_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
+}
+
+/// The `scheme://host[:port]` a page-initiated WebSocket must send as `Origin`;
+/// empty for a document that has none (`about:blank`), where a browser sends
+/// `null` rather than a fabricated origin.
+fn origin_of(base: &str) -> String {
+    match url::Url::parse(base) {
+        Ok(u) if u.has_host() => u.origin().ascii_serialization(),
+        _ => String::new(),
     }
 }
 
@@ -3032,5 +3252,173 @@ mod tests {
         } else {
             eprintln!("skip strict check: webgl natives inactive (no EGL here)");
         }
+    }
+
+    /// A WebSocket server that echoes `"echo:<what you sent>"` and then, on the
+    /// literal `"push"`, sends an unprompted frame — the server-driven case the
+    /// whole event-loop change exists for. Returns its `ws://` URL.
+    async fn echo_server() -> String {
+        use futures_util::{SinkExt, StreamExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    while let Some(Ok(msg)) = ws.next().await {
+                        if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
+                            let reply = format!("echo:{t}");
+                            if ws
+                                .send(tokio_tungstenite::tungstenite::Message::Text(reply))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            if t == "push" {
+                                // Unprompted, and deliberately late: the page must
+                                // receive it without having asked for anything.
+                                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                                let _ = ws
+                                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                                        "pushed".to_string(),
+                                    ))
+                                    .await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        format!("ws://{addr}/")
+    }
+
+    /// Pump until `probe` reports done, or give up. The engine pumps on command
+    /// (the CDP server does this on a timer), so a test drives it the same way.
+    async fn pump_until(ctx: &BrowserContext, probe: &str, rounds: usize) -> Value {
+        let mut last = Value::Null;
+        for _ in 0..rounds {
+            ctx.run_event_loop().await.unwrap();
+            last = ctx.evaluate(probe).await.unwrap();
+            if last.as_str().is_some_and(|s| s.contains("\"done\":true")) {
+                break;
+            }
+        }
+        last
+    }
+
+    #[tokio::test]
+    async fn websocket_opens_sends_and_receives_through_the_page() {
+        let _serial = serial().await;
+        let url = echo_server().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 4,
+                max_heap_mb: None,
+            },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+
+        // The page drives the socket itself: open, send on `open`, log everything.
+        ctx.evaluate(&format!(
+            r#"(() => {{
+                globalThis.__log = {{ events: [], messages: [], done: false }};
+                const ws = new WebSocket({url});
+                globalThis.__ws = ws;
+                ws.onopen = () => {{ __log.events.push('open'); __log.stateOnOpen = ws.readyState; ws.send('hello'); }};
+                ws.addEventListener('message', (e) => {{
+                    __log.messages.push(e.data);
+                    if (e.data === 'echo:hello') ws.send('push');
+                    if (e.data === 'pushed') {{ __log.done = true; ws.close(1000, 'bye'); }}
+                }});
+                ws.onclose = (e) => {{ __log.events.push('close'); __log.code = e.code; __log.clean = e.wasClean; }};
+                ws.onerror = (e) => {{ __log.events.push('error:' + e.message); }};
+            }})()"#,
+            url = serde_json::to_string(&url).unwrap()
+        ))
+        .await
+        .unwrap();
+
+        let out = pump_until(&ctx, "JSON.stringify(__log)", 40).await;
+        let log: Value = serde_json::from_str(out.as_str().unwrap()).unwrap();
+
+        assert!(
+            log["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e == "open"),
+            "the socket opened: {log}"
+        );
+        assert_eq!(log["stateOnOpen"], 1, "readyState is OPEN inside onopen");
+        let msgs: Vec<&str> = log["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m.as_str())
+            .collect();
+        assert!(
+            msgs.contains(&"echo:hello"),
+            "the page's frame reached the server and came back: {msgs:?}"
+        );
+        assert!(
+            msgs.contains(&"pushed"),
+            "a server-pushed frame arrived with nothing pending: {msgs:?}"
+        );
+
+        // The close is a round trip of its own, so pump once more for it.
+        let out = pump_until(&ctx, "JSON.stringify(__log)", 20).await;
+        let log: Value = serde_json::from_str(out.as_str().unwrap()).unwrap();
+        assert_eq!(log["code"], 1000, "clean close carries the code: {log}");
+        assert_eq!(log["clean"], true, "and reports wasClean");
+        let state = ctx.evaluate("String(__ws.readyState)").await.unwrap();
+        assert_eq!(state, "3", "readyState settles at CLOSED");
+        assert!(
+            !ctx.has_open_sockets().await,
+            "the engine dropped the socket from its table"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_to_a_dead_port_errors_and_closes_like_a_browser() {
+        let _serial = serial().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 4,
+                max_heap_mb: None,
+            },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        // Port 1 on loopback: nothing is listening, so the upgrade never happens.
+        ctx.evaluate(
+            r#"(() => {
+                globalThis.__log = { events: [], done: false };
+                const ws = new WebSocket('ws://127.0.0.1:1/');
+                ws.onerror = () => { __log.events.push('error'); };
+                ws.onclose = (e) => { __log.events.push('close'); __log.code = e.code; __log.clean = e.wasClean; __log.done = true; };
+            })()"#,
+        )
+        .await
+        .unwrap();
+
+        let out = pump_until(&ctx, "JSON.stringify(__log)", 40).await;
+        let log: Value = serde_json::from_str(out.as_str().unwrap()).unwrap();
+        assert_eq!(
+            log["events"].as_array().unwrap().len(),
+            2,
+            "a failed connection fires error *then* close: {log}"
+        );
+        assert_eq!(log["code"], 1006, "and reports 1006, not a clean code");
+        assert_eq!(log["clean"], false);
     }
 }

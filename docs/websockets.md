@@ -1,7 +1,9 @@
 # Design: `WebSocket` (and friends) inside the page
 
-Status: **analysis, not implemented.** This decides *where* the code goes —
-Rust or JavaScript — before anyone writes it.
+Status: **P0 shipped** — text and binary frames work end to end, both directions,
+including server-pushed frames. `EventSource` is still absent (P2 below). The
+analysis that follows is what decided the shape; the "Phasing" section at the end
+tracks what is left.
 
 ## What exists today
 
@@ -160,13 +162,19 @@ the host, rather than a class that throws on construction.
 
 ## Phasing
 
-1. **P0 — text sockets end to end.** Rust socket task + queues, JS class, loop
-   liveness, one bounded queue, tracker filter on `ws(s)://`. Test: an echo server
-   in-process, page opens a socket, sends, receives, closes; plus `typeof
-   WebSocket === 'function'` and `[native code]` in the fingerprint regression
-   suite.
-2. **P1 — binary + robustness.** `ArrayBuffer`/`Blob` frames, `bufferedAmount`,
-   backpressure and the overflow close, per-context caps, CDP
-   `Network.webSocketCreated`/`webSocketFrame*` events so Puppeteer's inspector
-   sees traffic.
+1. **P0 — sockets end to end. ✅ done.** `crates/net/src/websocket.rs` (one task
+   per socket over `client.websocket()`), the socket table + `apply_ws_ops` /
+   `deliver_ws_events` in `crates/core/src/lib.rs`, the JS class in
+   `crates/stealth/src/lib.rs`, and a 50 ms tick in the CDP server that pumps only
+   pages holding a socket. Both directions, text and binary, `Origin` sent,
+   subprotocols negotiated, tracker filter extended to `ws(s)://`, 64 sockets per
+   page and 256 frames per round as the fairness bounds. Tested against an
+   in-process echo server: open → send → echo → *unprompted server push* → clean
+   close with code 1000, plus a dead-port connection that fires `error` then
+   `close` with 1006 like a browser.
+2. **P1 — robustness and visibility.** Real `bufferedAmount` (0 today),
+   backpressure with an overflow close (1009), `Blob` frames read back through a
+   real `Blob` rather than the shim, and CDP `Network.webSocketCreated` /
+   `webSocketFrame*` events so Puppeteer's inspector sees the traffic — which
+   needs the `Network` domain to emit anything at all first (see ROADMAP Phase 5).
 3. **P2 — `EventSource`**, on the same rails.

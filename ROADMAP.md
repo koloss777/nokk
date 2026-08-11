@@ -150,20 +150,24 @@ Move to native (Rust):
   `OffscreenCanvas` maps to a detached `<canvas>`, reusing its 2D/WebGL contexts; `MessageEvent`
   added; `SharedWorker` present. All native-masked (`toString` → `[native code]`) and instances
   carry no own properties.
-- ⬜ **`WebSocket` in the page — the top gap, functional *and* passive.**
-  `typeof WebSocket === 'undefined'` today (verified against the live engine), so a
-  socket-driven app loads, executes, and then silently does nothing, while a
-  one-line probe separates us from every browser since 2011 — the same differential
-  tell canvas/WebGL spent months closing. Design decided in
-  [docs/websockets.md](docs/websockets.md): **the socket and its frame queues go in
-  Rust, the spec surface in JS.** The isolate has no I/O (JS can only enqueue and be
-  called back, exactly like `fetch`), and the upgrade *must* ride the same `wreq`
-  client — `client.websocket(uri)` behind wreq's `ws` feature — or one "browser"
-  presents two different TLS fingerprints, a louder tell than having no WebSocket.
-  The real work isn't the socket: it's teaching `pump_event_loop` that an open
-  socket means "not idle" and that server-pushed frames arrive unprompted, without
-  letting one context monopolise a shared worker. `EventSource` (also `undefined`)
-  rides the same rails afterwards. The sibling engine (obscura) hasn't got either.
+- ✅ **`WebSocket` in the page.** Was the top gap in both senses: a socket-driven
+  app loaded, executed and then silently did nothing, while `typeof WebSocket ===
+  'undefined'` separated us from every browser since 2011 in one line. Now real, per
+  [docs/websockets.md](docs/websockets.md): the socket lives in Rust
+  (`crates/net/src/websocket.rs`, one task each over wreq's `client.websocket()`, so
+  the upgrade carries the *same* JA3/JA4, cookie jar and proxy as every fetch — two
+  fingerprints from one "browser" would have been a louder tell than none), the
+  spec surface in JS, and the two meet through the queue/callback seam `fetch`
+  already uses. The load-bearing change was the event loop: an open socket now means
+  "not idle", frames arrive unprompted, and a 50 ms tick in the CDP server pumps
+  *only* pages holding a socket — bounded at 64 sockets per page and 256 frames per
+  round so one context can't monopolise a shared worker. Attributes are prototype
+  accessors, so `Object.keys(ws)` is `[]` and everything reads `[native code]`.
+  Tested against an in-process echo server (open → send → echo → server push →
+  clean 1000) and a dead port (`error` then `close` 1006). Left: `bufferedAmount`,
+  overflow backpressure, and CDP `Network.webSocket*` events (P1), then
+  `EventSource`, which is still `undefined` (P2). The sibling engine (obscura) has
+  neither.
 - 🟡 **Optional real rendering (`render` / `webgl` Cargo features)** — off-screen
   **rasterization** bridged via `natives.rs`, **off by default** so the standard build stays
   light and a feature build produces genuine pixels for harder anti-bot. `render` (2D, done):

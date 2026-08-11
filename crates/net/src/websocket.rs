@@ -22,7 +22,9 @@ use crate::{Client, NetError};
 #[derive(Debug, Clone)]
 pub enum WsEvent {
     /// The upgrade succeeded; carries the negotiated subprotocol, if any.
-    Open { protocol: String },
+    Open {
+        protocol: String,
+    },
     Text(String),
     Binary(Vec<u8>),
     /// The peer (or we) closed it. `clean` is false for a dropped connection,
@@ -59,25 +61,29 @@ impl WsHandle {
     }
 }
 
-/// Open `url` through `client`, returning the handle and the event stream.
+/// Open `url` through `client`, tagging everything it produces with `id` on the
+/// caller's shared `events` channel — one queue per page, so the event loop can
+/// drain every socket in arrival order without juggling receivers.
 ///
 /// `protocols` become `Sec-WebSocket-Protocol`; `origin` is sent as `Origin`,
 /// which a browser always includes for a page-initiated socket and whose absence
 /// some servers (and every attentive bot filter) will notice.
 pub fn open(
     client: &Client,
+    id: u32,
     url: &str,
     protocols: &[String],
     origin: &str,
-) -> (WsHandle, mpsc::UnboundedReceiver<WsEvent>) {
+    events: mpsc::UnboundedSender<(u32, WsEvent)>,
+) -> WsHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let (evt_tx, evt_rx) = mpsc::unbounded_channel();
+    let evt_tx = TaggedSender { id, tx: events };
 
     match client {
         // No real network (the stub): report a failed connection the way a
         // browser would when the host is unreachable — asynchronously.
         Client::Stub(_) => {
-            let _ = evt_tx.send(WsEvent::Error(NetError::Unimplemented.to_string()));
+            evt_tx.send(WsEvent::Error(NetError::Unimplemented.to_string()));
         }
         Client::Fingerprint(c) => {
             let inner = c.inner().clone();
@@ -86,7 +92,20 @@ pub fn open(
             tokio::spawn(async move { run(inner, url, protocols, origin, cmd_rx, evt_tx).await });
         }
     }
-    (WsHandle { tx: cmd_tx }, evt_rx)
+    WsHandle { tx: cmd_tx }
+}
+
+/// Stamps every event with its socket id on the way to the page's shared queue.
+struct TaggedSender {
+    id: u32,
+    tx: mpsc::UnboundedSender<(u32, WsEvent)>,
+}
+
+impl TaggedSender {
+    /// Returns false once the page is gone, which ends the socket task.
+    fn send(&self, e: WsEvent) -> bool {
+        self.tx.send((self.id, e)).is_ok()
+    }
 }
 
 /// Own the socket for its whole life: connect, then shuttle frames both ways
@@ -97,7 +116,7 @@ async fn run(
     protocols: Vec<String>,
     origin: String,
     mut cmd_rx: mpsc::UnboundedReceiver<WsCommand>,
-    evt_tx: mpsc::UnboundedSender<WsEvent>,
+    evt_tx: TaggedSender,
 ) {
     let mut builder = client.websocket(&url);
     if !protocols.is_empty() {
@@ -109,14 +128,14 @@ async fn run(
     let resp = match builder.send().await {
         Ok(r) => r,
         Err(e) => {
-            let _ = evt_tx.send(WsEvent::Error(e.to_string()));
+            evt_tx.send(WsEvent::Error(e.to_string()));
             return;
         }
     };
     let mut socket = match resp.into_websocket().await {
         Ok(s) => s,
         Err(e) => {
-            let _ = evt_tx.send(WsEvent::Error(e.to_string()));
+            evt_tx.send(WsEvent::Error(e.to_string()));
             return;
         }
     };
@@ -125,7 +144,7 @@ async fn run(
         .and_then(|p| p.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    if evt_tx.send(WsEvent::Open { protocol }).is_err() {
+    if !evt_tx.send(WsEvent::Open { protocol }) {
         return; // the context went away between connect and open
     }
 
@@ -150,7 +169,7 @@ async fn run(
                     }
                 };
                 if let Err(e) = socket.send(msg).await {
-                    let _ = evt_tx.send(WsEvent::Error(e.to_string()));
+                    evt_tx.send(WsEvent::Error(e.to_string()));
                     break;
                 }
             }
@@ -158,10 +177,10 @@ async fn run(
                 match incoming {
                     Some(Ok(msg)) => match msg {
                         wreq::ws::message::Message::Text(t) => {
-                            if evt_tx.send(WsEvent::Text(t.as_str().to_owned())).is_err() { return; }
+                            if !evt_tx.send(WsEvent::Text(t.as_str().to_owned())) { return; }
                         }
                         wreq::ws::message::Message::Binary(b) => {
-                            if evt_tx.send(WsEvent::Binary(b.to_vec())).is_err() { return; }
+                            if !evt_tx.send(WsEvent::Binary(b.to_vec())) { return; }
                         }
                         wreq::ws::message::Message::Close(frame) => {
                             let (code, reason) = frame
@@ -175,7 +194,7 @@ async fn run(
                         _ => {}
                     },
                     Some(Err(e)) => {
-                        let _ = evt_tx.send(WsEvent::Error(e.to_string()));
+                        evt_tx.send(WsEvent::Error(e.to_string()));
                         break;
                     }
                     None => break, // stream ended without a close frame -> 1006
@@ -183,5 +202,5 @@ async fn run(
             }
         }
     }
-    let _ = evt_tx.send(closed);
+    evt_tx.send(closed);
 }

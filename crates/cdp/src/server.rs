@@ -267,6 +267,12 @@ where
         browser_contexts: HashMap::new(),
     };
 
+    // Delivers server-pushed WebSocket frames between commands (see the tick arm
+    // below). 20 Hz: fast enough that a page's `onmessage` feels immediate,
+    // cheap enough to skip entirely when no page holds a socket.
+    let mut socket_pump = tokio::time::interval(std::time::Duration::from_millis(50));
+    socket_pump.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             msg = read.next() => {
@@ -297,6 +303,19 @@ where
             Some(pending) = reg_rx.recv() => {
                 for m in conn.register_target(pending) {
                     let _ = tx.send(Message::Text(m.to_string()));
+                }
+            }
+            // A page holding a WebSocket receives frames nobody asked for, and the
+            // engine's event loop only runs when a command drives it — so without
+            // this tick a pushed frame would sit in the queue until the client
+            // happened to evaluate something. Only pages with a live socket are
+            // pumped, so the idle case costs one cheap check per tick.
+            _ = socket_pump.tick() => {
+                for t in &conn.targets {
+                    let ctx = t.ctx.clone();
+                    if ctx.has_open_sockets().await {
+                        tokio::spawn(async move { let _ = ctx.run_event_loop().await; });
+                    }
                 }
             }
         }

@@ -32,3 +32,7 @@ url = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
+# An in-process echo server for the WebSocket tests — the page's socket has to be
+# exercised against a real peer, not a mock (already in the tree via nokk-cdp).
+tokio-tungstenite = { workspace = true }
+futures-util = "0.3"

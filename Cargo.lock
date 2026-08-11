@@ -1211,6 +1211,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 name = "nokk"
 version = "0.0.0"
 dependencies = [
+ "futures-util",
  "nokk-dom",
  "nokk-net",
  "nokk-pool",
@@ -1218,6 +1219,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite 0.24.0",
  "tracing",
  "url",
 ]
