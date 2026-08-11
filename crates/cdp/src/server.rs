@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -152,6 +152,14 @@ struct Target {
     init_scripts: Vec<String>,
     /// The Puppeteer browser context this page belongs to (`None` = default).
     browser_context_id: Option<String>,
+    /// Set whenever page JS ran, so the tick below pumps the event loop once
+    /// afterwards. `Runtime.evaluate` does not drive the loop itself (it must
+    /// answer immediately), so without this the I/O that evaluated code queues —
+    /// a `fetch`, or the *opening* of a WebSocket — would sit untouched until
+    /// some later command happened to pump. That was a chicken-and-egg for
+    /// sockets: the tick only pumps pages holding one, and holding one requires
+    /// a pump.
+    ran_js: Arc<AtomicBool>,
 }
 
 struct Conn {
@@ -310,14 +318,7 @@ where
             // this tick a pushed frame would sit in the queue until the client
             // happened to evaluate something. Only pages with a live socket are
             // pumped, so the idle case costs one cheap check per tick.
-            _ = socket_pump.tick() => {
-                for t in &conn.targets {
-                    let ctx = t.ctx.clone();
-                    if ctx.has_open_sockets().await {
-                        tokio::spawn(async move { let _ = ctx.run_event_loop().await; });
-                    }
-                }
-            }
+            _ = socket_pump.tick() => { conn.pump_live_pages().await; }
         }
     }
     drop(tx);
@@ -325,6 +326,21 @@ where
 }
 
 impl Conn {
+    /// Give the event loop a turn on every page that needs one: either it holds a
+    /// WebSocket (frames may be waiting, and nothing else would fetch them) or it
+    /// just ran JS that could have queued I/O. Called on a timer by the session
+    /// loop; pages with neither cost one atomic read.
+    async fn pump_live_pages(&self) {
+        for t in &self.targets {
+            if t.ran_js.swap(false, Ordering::Relaxed) || t.ctx.has_open_sockets().await {
+                let ctx = t.ctx.clone();
+                tokio::spawn(async move {
+                    let _ = ctx.run_event_loop().await;
+                });
+            }
+        }
+    }
+
     /// Register a target whose context finished building off the read loop, and
     /// produce its `Target.createTarget` reply + `targetCreated` (+ attach) events.
     fn register_target(&mut self, pending: PendingTarget) -> Vec<Value> {
@@ -349,6 +365,7 @@ impl Conn {
                     iso_worlds: Vec::new(),
                     init_scripts: Vec::new(),
                     browser_context_id,
+                    ran_js: Arc::new(AtomicBool::new(false)),
                 };
                 let info = target_info(&t);
                 self.targets.push(t);
@@ -801,6 +818,9 @@ impl Conn {
                     .unwrap_or(false);
                 let (ctx, session, tx) =
                     (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                // Whatever this evaluate queued (a fetch, a socket) gets pumped by
+                // the tick; the reply itself must not wait for the event loop.
+                self.targets[idx].ran_js.store(true, Ordering::Relaxed);
                 tokio::spawn(async move {
                     let ro = remote_eval(&ctx, &expr, by_value, await_promise).await;
                     let _ = tx.send(Message::Text(
@@ -848,6 +868,9 @@ impl Conn {
                 let expr = format!("(\n{decl}\n).apply({this_js}, [{}])", args_js.join(","));
                 let (ctx, session, tx) =
                     (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                // Whatever this evaluate queued (a fetch, a socket) gets pumped by
+                // the tick; the reply itself must not wait for the event loop.
+                self.targets[idx].ran_js.store(true, Ordering::Relaxed);
                 tokio::spawn(async move {
                     let ro = remote_eval(&ctx, &expr, by_value, await_promise).await;
                     let _ = tx.send(Message::Text(
@@ -1395,5 +1418,50 @@ mod tests {
             .expect("targetInfos array");
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0]["type"], json!("page"));
+    }
+
+    /// A socket opened from `Runtime.evaluate` must actually be acted on.
+    ///
+    /// `Runtime.evaluate` answers without driving the event loop, so the `open`
+    /// operation the page queued only moves when something pumps — and the pump
+    /// used to run solely for pages that *already* held a socket, which no page
+    /// could reach. The result was a `WebSocket` stuck in CONNECTING forever, and
+    /// no unit test below this level could see it.
+    #[tokio::test]
+    async fn a_socket_opened_via_cdp_evaluate_gets_pumped() {
+        let _s = SERIAL.lock().await;
+        let mut conn = test_conn();
+        create_target(&mut conn, 1).await;
+        let session = conn.targets[0].session_id.clone();
+        conn.dispatch(
+            &json!({ "id": 2, "sessionId": session, "method": "Runtime.evaluate", "params": {
+                "expression": "globalThis.__w = new WebSocket('ws://127.0.0.1:1/');"
+            }}),
+            &sink(),
+            &reg_sink(),
+        )
+        .await;
+
+        // This engine has no real network, so the connection fails — the point is
+        // that it *resolves at all* rather than sitting in the queue.
+        let ctx = conn.targets[0].ctx.clone();
+        let mut state = String::new();
+        for _ in 0..40 {
+            conn.pump_live_pages().await;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            if let Ok(v) = ctx
+                .evaluate("String(globalThis.__w && __w.readyState)")
+                .await
+            {
+                state = v.as_str().unwrap_or_default().to_string();
+                if state == "3" {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            state, "3",
+            "the queued socket was drained and settled (CLOSED), not left CONNECTING"
+        );
     }
 }
