@@ -180,6 +180,43 @@
     get classList() { return makeClassList(this); }
     get dataset() { return makeDataset(this); }
 
+    // URL-valued attributes reflect as *absolute* URLs, exactly as in a browser.
+    // Not cosmetic: Cloudflare's Turnstile finds its own `<script>` by comparing
+    // `script.src` against its api.js URL, and while this returned `''` the
+    // widget refused to initialise ("Could not find Turnstile valid script tag").
+    get src() { return this.__ptUrlAttr('src'); }
+    set src(v) { this.setAttribute('src', v); }
+    get href() { return this.__ptUrlAttr('href'); }
+    set href(v) { this.setAttribute('href', v); }
+    get action() { return this.__ptUrlAttr('action'); }
+    set action(v) { this.setAttribute('action', v); }
+    __ptUrlAttr(n) {
+      const raw = this.getAttribute(n);
+      if (raw == null) return '';
+      const base = (globalThis.location && location.href) || 'about:blank';
+      try { return new URL(raw, base).href; } catch (e) { return raw; }
+    }
+
+    // Plain string/boolean reflections a page can read back off an element.
+    get rel() { return this.getAttribute('rel') || ''; }
+    set rel(v) { this.setAttribute('rel', v); }
+    get target() { return this.getAttribute('target') || ''; }
+    set target(v) { this.setAttribute('target', v); }
+    get alt() { return this.getAttribute('alt') || ''; }
+    set alt(v) { this.setAttribute('alt', v); }
+    get integrity() { return this.getAttribute('integrity') || ''; }
+    set integrity(v) { this.setAttribute('integrity', v); }
+    get nonce() { return this.getAttribute('nonce') || ''; }
+    set nonce(v) { this.setAttribute('nonce', v); }
+    get crossOrigin() { return this.hasAttribute('crossorigin') ? (this.getAttribute('crossorigin') || 'anonymous') : null; }
+    set crossOrigin(v) { this.setAttribute('crossorigin', v); }
+    get referrerPolicy() { return this.getAttribute('referrerpolicy') || ''; }
+    set referrerPolicy(v) { this.setAttribute('referrerpolicy', v); }
+    get async() { return this.hasAttribute('async'); }
+    set async(v) { v ? this.setAttribute('async', '') : this.removeAttribute('async'); }
+    get defer() { return this.hasAttribute('defer'); }
+    set defer(v) { v ? this.setAttribute('defer', '') : this.removeAttribute('defer'); }
+
     get children() { return this.childNodes.filter(n => n.nodeType === ELEMENT_NODE); }
     get childElementCount() { return this.children.length; }
     get firstElementChild() { return this.children[0] || null; }
@@ -865,9 +902,24 @@
   // carries our accessors (notably `value`). Playwright's `fill` sets a field via
   // the *native* setter it looks up on `HTMLInputElement.prototype`, so that
   // descriptor must exist there.
+  // A missing one is not a cosmetic gap: real bundles reference these directly
+  // (Cloudflare's Turnstile loader dies on `HTMLScriptElement is not defined`
+  // before it can draw its widget), and a fingerprinter can list them in a line.
   for (const n of ['HTMLInputElement', 'HTMLTextAreaElement', 'HTMLSelectElement',
     'HTMLButtonElement', 'HTMLAnchorElement', 'HTMLDivElement', 'HTMLSpanElement',
-    'HTMLParagraphElement', 'HTMLFormElement', 'HTMLOptionElement', 'HTMLLabelElement']) {
+    'HTMLParagraphElement', 'HTMLFormElement', 'HTMLOptionElement', 'HTMLLabelElement',
+    'HTMLScriptElement', 'HTMLIFrameElement', 'HTMLBodyElement', 'HTMLHeadElement',
+    'HTMLHtmlElement', 'HTMLStyleElement', 'HTMLLinkElement', 'HTMLMetaElement',
+    'HTMLTitleElement', 'HTMLTemplateElement', 'HTMLSlotElement', 'HTMLPictureElement',
+    'HTMLSourceElement', 'HTMLMediaElement', 'HTMLVideoElement', 'HTMLAudioElement',
+    'HTMLTableElement', 'HTMLTableRowElement', 'HTMLTableCellElement',
+    'HTMLTableSectionElement', 'HTMLUListElement', 'HTMLOListElement', 'HTMLLIElement',
+    'HTMLHeadingElement', 'HTMLPreElement', 'HTMLBRElement', 'HTMLHRElement',
+    'HTMLFieldSetElement', 'HTMLLegendElement', 'HTMLOptGroupElement', 'HTMLDataListElement',
+    'HTMLOutputElement', 'HTMLProgressElement', 'HTMLMeterElement', 'HTMLDetailsElement',
+    'HTMLDialogElement', 'HTMLMapElement', 'HTMLAreaElement', 'HTMLQuoteElement',
+    'HTMLTimeElement', 'HTMLModElement', 'HTMLObjectElement', 'HTMLEmbedElement',
+    'HTMLUnknownElement']) {
     if (!globalThis[n]) globalThis[n] = Element;
   }
   globalThis.Text = Text;

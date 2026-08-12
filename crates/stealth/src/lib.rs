@@ -1990,7 +1990,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     }
     // No-op the GL calls a fingerprinter drives before reading parameters.
     for (const m of ['viewport','clearColor','clear','enable','disable','createShader','shaderSource',
-      'compileShader','getShaderParameter','createProgram','attachShader','linkProgram','getProgramParameter',
+      'compileShader','createProgram','attachShader','linkProgram',
       'useProgram','createBuffer','bindBuffer','bufferData','getAttribLocation','vertexAttribPointer',
       'enableVertexAttribArray','getUniformLocation','uniform1f','uniform2f','uniform3f','uniform4f',
       'uniform1i','uniform2i','uniform3i','uniform4i','uniform1fv','uniform2fv','uniform3fv','uniform4fv',
@@ -2010,6 +2010,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     if (!gl.getShaderInfoLog) gl.getShaderInfoLog = function () { return ''; };
     if (!gl.getProgramInfoLog) gl.getProgramInfoLog = function () { return ''; };
     if (!gl.getUniformLocation) gl.getUniformLocation = function () { return Object.create(iface('WebGLUniformLocation')); };
+    // Shaders always compile and programs always link in a real browser — the
+    // no-op fill above answered `undefined`, which reads as "compilation failed"
+    // and stops a page (or tells a fingerprinter it is not talking to Chrome).
+    if (!gl.getShaderParameter) gl.getShaderParameter = function (sh, pn) { return pn === 0x8B4F ? (sh && sh.__type) : true; };
+    if (!gl.getProgramParameter) gl.getProgramParameter = function (p, pn) { return pn === C.LINK_STATUS ? true : 0; };
     return maskProto(gl);
   };
 
