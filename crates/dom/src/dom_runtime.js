@@ -42,7 +42,19 @@
     }
     hasChildNodes() { return this.childNodes.length > 0; }
     contains(n) { for (; n; n = n.parentNode) if (n === this) return true; return false; }
-    get isConnected() { for (let n = this; n; n = n.parentNode) if (n.nodeType === DOCUMENT_NODE) return true; return false; }
+    // Walks out through a shadow host too: a node inside an attached shadow tree
+    // is connected, even though the root itself has no parent.
+    get isConnected() {
+      for (let n = this; n; n = n.parentNode || n.__ptHost) {
+        if (n.nodeType === DOCUMENT_NODE) return true;
+      }
+      return false;
+    }
+    getRootNode(opts) {
+      let n = this;
+      while (n.parentNode || (n.__ptHost && opts && opts.composed)) n = n.parentNode || n.__ptHost;
+      return n;
+    }
 
     appendChild(child) { return this.insertBefore(child, null); }
     insertBefore(child, ref) {
@@ -55,12 +67,16 @@
       if (i < 0) this.childNodes.push(child); else this.childNodes.splice(i, 0, child);
       child.parentNode = this;
       __markDirty();
+      __mutation(__childListRecord(this, [child], [], child.previousSibling, child.nextSibling));
       return child;
     }
     removeChild(child) {
       const i = this.childNodes.indexOf(child);
       if (i < 0) throw new Error('NotFoundError: removeChild');
-      this.childNodes.splice(i, 1); child.parentNode = null; __markDirty(); return child;
+      const prev = this.childNodes[i - 1] || null, next = this.childNodes[i + 1] || null;
+      this.childNodes.splice(i, 1); child.parentNode = null; __markDirty();
+      __mutation(__childListRecord(this, [], [child], prev, next));
+      return child;
     }
     replaceChild(nw, old) { this.insertBefore(nw, old); return this.removeChild(old); }
     remove() { if (this.parentNode) this.parentNode.removeChild(this); }
@@ -152,6 +168,42 @@
   }
 
   // ---- Element --------------------------------------------------------------
+  /// A shadow root: a fragment that carries the query surface of an element and
+  /// remembers its host, so a subtree can live outside the document tree while
+  /// still being connected through it.
+  class ShadowRoot extends Node {
+    constructor(host, mode) {
+      super(DOCUMENT_FRAGMENT_NODE);
+      this.__ptHost = host;
+      this.__ptMode = mode;
+      this.ownerDocument = host.ownerDocument;
+    }
+    get host() { return this.__ptHost; }
+    get mode() { return this.__ptMode; }
+    get nodeName() { return '#document-fragment'; }
+    get nodeValue() { return null; }
+    get textContent() { return this.childNodes.map(n => n.textContent).join(''); }
+    set textContent(v) { this.childNodes = []; if (v !== '') this.appendChild(new Text(String(v))); }
+    get innerHTML() { return this.childNodes.map(serializeNode).join(''); }
+    set innerHTML(html) { this.childNodes = []; for (const n of parseFragment(String(html))) this.appendChild(n); }
+    get children() { return this.childNodes.filter(n => n.nodeType === ELEMENT_NODE); }
+    get firstElementChild() { return this.children[0] || null; }
+    get lastElementChild() { const c = this.children; return c[c.length - 1] || null; }
+    get childElementCount() { return this.children.length; }
+    get activeElement() { return null; }
+    get styleSheets() { return []; }
+    get adoptedStyleSheets() { return this.__ptAdopted || (this.__ptAdopted = []); }
+    set adoptedStyleSheets(v) { this.__ptAdopted = v; }
+    getElementById(id) { return firstMatch(this, e => e.id === id); }
+    getElementsByTagName(t) { const tag = String(t).toUpperCase(); return collect(this, e => t === '*' || e.tagName === tag); }
+    getElementsByClassName(c) { const cs = String(c).split(/\s+/).filter(Boolean); return collect(this, e => cs.every(x => e.classList.contains(x))); }
+    querySelector(sel) { return query(this, sel)[0] || null; }
+    querySelectorAll(sel) { return query(this, sel); }
+    append(...ns) { for (const n of ns) this.appendChild(typeof n === 'string' ? new Text(n) : n); }
+    prepend(...ns) { for (const n of ns.reverse()) this.insertBefore(typeof n === 'string' ? new Text(n) : n, this.firstChild); }
+    elementFromPoint() { return null; }
+  }
+
   class Element extends Node {
     constructor(tag) {
       super(ELEMENT_NODE);
@@ -167,8 +219,22 @@
 
     // Attributes
     getAttribute(n) { const v = this.__ptAttrs.get(n.toLowerCase()); return v === undefined ? null : v; }
-    setAttribute(n, v) { this.__ptAttrs.set(n.toLowerCase(), String(v)); __markDirty(); }
-    removeAttribute(n) { this.__ptAttrs.delete(n.toLowerCase()); __markDirty(); }
+    setAttribute(n, v) {
+      const name = n.toLowerCase(), old = this.__ptAttrs.get(name);
+      this.__ptAttrs.set(name, String(v));
+      __markDirty();
+      __mutation({ type: 'attributes', target: this, attributeName: name, attributeNamespace: null,
+        oldValue: old === undefined ? null : old, addedNodes: [], removedNodes: [],
+        previousSibling: null, nextSibling: null });
+    }
+    removeAttribute(n) {
+      const name = n.toLowerCase(), old = this.__ptAttrs.get(name);
+      this.__ptAttrs.delete(name);
+      __markDirty();
+      __mutation({ type: 'attributes', target: this, attributeName: name, attributeNamespace: null,
+        oldValue: old === undefined ? null : old, addedNodes: [], removedNodes: [],
+        previousSibling: null, nextSibling: null });
+    }
     hasAttribute(n) { return this.__ptAttrs.has(n.toLowerCase()); }
     getAttributeNames() { return [...this.__ptAttrs.keys()]; }
     get attributes() { return [...this.__ptAttrs].map(([name, value]) => ({ name, value })); }
@@ -237,6 +303,23 @@
     matches(sel) { return matchesSelector(this, sel); }
 
     // Serialization
+    // Shadow DOM. A widget that draws itself into a shadow root — Cloudflare's
+    // Turnstile does, and so does most of the web-component world — dies at the
+    // first line without this. The tree is genuinely separate: nothing inside is
+    // reachable from `document.querySelector`, which is the point of it.
+    attachShadow(init) {
+      const mode = (init && init.mode) === 'closed' ? 'closed' : 'open';
+      if (this.__ptShadow) throw new Error("Failed to execute 'attachShadow' on 'Element': Shadow root cannot be created on a host which already hosts a shadow tree.");
+      this.__ptShadow = new ShadowRoot(this, mode);
+      __markDirty();
+      return this.__ptShadow;
+    }
+    get shadowRoot() {
+      const r = this.__ptShadow;
+      // A closed root is invisible even to its own host's `shadowRoot`.
+      return r && r.mode === 'open' ? r : null;
+    }
+
     get innerHTML() { return this.childNodes.map(serializeNode).join(''); }
     set innerHTML(html) { this.childNodes = []; for (const n of parseFragment(String(html))) this.appendChild(n); }
     get outerHTML() { return serializeNode(this); }
@@ -922,6 +1005,7 @@
     'HTMLUnknownElement']) {
     if (!globalThis[n]) globalThis[n] = Element;
   }
+  globalThis.ShadowRoot = ShadowRoot;
   globalThis.Text = Text;
   globalThis.Comment = Comment;
   globalThis.Document = Document;
@@ -1037,6 +1121,112 @@
   let __mouseDownEl = null; // element that received the last mousedown
 
   function __markDirty() { __layoutSeq++; }
+
+  // --- MutationObserver ---------------------------------------------------
+  // A stub that never fires is worse than none: a page waiting on a mutation
+  // simply stops, with no error to explain it. Records are collected on the same
+  // hooks that already mark the tree dirty and delivered in a microtask, as the
+  // spec requires (callbacks must not run inside the mutation itself).
+  const __observers = [];
+  let __moScheduled = false;
+
+  function __moDeliver() {
+    __moScheduled = false;
+    for (const o of __observers) {
+      if (!o.records.length) continue;
+      const batch = o.records.splice(0);
+      try { o.cb(batch, o.api); } catch (e) {}
+    }
+  }
+
+  function __moWatches(entry, rec) {
+    if (entry.target === rec.target) return true;
+    return !!entry.opts.subtree && entry.target.contains && entry.target.contains(rec.target);
+  }
+
+  function __moWants(entry, rec) {
+    if (rec.type === 'childList') return !!entry.opts.childList;
+    if (rec.type === 'attributes') {
+      if (!entry.opts.attributes) return false;
+      const filter = entry.opts.attributeFilter;
+      return !filter || filter.some(a => String(a).toLowerCase() === rec.attributeName);
+    }
+    return !!entry.opts.characterData;
+  }
+
+  function __mutation(rec) {
+    if (!__observers.length) return;
+    let queued = false;
+    for (const o of __observers) {
+      if (!o.entries.some(e => __moWatches(e, rec) && __moWants(e, rec))) continue;
+      o.records.push(rec);
+      queued = true;
+    }
+    if (queued && !__moScheduled) {
+      __moScheduled = true;
+      queueMicrotask(__moDeliver);
+    }
+  }
+
+  function __childListRecord(target, added, removed, prev, next) {
+    return {
+      type: 'childList', target,
+      addedNodes: added, removedNodes: removed,
+      previousSibling: prev || null, nextSibling: next || null,
+      attributeName: null, attributeNamespace: null, oldValue: null,
+    };
+  }
+
+  class MutationObserver {
+    constructor(cb) {
+      if (typeof cb !== 'function') throw new TypeError("Failed to construct 'MutationObserver': parameter 1 is not of type 'Function'.");
+      const state = { cb, entries: [], records: [], api: this };
+      __observers.push(state);
+      Object.defineProperty(this, '__ptState', { value: state, enumerable: false });
+    }
+    observe(target, opts) {
+      opts = opts || {};
+      // The spec default: with neither childList nor attributes nor
+      // characterData asked for, this is a TypeError, not a silent no-op.
+      if (!opts.childList && !opts.attributes && !opts.characterData && !opts.attributeFilter) {
+        throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
+      }
+      if (opts.attributeFilter) opts.attributes = true;
+      this.__ptState.entries.push({ target, opts });
+    }
+    disconnect() { this.__ptState.entries = []; this.__ptState.records = []; }
+    takeRecords() { return this.__ptState.records.splice(0); }
+  }
+
+  // --- ResizeObserver -----------------------------------------------------
+  // No real layout here, so there is nothing to *re*-observe — but Chrome
+  // delivers one observation as soon as you observe an element, and code that
+  // waits for that first callback would otherwise hang forever.
+  class ResizeObserver {
+    constructor(cb) {
+      const state = { cb, targets: [] };
+      Object.defineProperty(this, '__ptState', { value: state, enumerable: false });
+    }
+    observe(target) {
+      const st = this.__ptState;
+      st.targets.push(target);
+      queueMicrotask(() => {
+        const r = (target.getBoundingClientRect && target.getBoundingClientRect()) || { width: 0, height: 0, x: 0, y: 0, top: 0, left: 0 };
+        const box = [{ inlineSize: r.width, blockSize: r.height }];
+        try {
+          st.cb([{ target, contentRect: r, borderBoxSize: box, contentBoxSize: box, devicePixelContentBoxSize: box }], this);
+        } catch (e) {}
+      });
+    }
+    unobserve(target) { const t = this.__ptState.targets; const i = t.indexOf(target); if (i >= 0) t.splice(i, 1); }
+    disconnect() { this.__ptState.targets = []; }
+  }
+
+  // Assigned here, after the declarations (a class stays in its temporal dead
+  // zone until then). These override the stealth layer's inert stubs: with a
+  // document present there is a real tree to watch.
+  globalThis.MutationObserver = MutationObserver;
+  globalThis.ResizeObserver = ResizeObserver;
 
   function __isHiddenEl(el) {
     if (el.hasAttribute && el.hasAttribute('hidden')) return true;
