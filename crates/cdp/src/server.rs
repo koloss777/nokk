@@ -28,6 +28,35 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::tungstenite::Message;
 
+/// Open pages, shared across every connection so the HTTP discovery endpoints
+/// can answer. Targets themselves stay owned by the connection that made them
+/// (they die with it); this is the index a client browses over `/json/list`.
+#[derive(Clone, Default)]
+struct TargetRegistry(Arc<std::sync::Mutex<Vec<Value>>>);
+
+impl TargetRegistry {
+    fn add(&self, entry: Value) {
+        if let Ok(mut v) = self.0.lock() {
+            v.push(entry);
+        }
+    }
+    fn remove(&self, target_id: &str) {
+        if let Ok(mut v) = self.0.lock() {
+            v.retain(|e| e["id"] != target_id);
+        }
+    }
+    fn set_url(&self, target_id: &str, url: &str) {
+        if let Ok(mut v) = self.0.lock() {
+            if let Some(e) = v.iter_mut().find(|e| e["id"] == target_id) {
+                e["url"] = json!(url);
+            }
+        }
+    }
+    fn list(&self) -> Vec<Value> {
+        self.0.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+}
+
 static IDS: AtomicU64 = AtomicU64::new(1);
 fn next_id(prefix: &str) -> String {
     format!("{prefix}{:X}", IDS.fetch_add(1, Ordering::Relaxed))
@@ -44,12 +73,14 @@ pub struct ServerConfig {
 pub async fn serve(engine: Engine, config: ServerConfig) -> std::io::Result<()> {
     let listener = TcpListener::bind(config.addr).await?;
     let port = config.addr.port();
+    let registry = TargetRegistry::default();
     tracing::info!(%config.addr, "CDP server listening — ws://{}/devtools/browser/nokk", config.addr);
     loop {
         let (stream, peer) = listener.accept().await?;
         let engine = engine.clone();
+        let registry = registry.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, engine, port).await {
+            if let Err(e) = handle_conn(stream, engine, port, registry).await {
                 tracing::debug!(%peer, error = %e, "cdp connection ended");
             }
         });
@@ -79,7 +110,12 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.trim())
 }
 
-async fn handle_conn(mut stream: TcpStream, engine: Engine, port: u16) -> std::io::Result<()> {
+async fn handle_conn(
+    mut stream: TcpStream,
+    engine: Engine,
+    port: u16,
+    registry: TargetRegistry,
+) -> std::io::Result<()> {
     let head = read_head(&mut stream).await?;
     let request_line = head.lines().next().unwrap_or("");
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
@@ -89,7 +125,7 @@ async fn handle_conn(mut stream: TcpStream, engine: Engine, port: u16) -> std::i
         .unwrap_or(false);
 
     if !is_ws {
-        return serve_http(&mut stream, path, port).await;
+        return serve_http(&mut stream, path, port, &registry).await;
     }
 
     // WebSocket upgrade handshake.
@@ -107,11 +143,16 @@ async fn handle_conn(mut stream: TcpStream, engine: Engine, port: u16) -> std::i
     stream.write_all(response.as_bytes()).await?;
 
     let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
-    run_session(ws, engine).await;
+    run_session(ws, engine, port, registry).await;
     Ok(())
 }
 
-async fn serve_http(stream: &mut TcpStream, path: &str, port: u16) -> std::io::Result<()> {
+async fn serve_http(
+    stream: &mut TcpStream,
+    path: &str,
+    port: u16,
+    registry: &TargetRegistry,
+) -> std::io::Result<()> {
     let ws_url = format!("ws://127.0.0.1:{port}/devtools/browser/nokk");
     let body = match path {
         p if p.starts_with("/json/version") => json!({
@@ -120,6 +161,20 @@ async fn serve_http(stream: &mut TcpStream, path: &str, port: u16) -> std::io::R
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
             "V8-Version": "13.7",
             "WebKit-Version": "537.36",
+            "webSocketDebuggerUrl": ws_url,
+        }),
+        // The real page list. Every entry's debugger URL is the browser endpoint:
+        // nokk uses CDP's flatten model, where one browser socket carries every
+        // page and a client picks a page with `Target.attachToTarget`.
+        p if p.starts_with("/json/list") || p == "/json" || p == "/json/" => {
+            json!(registry.list())
+        }
+        // Creating a page without a connection to own it is not something this
+        // server can do — pages live and die with the CDP connection that opened
+        // them. Say so, rather than answering `[]` and leaving the client to
+        // wonder (which is precisely what it used to do).
+        p if p.starts_with("/json/new") => json!({
+            "error": "not supported: open pages over the browser WebSocket with Target.createTarget",
             "webSocketDebuggerUrl": ws_url,
         }),
         p if p.starts_with("/json") => json!([]),
@@ -165,12 +220,26 @@ struct Target {
     /// `page.goto()` waits for a response whose `loaderId` matches the one
     /// `Page.navigate` reported, and answers `None` when nothing ever does.
     loader_id: Arc<std::sync::Mutex<String>>,
+    /// Extra sessions attached to this same page. Chrome mints a *fresh* session
+    /// for every `Target.attachToTarget`, and a client that gets its existing one
+    /// back sees an attach event for a session it already knows — which is what
+    /// killed Playwright's driver on `new_cdp_session`. Commands may arrive on
+    /// any of them.
+    extra_sessions: Vec<String>,
 }
 
 struct Conn {
     engine: Engine,
     auto_attach: bool,
     targets: Vec<Target>,
+    /// Shared page index behind `/json/list` (see [`TargetRegistry`]), plus the
+    /// port so entries can carry a working debugger URL.
+    registry: TargetRegistry,
+    port: u16,
+    /// Sessions attached to the *browser* rather than a page
+    /// (`Target.attachToBrowserTarget`). Commands arriving on one are handled at
+    /// browser level, exactly as if they carried no session at all.
+    browser_sessions: Vec<String>,
     /// Puppeteer browser contexts (`browser.createBrowserContext`) → their config
     /// (proxy + optional persistent-session name). Targets created in a context
     /// inherit it, giving per-identity (IP + cookie jar) isolation and, when a
@@ -251,8 +320,12 @@ struct PendingTarget {
     browser_context_id: Option<String>,
 }
 
-async fn run_session<S>(ws: tokio_tungstenite::WebSocketStream<S>, engine: Engine)
-where
+async fn run_session<S>(
+    ws: tokio_tungstenite::WebSocketStream<S>,
+    engine: Engine,
+    port: u16,
+    registry: TargetRegistry,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (mut write, mut read) = ws.split();
@@ -278,6 +351,9 @@ where
         auto_attach: false,
         targets: Vec::new(),
         browser_contexts: HashMap::new(),
+        registry,
+        port,
+        browser_sessions: Vec::new(),
     };
 
     // Delivers server-pushed WebSocket frames between commands (see the tick arm
@@ -326,6 +402,11 @@ where
             _ = socket_pump.tick() => { conn.pump_live_pages().await; }
         }
     }
+    // Pages die with the connection that opened them, so drop them from the
+    // shared index too or `/json/list` would advertise targets nobody can reach.
+    for t in &conn.targets {
+        conn.registry.remove(&t.target_id);
+    }
     drop(tx);
     let _ = writer.await;
 }
@@ -372,8 +453,17 @@ impl Conn {
                     browser_context_id,
                     ran_js: Arc::new(AtomicBool::new(false)),
                     loader_id: Arc::new(std::sync::Mutex::new(String::new())),
+                    extra_sessions: Vec::new(),
                 };
                 let info = target_info(&t);
+                self.registry.add(json!({
+                    "id": t.target_id,
+                    "type": "page",
+                    "title": "",
+                    "url": t.url,
+                    "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser/nokk", self.port),
+                    "devtoolsFrontendUrl": "",
+                }));
                 self.targets.push(t);
                 // Emit the target lifecycle events *before* the createTarget reply.
                 // Real Chrome fires `targetCreated`/`attachedToTarget` before the
@@ -415,15 +505,30 @@ impl Conn {
             .map(String::from);
         tracing::debug!(method, session = session.is_some(), "cdp <<");
 
+        // A browser-attached session is browser level; so is no session at all.
+        let browser_level = match session.as_deref() {
+            None => true,
+            Some(s) => self.browser_sessions.iter().any(|b| b == s),
+        };
+
         match method {
             // ---- Browser ----
+            // Playwright's `new_cdp_session` opens a browser session first and
+            // registers it by the id we hand back. Answering `{}` (the old
+            // catch-all) made it register `undefined` and then trip an assertion
+            // that killed its driver outright.
+            "Target.attachToBrowserTarget" => {
+                let sid = next_id("SB");
+                self.browser_sessions.push(sid.clone());
+                vec![ok(id, &session, json!({ "sessionId": sid }))]
+            }
             // Playwright asks for cookies at *browser* level, with no sessionId
             // (`BrowserContext.cookies()`), so this has to answer before the
             // per-target dispatch below — which is why it used to fall through to
             // the catch-all and hand back `{}`, crashing the client on
             // `undefined.map`. Cookies come from the pages of the browser context
             // named in the params, or from every page when none is named.
-            "Storage.getCookies" | "Network.getAllCookies" if session.is_none() => {
+            "Storage.getCookies" | "Network.getAllCookies" if browser_level => {
                 let want = params
                     .get("browserContextId")
                     .and_then(|v| v.as_str())
@@ -582,14 +687,29 @@ impl Conn {
                     .get("targetId")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if let Some(t) = self.targets.iter().find(|t| t.target_id == tid) {
-                    let sid = t.session_id.clone();
+                if let Some(t) = self.targets.iter_mut().find(|t| t.target_id == tid) {
+                    // A page may be attached to more than once (Playwright's
+                    // `new_cdp_session` does exactly that on a page it already
+                    // drives); each attach is its own session, as in Chrome.
+                    let sid = if t.session_id.is_empty() {
+                        t.session_id = next_id("S");
+                        t.session_id.clone()
+                    } else {
+                        let extra = next_id("S");
+                        t.extra_sessions.push(extra.clone());
+                        extra
+                    };
                     let info = target_info(t);
                     vec![
                         ok(id, &session, json!({ "sessionId": sid })),
+                        // On the session that asked, not the root: in the flatten
+                        // model the attach event belongs to the parent session, and
+                        // a client that receives it on the root builds a *second*
+                        // session object for the same id — after which replies land
+                        // on the wrong one and its assertions fire.
                         event(
                             "Target.attachedToTarget",
-                            &None,
+                            &session,
                             json!({ "sessionId": sid, "targetInfo": info, "waitingForDebugger": false }),
                         ),
                     ]
@@ -612,6 +732,7 @@ impl Conn {
                     .find(|t| t.target_id == tid)
                     .map(|t| t.session_id.clone());
                 self.targets.retain(|t| t.target_id != tid);
+                self.registry.remove(tid);
                 let mut out = vec![ok(id, &session, json!({ "success": true }))];
                 if let Some(sid) = sid {
                     out.push(event(
@@ -648,10 +769,11 @@ impl Conn {
         tx: &UnboundedSender<Message>,
     ) -> Vec<Value> {
         // Resolve the target for this session.
-        let idx = match session
-            .as_deref()
-            .and_then(|s| self.targets.iter().position(|t| t.session_id == s))
-        {
+        let idx = match session.as_deref().and_then(|s| {
+            self.targets
+                .iter()
+                .position(|t| t.session_id == s || t.extra_sessions.iter().any(|e| e == s))
+        }) {
             Some(i) => i,
             None => {
                 // Browser-level or unknown: be lenient (empty result).
@@ -799,6 +921,7 @@ impl Conn {
                 if let Ok(mut slot) = self.targets[idx].loader_id.lock() {
                     slot.clone_from(&loader);
                 }
+                self.registry.set_url(&self.targets[idx].target_id, &url);
                 let new_ctx = IDS.fetch_add(1, Ordering::Relaxed) as i64;
                 // Connection-state work is done synchronously here (in the read
                 // loop): swap the target's execution context and re-key its
@@ -1482,6 +1605,9 @@ mod tests {
             auto_attach: false,
             targets: Vec::new(),
             browser_contexts: HashMap::new(),
+            registry: TargetRegistry::default(),
+            port: 0,
+            browser_sessions: Vec::new(),
         }
     }
 
