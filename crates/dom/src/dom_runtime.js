@@ -78,6 +78,10 @@
       const prev = this.childNodes[i - 1] || null, next = this.childNodes[i + 1] || null;
       this.childNodes.splice(i, 1); child.parentNode = null; __markDirty();
       __mutation(__childListRecord(this, [], [child], prev, next));
+      // A removed frame is a closed browsing context. Without this its V8 context
+      // outlives the element forever — a widget that replaces its iframe on a
+      // retry (Turnstile does, repeatedly) would pile them up until the cap.
+      if (child.__ptFrameId) __ptDisconnectFrame(child);
       return child;
     }
     replaceChild(nw, old) { this.insertBefore(nw, old); return this.removeChild(old); }
@@ -1268,6 +1272,16 @@
   let __nextFrameId = 1;
 
   globalThis.__pt_drainFrameQueue = () => __frameOps.splice(0);
+
+  // Tear down a frame whose element left the document, and let the element be
+  // connected again later as a fresh one.
+  const __ptDisconnectFrame = (el) => {
+    const id = el.__ptFrameId;
+    if (!id) return;
+    __frames.delete(id);
+    try { Object.defineProperty(el, '__ptFrameId', { value: 0, configurable: true, enumerable: false }); } catch (e) {}
+    __frameOps.push({ op: 'close', id });
+  };
 
   // The cross-origin window surface, and nothing more: `postMessage`, the frame
   // tree accessors, `closed`. Reading anything else from another origin throws in
