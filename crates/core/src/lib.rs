@@ -1045,32 +1045,13 @@ impl BrowserContext {
             self.apply_ws_ops(&base, &ws_ops).await;
             let delivered = self.deliver_ws_events(index).await?;
 
-            // 4. Frames: build the ones the page connected, then give the live ones
-            //    a turn of their own — a frame whose document finished loading is
-            //    still running, and a widget inside one waits on its own timers.
+            // 4. Frames the page just connected get built now — that is cheap, and
+            //    a widget polls `contentWindow` the instant it inserts one.
             self.apply_frame_ops(&base, &frame_ops).await;
-            let frame_work = self.pump_frames().await?;
 
-            if ran == 0
-                && reqs.is_empty()
-                && ws_ops.is_empty()
-                && delivered == 0
-                && frame_ops.is_empty()
-                && frame_work == 0
-            {
-                // Idle — but an open socket means "not finished", only "nothing
-                // right now". Wait briefly for a frame rather than spinning, and
-                // still return promptly: continuous delivery is the caller's job
-                // (the CDP server pumps periodically), not this call's.
-                if !self.has_open_sockets().await {
-                    break;
-                }
-                if !self.await_ws_event(SOCKET_IDLE_GRACE).await {
-                    break;
-                }
-            }
+            let busy = ran > 0 || !reqs.is_empty() || !ws_ops.is_empty() || delivered > 0;
 
-            // 3. Perform each fetch off the isolate thread, then settle its
+            // 5. Perform each fetch off the isolate thread, then settle its
             //    Promise back on the worker.
             for r in reqs {
                 if fetches_done >= MAX_FETCHES {
@@ -1083,6 +1064,31 @@ impl BrowserContext {
                     .dispatch(self.worker, move |iso| iso.eval(index, &settle))
                     .await?
                     .map_err(EngineError::Js)?;
+            }
+
+            if busy || !frame_ops.is_empty() {
+                continue;
+            }
+
+            // Nothing of the page's own is pending. Frames get their turn *here*,
+            // not on every round: a frame pump costs a dispatch and an event-loop
+            // slice per frame, and paying that on each of up to MAX_ROUNDS rounds
+            // turned one navigation into ten seconds. The deadline is re-checked
+            // first — a frame running something long-lived (an anti-bot challenge
+            // is exactly that) must not stretch the caller's budget.
+            if std::time::Instant::now() < deadline && self.pump_frames().await? > 0 {
+                continue;
+            }
+
+            // Idle — but an open socket means "not finished", only "nothing right
+            // now". Wait briefly for a frame rather than spinning, and still return
+            // promptly: continuous delivery is the caller's job (the CDP server
+            // pumps periodically), not this call's.
+            if !self.has_open_sockets().await {
+                break;
+            }
+            if !self.await_ws_event(SOCKET_IDLE_GRACE).await {
+                break;
             }
         }
         Ok(total_timers)
@@ -1295,6 +1301,30 @@ impl BrowserContext {
                 Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
                 _ => Value::Null,
             };
+            let base = self.frame_base(id);
+
+            // A frame is a document like any other: its `fetch`/XHR has to reach
+            // the network, resolved against *its* URL. Draining this queue and
+            // dropping it (as this did) leaves a widget unable to report anything
+            // home, which looks from the outside exactly like a widget that hangs.
+            if let Some(reqs) = queues["fetch"].as_array() {
+                for r in reqs.iter().take(64) {
+                    work += 1;
+                    let settle = self.perform_fetch(&base, r).await;
+                    let _ = self.eval_in(index, &settle).await;
+                }
+            }
+
+            // Sockets opened from inside a frame share the page's table, so their
+            // frames come back through the same delivery path.
+            if let Some(ws_ops) = queues["ws"].as_array() {
+                if !ws_ops.is_empty() {
+                    work += ws_ops.len();
+                    self.apply_ws_ops(&base, ws_ops).await;
+                }
+            }
+            work += self.deliver_ws_events(index).await?;
+
             // A frame's own `postMessage` calls come back tagged with its id.
             if let Some(ops) = queues["frames"].as_array() {
                 let tagged: Vec<Value> = ops
@@ -1306,7 +1336,7 @@ impl BrowserContext {
                     })
                     .collect();
                 work += tagged.len();
-                self.apply_frame_ops(&self.frame_base(id), &tagged).await;
+                self.apply_frame_ops(&base, &tagged).await;
             }
         }
         Ok(work)
