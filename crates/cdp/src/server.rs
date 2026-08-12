@@ -517,6 +517,31 @@ impl Conn {
             // registers it by the id we hand back. Answering `{}` (the old
             // catch-all) made it register `undefined` and then trip an assertion
             // that killed its driver outright.
+            "Target.getTargetInfo" => {
+                let tid = params.get("targetId").and_then(|v| v.as_str());
+                let info = match tid {
+                    Some(t) => self
+                        .targets
+                        .iter()
+                        .find(|x| x.target_id == t)
+                        .map(target_info),
+                    // No id means "the target this session is attached to"; at
+                    // browser level that is the browser itself.
+                    None => session
+                        .as_deref()
+                        .and_then(|s| {
+                            self.targets.iter().find(|t| {
+                                t.session_id == s || t.extra_sessions.iter().any(|e| e == s)
+                            })
+                        })
+                        .map(target_info),
+                };
+                let info = info.unwrap_or_else(|| {
+                    json!({ "targetId": "browser", "type": "browser", "title": "nokk",
+                            "url": "", "attached": true, "canAccessOpener": false })
+                });
+                vec![ok(id, &session, json!({ "targetInfo": info }))]
+            }
             "Target.attachToBrowserTarget" => {
                 let sid = next_id("SB");
                 self.browser_sessions.push(sid.clone());
@@ -768,6 +793,13 @@ impl Conn {
         session: &Option<String>,
         tx: &UnboundedSender<Message>,
     ) -> Vec<Value> {
+        // A configure-only method is a no-op at either level, so this is checked
+        // before a page is resolved: clients send some of them with a session and
+        // some without, and the answer is the same either way.
+        if is_configuration_noop(method) {
+            return vec![ok(id, session, json!({}))];
+        }
+
         // Resolve the target for this session.
         let idx = match session.as_deref().and_then(|s| {
             self.targets
@@ -776,8 +808,20 @@ impl Conn {
         }) {
             Some(i) => i,
             None => {
-                // Browser-level or unknown: be lenient (empty result).
-                return vec![ok(id, session, json!({}))];
+                // Nothing above claimed it, and there is no page to route it to.
+                return match session {
+                    // A session id we do not know: Chrome's own code for it, and
+                    // the one clients quietly tolerate (Playwright ignores -32001
+                    // by design, since sessions die asynchronously).
+                    Some(_) => vec![err(id, session, -32001, "Session with given id not found.")],
+                    // Browser level, unimplemented. Say so.
+                    None => vec![err(
+                        id,
+                        session,
+                        -32601,
+                        &format!("'{method}' wasn't found"),
+                    )],
+                };
             }
         };
 
@@ -1350,7 +1394,17 @@ impl Conn {
                 vec![]
             }
             // Lenient default: empty result keeps Puppeteer's promise chain alive.
-            _ => vec![ok(id, session, json!({}))],
+            // Everything else genuinely is not implemented, and says so the way
+            // Chrome does. Answering an empty *success* (as this used to) is
+            // indistinguishable from "nothing to report", so a client cannot tell
+            // a gap from an empty result and waits forever — the single defect
+            // behind most of the field report.
+            _ => vec![err(
+                id,
+                session,
+                -32601,
+                &format!("'{method}' wasn't found"),
+            )],
         }
     }
 }
@@ -1562,6 +1616,41 @@ fn ok(id: i64, session: &Option<String>, result: Value) -> Value {
         m["sessionId"] = json!(s);
     }
     m
+}
+
+/// Methods that only *configure* something this engine does not model. A client
+/// sends them for effect and ignores the reply, so an empty success is honest —
+/// there is nothing to report. This list is the dividing line: anything that
+/// would *return data* must either be implemented or say it is missing, because
+/// an empty success there is indistinguishable from "nothing to report" and
+/// leaves the caller waiting forever.
+fn is_configuration_noop(method: &str) -> bool {
+    matches!(
+        method,
+        "Browser.setDownloadBehavior"
+            | "DOM.disable"
+            | "Emulation.setDefaultBackgroundColorOverride"
+            | "Emulation.setEmulatedMedia"
+            | "Emulation.setFocusEmulationEnabled"
+            | "Emulation.setPageScaleFactor"
+            | "Emulation.setScriptExecutionDisabled"
+            | "Emulation.setTouchEmulationEnabled"
+            | "Fetch.disable"
+            | "Log.clear"
+            | "Log.disable"
+            | "Network.disable"
+            | "Network.setCacheDisabled"
+            | "Network.setExtraHTTPHeaders"
+            | "Page.disable"
+            | "Page.setBypassCSP"
+            | "Page.setInterceptFileChooserDialog"
+            | "Page.stopLoading"
+            | "Performance.disable"
+            | "Runtime.discardConsoleEntries"
+            | "Runtime.disable"
+            | "Target.detachFromTarget"
+            | "Target.setDiscoverTargets"
+    )
 }
 
 fn err(id: i64, session: &Option<String>, code: i64, message: &str) -> Value {
