@@ -418,7 +418,10 @@ impl Conn {
     /// loop; pages with neither cost one atomic read.
     async fn pump_live_pages(&self) {
         for t in &self.targets {
-            if t.ran_js.swap(false, Ordering::Relaxed) || t.ctx.has_open_sockets().await {
+            if t.ran_js.swap(false, Ordering::Relaxed)
+                || t.ctx.has_frames()
+                || t.ctx.has_open_sockets().await
+            {
                 let ctx = t.ctx.clone();
                 tokio::spawn(async move {
                     let _ = ctx.run_event_loop().await;

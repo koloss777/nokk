@@ -1145,6 +1145,90 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     globalThis.TextEncoder = class { encode(s) { s = String(s); const a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i) & 0xff; return a; } };
   }
 
+  // --- base64 and the other globals every browser has ---------------------
+  // `atob` missing is not a nicety: Cloudflare's challenge script decodes base64
+  // on its first line and dies with a ReferenceError, and any page doing the same
+  // breaks just as silently. These are cheap and their absence is both a
+  // functional break and something a probe can list in one line.
+  const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  if (!globalThis.atob) {
+    globalThis.atob = function atob(input) {
+      const s = String(input).replace(/[ \t\n\f\r]/g, '');
+      const body = s.replace(/=+$/, '');
+      if (body.length % 4 === 1 || /[^A-Za-z0-9+/]/.test(body)) {
+        throw new (globalThis.DOMException || Error)("Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.", 'InvalidCharacterError');
+      }
+      let out = '', bits = 0, acc = 0;
+      for (const ch of body) {
+        acc = (acc << 6) | B64.indexOf(ch);
+        bits += 6;
+        if (bits >= 8) { bits -= 8; out += String.fromCharCode((acc >> bits) & 0xff); }
+      }
+      return out;
+    };
+  }
+  if (!globalThis.btoa) {
+    globalThis.btoa = function btoa(input) {
+      const s = String(input);
+      let out = '';
+      for (let i = 0; i < s.length; i += 3) {
+        const c0 = s.charCodeAt(i), c1 = s.charCodeAt(i + 1), c2 = s.charCodeAt(i + 2);
+        if (c0 > 255 || c1 > 255 || c2 > 255) {
+          throw new (globalThis.DOMException || Error)("Failed to execute 'btoa' on 'Window': The string to be encoded contains characters outside of the Latin1 range.", 'InvalidCharacterError');
+        }
+        const n = (c0 << 16) | ((c1 || 0) << 8) | (c2 || 0);
+        out += B64[(n >> 18) & 63] + B64[(n >> 12) & 63]
+          + (isNaN(c1) ? '=' : B64[(n >> 6) & 63])
+          + (isNaN(c2) ? '=' : B64[n & 63]);
+      }
+      return out;
+    };
+  }
+  // A deep clone that covers what pages actually pass through it.
+  if (!globalThis.structuredClone) {
+    globalThis.structuredClone = function structuredClone(v) {
+      const seen = new Map();
+      const walk = (x) => {
+        if (x === null || typeof x !== 'object') return x;
+        if (seen.has(x)) return seen.get(x);
+        if (x instanceof Date) return new Date(x.getTime());
+        if (x instanceof RegExp) return new RegExp(x.source, x.flags);
+        if (ArrayBuffer.isView(x)) return new x.constructor(x);
+        if (x instanceof ArrayBuffer) return x.slice(0);
+        if (x instanceof Map) { const m = new Map(); seen.set(x, m); for (const [k, val] of x) m.set(walk(k), walk(val)); return m; }
+        if (x instanceof Set) { const st = new Set(); seen.set(x, st); for (const val of x) st.add(walk(val)); return st; }
+        if (Array.isArray(x)) { const a = []; seen.set(x, a); for (const val of x) a.push(walk(val)); return a; }
+        const o = {}; seen.set(x, o);
+        for (const k of Object.keys(x)) o[k] = walk(x[k]);
+        return o;
+      };
+      return walk(v);
+    };
+  }
+  if (!globalThis.reportError) globalThis.reportError = function reportError(e) { try { console.error(e); } catch (x) {} };
+  if (!globalThis.AbortController) {
+    globalThis.AbortSignal = globalThis.AbortSignal || class AbortSignal {
+      constructor() { this.aborted = false; this.reason = undefined; this.onabort = null; this._ls = []; }
+      addEventListener(t, fn) { if (t === 'abort' && typeof fn === 'function') this._ls.push(fn); }
+      removeEventListener(t, fn) { const i = this._ls.indexOf(fn); if (i >= 0) this._ls.splice(i, 1); }
+      dispatchEvent() { return true; }
+      throwIfAborted() { if (this.aborted) throw this.reason; }
+      static abort(reason) { const s = new globalThis.AbortSignal(); s.aborted = true; s.reason = reason; return s; }
+    };
+    globalThis.AbortController = class AbortController {
+      constructor() { this.signal = new globalThis.AbortSignal(); }
+      abort(reason) {
+        const s = this.signal;
+        if (s.aborted) return;
+        s.aborted = true;
+        s.reason = reason === undefined ? new Error('signal is aborted without reason') : reason;
+        const ev = { type: 'abort', target: s, currentTarget: s };
+        try { if (typeof s.onabort === 'function') s.onabort(ev); } catch (e) {}
+        for (const fn of s._ls.slice()) { try { fn(ev); } catch (e) {} }
+      }
+    };
+  }
+
   // --- WebSocket ----------------------------------------------------------
   // Same shape as fetch above: JS owns the object and its state machine, Rust
   // owns the socket. Operations pile onto a queue the event loop drains

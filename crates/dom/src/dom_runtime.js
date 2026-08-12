@@ -68,6 +68,8 @@
       child.parentNode = this;
       __markDirty();
       __mutation(__childListRecord(this, [child], [], child.previousSibling, child.nextSibling));
+      // A frame only becomes a browsing context once it is in the document.
+      if (child.__ptConnectFrame && child.isConnected) child.__ptConnectFrame();
       return child;
     }
     removeChild(child) {
@@ -251,7 +253,10 @@
     // `script.src` against its api.js URL, and while this returned `''` the
     // widget refused to initialise ("Could not find Turnstile valid script tag").
     get src() { return this.__ptUrlAttr('src'); }
-    set src(v) { this.setAttribute('src', v); }
+    set src(v) {
+      this.setAttribute('src', v);
+      if (this.__ptConnectFrame && this.isConnected) this.__ptConnectFrame();
+    }
     get href() { return this.__ptUrlAttr('href'); }
     set href(v) { this.setAttribute('href', v); }
     get action() { return this.__ptUrlAttr('action'); }
@@ -303,6 +308,38 @@
     matches(sel) { return matchesSelector(this, sel); }
 
     // Serialization
+    // --- iframes ----------------------------------------------------------
+    // An iframe is a *browsing context*, not a tag: a widget creates one, then
+    // polls `contentWindow` and refuses to proceed until it answers. Connecting
+    // one queues a request the engine turns into a real child context; until it
+    // is ready `contentWindow` is null, exactly as in a browser.
+    get contentWindow() {
+      // Present the moment the frame is connected, not once its document has
+      // loaded — that is how a browser behaves (the window exists, `about:blank`
+      // at first, and navigates afterwards). Waiting for the load was enough to
+      // make widgets that poll this synchronously give up and start over.
+      const st = __frames.get(this.__ptFrameId);
+      return st ? st.win : null;
+    }
+    get contentDocument() {
+      const st = __frames.get(this.__ptFrameId);
+      // Cross-origin frames expose no document at all — that is the rule, not a
+      // limitation. A same-origin one is not reachable from here either (its
+      // document lives in another V8 context), so it reports the same.
+      return st && st.ready && st.sameOrigin ? st.doc || null : null;
+    }
+    __ptConnectFrame() {
+      if (this.__ptFrameId || this.__ptLocal !== 'iframe') return;
+      const src = this.getAttribute('src');
+      if (!src) return;
+      const id = __nextFrameId++;
+      Object.defineProperty(this, '__ptFrameId', { value: id, configurable: true, enumerable: false });
+      const st = { el: this, ready: false, sameOrigin: false, win: null, doc: null, pending: [] };
+      st.win = __frameWindow(id, st);
+      __frames.set(id, st);
+      __frameOps.push({ op: 'open', id, src });
+    }
+
     // Shadow DOM. A widget that draws itself into a shadow root — Cloudflare's
     // Turnstile does, and so does most of the web-component world — dies at the
     // first line without this. The tree is genuinely separate: nothing inside is
@@ -1221,6 +1258,89 @@
     unobserve(target) { const t = this.__ptState.targets; const i = t.indexOf(target); if (i >= 0) t.splice(i, 1); }
     disconnect() { this.__ptState.targets = []; }
   }
+
+  // --- frame plumbing -----------------------------------------------------
+  // The engine drains `__pt_drainFrameQueue` each turn, builds the child context,
+  // and calls back with `__pt_frameReady`. Messages travel the same road: a
+  // `postMessage` in either direction becomes an op, and arrives as an event.
+  const __frames = new Map();
+  const __frameOps = [];
+  let __nextFrameId = 1;
+
+  globalThis.__pt_drainFrameQueue = () => __frameOps.splice(0);
+
+  // The cross-origin window surface, and nothing more: `postMessage`, the frame
+  // tree accessors, `closed`. Reading anything else from another origin throws in
+  // a browser; answering `undefined` would give us away, so the object simply
+  // carries what is allowed. Messages sent before the document exists are held
+  // and flushed on ready, as a browser queues them against `about:blank`.
+  const __frameWindow = (id, st) => ({
+    postMessage: (data, targetOrigin) => {
+      const op = { op: 'post', id, data: JSON.stringify(data === undefined ? null : data), toParent: false, targetOrigin: String(targetOrigin || '*') };
+      if (st.ready) __frameOps.push(op); else st.pending.push(op);
+    },
+    get closed() { return false; },
+    get frames() { return st.win; },
+    get length() { return 0; },
+    get parent() { return globalThis; },
+    get top() { return globalThis; },
+    get opener() { return null; },
+    get self() { return st.win; },
+    get window() { return st.win; },
+  });
+
+  globalThis.__pt_frameReady = (id, origin) => {
+    const st = __frames.get(id);
+    if (!st) return;
+    st.ready = true;
+    st.sameOrigin = !!(globalThis.location && origin === location.origin);
+    for (const op of st.pending.splice(0)) __frameOps.push(op);
+    const ev = { type: 'load', target: st.el, currentTarget: st.el, isTrusted: true };
+    try { if (typeof st.el.onload === 'function') st.el.onload(ev); } catch (e) {}
+    try { st.el.dispatchEvent && st.el.dispatchEvent(ev); } catch (e) {}
+  };
+
+  globalThis.__pt_frameFailed = (id) => {
+    const st = __frames.get(id);
+    if (!st) return;
+    __frames.delete(id);
+    const ev = { type: 'error', target: st.el, currentTarget: st.el, isTrusted: true };
+    try { if (typeof st.el.onerror === 'function') st.el.onerror(ev); } catch (e) {}
+    try { st.el.dispatchEvent && st.el.dispatchEvent(ev); } catch (e) {}
+  };
+
+  // A `message` event arriving from the other side of a frame boundary.
+  globalThis.__pt_deliverMessage = (data, origin, fromFrameId) => {
+    const source = fromFrameId ? (__frames.get(fromFrameId) || {}).win || null : (globalThis.parent === globalThis ? null : globalThis.parent);
+    const ev = {
+      type: 'message', data, origin: String(origin || ''), lastEventId: '',
+      source, ports: [], isTrusted: true, target: globalThis, currentTarget: globalThis,
+    };
+    try { if (typeof globalThis.onmessage === 'function') globalThis.onmessage(ev); } catch (e) {}
+    try { globalThis.dispatchEvent && globalThis.dispatchEvent(ev); } catch (e) {}
+  };
+
+  // Inside a frame, `parent`/`top` are the embedder, and `postMessage` on them
+  // goes back up. The engine calls this right after creating the child context
+  // and before its document exists — a context cannot know it is a frame while
+  // its own bootstrap is still running.
+  globalThis.__pt_markAsFrame = (id) => {
+    globalThis.__pt_frameId = id;
+    const up = {
+      postMessage: (data) => {
+        __frameOps.push({ op: 'post', data: JSON.stringify(data === undefined ? null : data), toParent: true });
+      },
+      get closed() { return false; },
+      get frames() { return up; },
+      get length() { return 0; },
+      get self() { return up; },
+      get window() { return up; },
+    };
+    try {
+      Object.defineProperty(globalThis, 'parent', { value: up, configurable: true });
+      Object.defineProperty(globalThis, 'top', { value: up, configurable: true });
+    } catch (e) {}
+  };
 
   // Assigned here, after the declarations (a class stays in its temporal dead
   // zone until then). These override the stealth layer's inert stubs: with a

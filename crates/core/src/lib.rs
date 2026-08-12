@@ -596,10 +596,11 @@ impl Engine {
         let permit = self.inner.pool.acquire_context().await?;
         let worker = self.inner.pool.pick_worker();
         let load = self.inner.pool.register_context(worker);
+        let boot = bootstrap.clone();
         let index = self
             .inner
             .pool
-            .dispatch(worker, move |iso| iso.create_context(&bootstrap))
+            .dispatch(worker, move |iso| iso.create_context(&boot))
             .await?
             .map_err(EngineError::Js)?;
         tracing::debug!(?worker, index, "context created");
@@ -612,6 +613,8 @@ impl Engine {
             requests: std::sync::Mutex::new(Vec::new()),
             sockets: tokio::sync::Mutex::new(PageSockets::new()),
             network_tx: std::sync::Mutex::new(None),
+            frames: std::sync::Mutex::new(HashMap::new()),
+            bootstrap,
             session,
             _permit: permit,
             _load: load,
@@ -724,8 +727,25 @@ pub struct BrowserContext {
     /// Where to forward each completed request, when a CDP session is attached
     /// and wants `Network.*` events.
     network_tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<NetworkRecord>>>,
+    /// `<iframe>`s the page has connected, by the id its DOM assigned. Each is a
+    /// V8 context of its own on this same worker — a real browsing context, which
+    /// is what a widget means when it polls `iframe.contentWindow`.
+    frames: std::sync::Mutex<HashMap<u32, FrameState>>,
+    /// This context's bootstrap, kept so a child frame is built with the same
+    /// stealth profile — an iframe of this browser is the same machine.
+    bootstrap: String,
     _permit: tokio::sync::OwnedSemaphorePermit,
     _load: nokk_pool::ContextLoadGuard,
+}
+
+/// A live `<iframe>`: its own V8 context on the parent's worker, plus where it
+/// came from. `origin` decides what the parent may touch — a cross-origin frame
+/// exposes only `postMessage`, as in a browser.
+#[derive(Debug, Clone)]
+struct FrameState {
+    index: usize,
+    url: String,
+    origin: String,
 }
 
 /// One page's open sockets, plus the single queue everything they produce lands
@@ -860,6 +880,21 @@ impl BrowserContext {
         }
     }
 
+    /// Evaluate in one of this context's *sibling* V8 contexts on the same worker
+    /// — an iframe's document lives in one of these (see [`Self::frames`]). The
+    /// page's own context is [`Self::index`], so `eval_in(self.index, …)` is
+    /// exactly [`Self::evaluate`].
+    async fn eval_in(&self, index: usize, source: &str) -> Result<Value, EngineError> {
+        let source = source.to_string();
+        let out = self
+            .engine
+            .pool
+            .dispatch(self.worker, move |iso| iso.eval(index, &source))
+            .await?
+            .map_err(EngineError::Js)?;
+        Ok(Value::String(out))
+    }
+
     /// Build the DOM from `html`, then run its scripts in document order and fire
     /// `DOMContentLoaded`/`load`. `base_url` resolves relative external script
     /// `src`s. Page scripts that throw are logged and skipped — a broken page
@@ -868,14 +903,30 @@ impl BrowserContext {
         if let Ok(mut b) = self.base_url.lock() {
             *b = base_url.to_string();
         }
+        self.load_html_into(self.index, base_url, html).await?;
+        // Timers and async continuations scheduled during load (and by the load
+        // handlers) get their turn now.
+        self.run_event_loop().await?;
+        Ok(())
+    }
+
+    /// [`Self::load_html`] against a chosen context — the same steps, so an
+    /// iframe's document is built exactly the way the top-level one is (its own
+    /// `location`, its own tree, its own scripts, its own lifecycle events).
+    async fn load_html_into(
+        &self,
+        index: usize,
+        base_url: &str,
+        html: &str,
+    ) -> Result<(), EngineError> {
         // Reflect the real URL into `window.location` before any script runs.
         if let Some(js) = location_setter(base_url) {
-            let _ = self.evaluate(&js).await;
+            let _ = self.eval_in(index, &js).await;
         }
         let page = nokk_dom::parse(html);
 
         // Install the parsed tree as `document`.
-        self.evaluate(&page.install_script()).await?;
+        self.eval_in(index, &page.install_script()).await?;
 
         // Execute scripts in order against the live document. `idx` matches the
         // document-order script list the DOM runtime built, so `__pt_beginScript`
@@ -906,17 +957,20 @@ impl BrowserContext {
                     }
                 },
             };
-            let _ = self.evaluate(&format!("__pt_beginScript({idx})")).await;
-            if let Err(e) = self.evaluate(&code).await {
+            let _ = self
+                .eval_in(index, &format!("__pt_beginScript({idx})"))
+                .await;
+            if let Err(e) = self.eval_in(index, &code).await {
                 tracing::debug!(error = %e, "page script threw");
             }
-            let _ = self.evaluate("__pt_endScript()").await;
+            let _ = self.eval_in(index, "__pt_endScript()").await;
         }
 
-        // Fire lifecycle events, then drain the event loop so timers and async
-        // continuations scheduled during load (and by the load handlers) run.
-        self.evaluate("__pt_finishLoad();").await?;
-        self.run_event_loop().await?;
+        // Fire lifecycle events. Draining the loop afterwards is the *caller's*
+        // job: for the top-level page that is `load_html` below, and for a frame
+        // it is `pump_frames`, which gives it turns of its own. Pumping here would
+        // mean a frame's load re-entering the parent's whole event loop.
+        self.eval_in(index, "__pt_finishLoad();").await?;
         Ok(())
     }
 
@@ -984,13 +1038,26 @@ impl BrowserContext {
             let queues: Value = serde_json::from_str(&qjson).unwrap_or_default();
             let reqs: Vec<Value> = queues["fetch"].as_array().cloned().unwrap_or_default();
             let ws_ops: Vec<Value> = queues["ws"].as_array().cloned().unwrap_or_default();
+            let frame_ops: Vec<Value> = queues["frames"].as_array().cloned().unwrap_or_default();
 
             // 3. Sockets: apply what the page asked for, then hand it whatever the
             //    sockets have produced since the last round.
             self.apply_ws_ops(&base, &ws_ops).await;
             let delivered = self.deliver_ws_events(index).await?;
 
-            if ran == 0 && reqs.is_empty() && ws_ops.is_empty() && delivered == 0 {
+            // 4. Frames: build the ones the page connected, then give the live ones
+            //    a turn of their own — a frame whose document finished loading is
+            //    still running, and a widget inside one waits on its own timers.
+            self.apply_frame_ops(&base, &frame_ops).await;
+            let frame_work = self.pump_frames().await?;
+
+            if ran == 0
+                && reqs.is_empty()
+                && ws_ops.is_empty()
+                && delivered == 0
+                && frame_ops.is_empty()
+                && frame_work == 0
+            {
                 // Idle — but an open socket means "not finished", only "nothing
                 // right now". Wait briefly for a frame rather than spinning, and
                 // still return promptly: continuous delivery is the caller's job
@@ -1069,6 +1136,13 @@ impl BrowserContext {
         !self.sockets.lock().await.open.is_empty()
     }
 
+    /// Whether this page has a live `<iframe>`. Same reasoning as a socket: the
+    /// frame is a running document with timers and requests of its own, and it
+    /// freezes the moment nothing pumps it.
+    pub fn has_frames(&self) -> bool {
+        self.frames.lock().map(|f| !f.is_empty()).unwrap_or(false)
+    }
+
     /// Wait up to `grace` for any socket to produce something, putting it back on
     /// the queue for the next drain. False means nothing arrived in time.
     async fn await_ws_event(&self, grace: std::time::Duration) -> bool {
@@ -1081,6 +1155,170 @@ impl BrowserContext {
             }
             _ => false,
         }
+    }
+
+    /// Carry out the frame operations the page queued: build a browsing context
+    /// for a connected `<iframe>`, or tear one down.
+    ///
+    /// This is what makes an iframe *real* rather than an inert tag. The child
+    /// gets its own V8 context on this same worker (so parent and child can be
+    /// driven without cross-thread hops), the same stealth bootstrap (an iframe of
+    /// this browser is the same machine), its own `location`, its own document and
+    /// its own scripts — after which `contentWindow` answers, which is precisely
+    /// what a widget polls for before it will do anything.
+    async fn apply_frame_ops(&self, base: &str, ops: &[Value]) {
+        const MAX_FRAMES: usize = 16;
+        for op in ops {
+            let id = op["id"].as_u64().unwrap_or(0) as u32;
+            match op["op"].as_str().unwrap_or("") {
+                "open" => {
+                    let raw = op["src"].as_str().unwrap_or("");
+                    if raw.is_empty() || raw == "about:blank" {
+                        continue;
+                    }
+                    let url = resolve_url(base, raw).unwrap_or_else(|| raw.to_string());
+                    if self.engine.block_trackers && nokk_net::is_blocked_url(&url) {
+                        self.record("GET", &url, "document", 0, &[]);
+                        continue;
+                    }
+                    // A page that spawns frames without bound would pin unbounded
+                    // contexts to a shared worker.
+                    if self.frames.lock().map(|f| f.len()).unwrap_or(0) >= MAX_FRAMES {
+                        continue;
+                    }
+                    let Ok((_, html)) = self.fetch_text(&url, "document").await else {
+                        let _ = self.evaluate(&format!("__pt_frameFailed({id})")).await;
+                        continue;
+                    };
+                    let boot = self.bootstrap.clone();
+                    let Ok(Ok(index)) = self
+                        .engine
+                        .pool
+                        .dispatch(self.worker, move |iso| iso.create_context(&boot))
+                        .await
+                    else {
+                        continue;
+                    };
+                    // Teach the child who it is before anything runs in it: its own
+                    // frame id (so its `postMessage` can be routed back) and that it
+                    // is not the top-level window.
+                    let _ = self
+                        .eval_in(index, &format!("__pt_markAsFrame({id});"))
+                        .await;
+                    let origin = origin_of(&url);
+                    if let Ok(mut frames) = self.frames.lock() {
+                        frames.insert(
+                            id,
+                            FrameState {
+                                index,
+                                url: url.clone(),
+                                origin: origin.clone(),
+                            },
+                        );
+                    }
+                    if let Err(e) = self.load_html_into(index, &url, &html).await {
+                        tracing::debug!(url = %url, error = %e, "iframe document failed to load");
+                    }
+                    // Only now does `contentWindow` exist, and only now does the
+                    // element's `load` fire — the order a page relies on.
+                    let _ = self
+                        .evaluate(&format!("__pt_frameReady({id}, {});", js_str(&origin)))
+                        .await;
+                }
+                "close" => {
+                    let gone = self.frames.lock().ok().and_then(|mut f| f.remove(&id));
+                    if let Some(f) = gone {
+                        let idx = f.index;
+                        let _ = self
+                            .engine
+                            .pool
+                            .dispatch(self.worker, move |iso| iso.dispose_context(idx))
+                            .await;
+                    }
+                }
+                // `parent.postMessage` from inside a frame, or
+                // `frame.contentWindow.postMessage` from the page: same plumbing,
+                // opposite directions.
+                "post" => {
+                    let data = op["data"].as_str().unwrap_or("null").to_string();
+                    let to_parent = op["toParent"].as_bool().unwrap_or(false);
+                    let target = self.frames.lock().ok().and_then(|f| f.get(&id).cloned());
+                    let Some(frame) = target else { continue };
+                    let (index, origin) = if to_parent {
+                        (self.index, frame.origin.clone())
+                    } else {
+                        (frame.index, origin_of(base))
+                    };
+                    let _ = self
+                        .eval_in(
+                            index,
+                            &format!(
+                                "__pt_deliverMessage({}, {}, {});",
+                                data,
+                                js_str(&origin),
+                                if to_parent {
+                                    id.to_string()
+                                } else {
+                                    "0".into()
+                                }
+                            ),
+                        )
+                        .await;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Drain what every live frame queued (its `parent.postMessage` calls) and
+    /// give each one an event-loop turn, so a frame's own timers and fetches make
+    /// progress rather than freezing the moment its document finished loading.
+    async fn pump_frames(&self) -> Result<usize, EngineError> {
+        let frames: Vec<(u32, usize)> = self
+            .frames
+            .lock()
+            .map(|f| f.iter().map(|(id, s)| (*id, s.index)).collect())
+            .unwrap_or_default();
+        let mut work = 0;
+        for (id, index) in frames {
+            let ran = self
+                .engine
+                .pool
+                .dispatch(self.worker, move |iso| {
+                    iso.run_event_loop(index, 200, std::time::Duration::from_millis(50))
+                })
+                .await?
+                .unwrap_or(0);
+            work += ran as usize;
+            let qjson = self.eval_in(index, DRAIN_IO).await?;
+            let queues: Value = match qjson {
+                Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
+                _ => Value::Null,
+            };
+            // A frame's own `postMessage` calls come back tagged with its id.
+            if let Some(ops) = queues["frames"].as_array() {
+                let tagged: Vec<Value> = ops
+                    .iter()
+                    .map(|o| {
+                        let mut o = o.clone();
+                        o["id"] = json_num(id);
+                        o
+                    })
+                    .collect();
+                work += tagged.len();
+                self.apply_frame_ops(&self.frame_base(id), &tagged).await;
+            }
+        }
+        Ok(work)
+    }
+
+    /// The document URL a frame resolves its own relative URLs against.
+    fn frame_base(&self, id: u32) -> String {
+        self.frames
+            .lock()
+            .ok()
+            .and_then(|f| f.get(&id).map(|s| s.url.clone()))
+            .unwrap_or_default()
     }
 
     /// Carry out the `open`/`send`/`close` operations the page queued.
@@ -1422,7 +1660,12 @@ static REQUEST_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// queues instead of throwing.
 const DRAIN_IO: &str = "JSON.stringify({\
     fetch: typeof __pt_drainFetchQueue === 'function' ? JSON.parse(__pt_drainFetchQueue()) : [],\
-    ws: typeof __pt_drainWsQueue === 'function' ? __pt_drainWsQueue() : []})";
+    ws: typeof __pt_drainWsQueue === 'function' ? __pt_drainWsQueue() : [],\
+    frames: typeof __pt_drainFrameQueue === 'function' ? __pt_drainFrameQueue() : []})";
+
+fn json_num(v: u32) -> Value {
+    Value::Number(serde_json::Number::from(v))
+}
 
 /// A JS string literal for `s` (safely quoted/escaped).
 fn js_str(s: &str) -> String {
