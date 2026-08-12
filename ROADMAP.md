@@ -15,7 +15,7 @@ Legend: ✅ done · 🟡 partial / in progress · ⬜ planned
 | 2 | Network + Chrome TLS/HTTP fingerprint (BoringSSL, JA3/JA4, HTTP/2) | ✅ |
 | 3 | HTML parsing → DOM | ✅ |
 | 4 | JS ↔ DOM bridge (`document`, events, timers, `fetch`/XHR) | ✅ |
-| 5 | CDP WebSocket server (Puppeteer connect / navigate / evaluate) | 🟡 |
+| 5 | CDP WebSocket server (Puppeteer + Playwright: connect / navigate / evaluate / cookies / Network events) | 🟡 |
 | 6 | JS-level stealth (canvas/WebGL/audio, `window.chrome`, hardening) | 🟡 |
 | 7 | Scaling & concurrency (100–1000 contexts under a memory ceiling) | ⬜ |
 | 8 | Testing, benchmarks, fingerprint regression suite | 🟡 |
@@ -186,34 +186,40 @@ Keep in JS (the advantage is real):
 
 ## Near-term: protocol & DOM completeness (Phase 5)
 
-The four entries below come from a field report against a live Akamai-protected,
+All four entries below came from a field report against a live Akamai-protected,
 WebSocket-driven app — the run where nokk *cleared a challenge headless Chrome
-failed* and then couldn't use the session. They share one root cause worth fixing
-first.
+failed* and then couldn't use the session. All are now closed, each verified
+against live Puppeteer and Playwright.
 
-- ⬜ **Unknown CDP commands must not silently succeed.** `crates/cdp/src/server.rs`
-  ends its dispatch with `_ => ok(id, {})`, so every unimplemented method returns an
-  empty *success*. A client cannot tell "not implemented" from "nothing to report"
-  and waits forever, and Playwright crashes on the shape (`ctx.cookies()` →
-  `Cannot read properties of undefined (reading 'map')`, because `Network.getCookies`
-  answered `{}` with no `cookies` key). Return a proper `-32601` for methods we
-  don't implement, keeping an explicit allow-list of the harmless no-ops
-  (`Log.enable`, `Performance.enable`, …) that clients call for effect.
-- ⬜ **`Network` domain emits nothing.** `Network.enable` is in that no-op list, so
-  a 452 KB navigation with subresources produces zero `requestWillBeSent` /
-  `responseReceived`. Downstream, Playwright's `page.goto()` returns `None` — it
-  builds the response object from those events. The engine already records every
-  request (the interception audit trail); wire that into CDP events.
-- ⬜ **`Network.getCookies` / `Storage.getCookies` return real cookies**, HttpOnly
-  included. Today: unimplemented → `{}`. This is the only way to export a warmed
-  session (Akamai's `ak_bmsc`/`bm_s*`, a `cf_clearance`) to another process, and
-  `document.cookie` can't substitute — everything that matters is HttpOnly. The jar
-  is already there in `nokk-net`; this is plumbing.
-- ⬜ **`/json`, `/json/list`, `/json/new` return `[]`.** Only `/json/version` is
-  real; everything else matches `p if p.starts_with("/json") => json!([])`. Generic
-  CDP clients probe these, get an empty list, fall back to the browser endpoint, and
-  then send page-level commands with no `sessionId` — which vanish into the no-op
-  path above. Implement target listing/creation, or answer with an explicit error.
+- ✅ **Unimplemented CDP methods say so.** The dispatcher ended in `_ => ok(id, {})`,
+  so anything nokk did not implement returned an empty *success* — indistinguishable
+  from "nothing to report", which is why a client waited forever or crashed on a
+  shape that never came. This was the root cause behind the three below. Unknown
+  methods now answer `-32601` as Chrome does, unknown sessions `-32001`, and an
+  explicit allow-list keeps the configure-only calls (which a client sends for
+  effect and ignores) as honest no-ops. The list was built from traces of both
+  clients driving a full session.
+- ✅ **`Network` domain emits events.** `requestWillBeSent` / `responseReceived` /
+  `loadingFinished` (and `loadingFailed` for a request that never got a response),
+  published from the engine's existing request log. Two Chrome behaviours had to
+  match exactly for a client to make sense of them: a navigation's document request
+  carries the same id as its loader, and that loader id is the one `Page.navigate`
+  reported. With both, Playwright's `page.goto()` returns a real response instead
+  of `None`.
+- ✅ **`Network.getCookies` / `Storage.getCookies` return real cookies**, HttpOnly
+  included — the only way to export a warmed session. The jar used to be
+  unreachable by construction (wreq's internal store); every client now keeps one
+  we own. Playwright asks at browser level, with no session, so that form is
+  answered before per-page dispatch.
+- ✅ **`/json`, `/json/list`** list the real pages, following navigation and
+  disappearing with the connection that owns them; **`/json/new`** says plainly that
+  it cannot create one rather than answering `[]`.
+- ✅ **`Target.attachToBrowserTarget` / `attachToTarget`.** The first returned no
+  session id, so Playwright's `new_cdp_session` registered `undefined` and killed
+  its driver; the second reused the page's existing session and announced it at
+  root, so a second attach built a duplicate session object and replies landed on
+  the wrong one. Each attach now mints a fresh session, announced on the session
+  that asked, and a page resolves commands arriving on any of its sessions.
 - 🟡 **CDP registry lifecycle** — honor `removeScriptToEvaluateOnNewDocument` and
   `releaseObjectGroup`; bound per-connection registry growth.
 - ✅ **Puppeteer `page.$` / `$eval` / `$$eval`** — work now. The blocker was
