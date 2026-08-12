@@ -30,6 +30,13 @@ pub struct CookieRecord {
     pub path: Option<String>,
     pub secure: bool,
     pub http_only: bool,
+    /// Expiry as a Unix timestamp in seconds; `None` for a session cookie.
+    /// `#[serde(default)]` so jars written before this field still load.
+    #[serde(default)]
+    pub expires: Option<f64>,
+    /// `Strict` / `Lax` / `None`, as the attribute was written.
+    #[serde(default)]
+    pub same_site: Option<String>,
 }
 
 impl SessionJar {
@@ -113,10 +120,26 @@ impl SessionJar {
             .map(|c| CookieRecord {
                 name: c.name().to_owned(),
                 value: c.value().to_owned(),
-                domain: c.domain().map(str::to_owned),
+                // The *effective* domain, not the raw attribute: a cookie set
+                // without `Domain=` has none of its own, yet still belongs to the
+                // host that set it, and reporting `""` would make it unusable to
+                // anyone replaying the jar. A `Domain=` cookie gets Chrome's
+                // leading dot, marking that it also matches subdomains.
+                domain: match &c.domain {
+                    cookie_store::CookieDomain::HostOnly(h) => Some(h.clone()),
+                    cookie_store::CookieDomain::Suffix(s) => Some(format!(".{s}")),
+                    _ => None,
+                },
                 path: c.path().map(str::to_owned),
                 secure: c.secure().unwrap_or(false),
                 http_only: c.http_only().unwrap_or(false),
+                // From the store's own expiry, which is where a `Max-Age` lands —
+                // the raw cookie only carries an explicit `Expires`.
+                expires: match c.expires {
+                    cookie_store::CookieExpiration::AtUtc(t) => Some(t.unix_timestamp() as f64),
+                    cookie_store::CookieExpiration::SessionEnd => None,
+                },
+                same_site: c.same_site().map(|s| s.to_string()),
             })
             .collect()
     }

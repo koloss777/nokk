@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use nokk::{BrowserContext, Engine, ProxyConfig, ProxyScheme};
+use nokk::{reason_phrase, BrowserContext, Engine, ProxyConfig, ProxyScheme};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -160,6 +160,11 @@ struct Target {
     /// sockets: the tick only pumps pages holding one, and holding one requires
     /// a pump.
     ran_js: Arc<AtomicBool>,
+    /// The loader id of the navigation in flight. A client ties the document
+    /// request to the navigation by *this* id, not by the frame's — Playwright's
+    /// `page.goto()` waits for a response whose `loaderId` matches the one
+    /// `Page.navigate` reported, and answers `None` when nothing ever does.
+    loader_id: Arc<std::sync::Mutex<String>>,
 }
 
 struct Conn {
@@ -366,6 +371,7 @@ impl Conn {
                     init_scripts: Vec::new(),
                     browser_context_id,
                     ran_js: Arc::new(AtomicBool::new(false)),
+                    loader_id: Arc::new(std::sync::Mutex::new(String::new())),
                 };
                 let info = target_info(&t);
                 self.targets.push(t);
@@ -411,6 +417,33 @@ impl Conn {
 
         match method {
             // ---- Browser ----
+            // Playwright asks for cookies at *browser* level, with no sessionId
+            // (`BrowserContext.cookies()`), so this has to answer before the
+            // per-target dispatch below — which is why it used to fall through to
+            // the catch-all and hand back `{}`, crashing the client on
+            // `undefined.map`. Cookies come from the pages of the browser context
+            // named in the params, or from every page when none is named.
+            "Storage.getCookies" | "Network.getAllCookies" if session.is_none() => {
+                let want = params
+                    .get("browserContextId")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let mut seen = std::collections::HashSet::new();
+                let mut cookies = Vec::new();
+                for t in &self.targets {
+                    if want.is_some() && t.browser_context_id != want {
+                        continue;
+                    }
+                    for c in t.ctx.cookies(&[]) {
+                        // Pages in one context share a jar; don't report twice.
+                        let key = (c.name.clone(), c.domain.clone(), c.path.clone());
+                        if seen.insert(key) {
+                            cookies.push(cdp_cookie(c));
+                        }
+                    }
+                }
+                vec![ok(id, &session, json!({ "cookies": cookies }))]
+            }
             "Browser.getVersion" => vec![ok(
                 id,
                 &session,
@@ -645,8 +678,54 @@ impl Conn {
                     ),
                 ]
             }
+            // The jar the engine actually sends, HttpOnly included — `document.cookie`
+            // cannot see the ones that matter (a `cf_clearance`, Akamai's `bm_s*`),
+            // so this is the only route for handing a warmed session to another
+            // process. `Storage.getCookies` is the browser-wide spelling of the
+            // same thing; both answer from this page's client.
+            "Network.getCookies" | "Network.getAllCookies" | "Storage.getCookies" => {
+                let urls: Vec<String> = params
+                    .get("urls")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let cookies: Vec<Value> = self.targets[idx]
+                    .ctx
+                    .cookies(&urls)
+                    .into_iter()
+                    .map(cdp_cookie)
+                    .collect();
+                vec![ok(id, session, json!({ "cookies": cookies }))]
+            }
+            // Chrome only reports network activity after `enable`, and a client
+            // that never calls it must not be flooded — so the subscription is
+            // set up here, not at target creation.
+            "Network.enable" => {
+                let ctx = self.targets[idx].ctx.clone();
+                let mut rx = ctx.subscribe_network();
+                let (frame, sess, out, loader) = (
+                    self.targets[idx].target_id.clone(),
+                    session.clone(),
+                    tx.clone(),
+                    self.targets[idx].loader_id.clone(),
+                );
+                tokio::spawn(async move {
+                    while let Some(rec) = rx.recv().await {
+                        let loader_id = loader.lock().map(|l| l.clone()).unwrap_or_default();
+                        for m in network_events(&rec, &frame, &loader_id, &sess) {
+                            if out.send(Message::Text(m.to_string())).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+                vec![ok(id, session, json!({}))]
+            }
             "Page.enable"
-            | "Network.enable"
             | "DOM.enable"
             | "Log.enable"
             | "Performance.enable"
@@ -717,6 +796,9 @@ impl Conn {
                     .unwrap_or("about:blank")
                     .to_string();
                 let loader = next_id("L");
+                if let Ok(mut slot) = self.targets[idx].loader_id.lock() {
+                    slot.clone_from(&loader);
+                }
                 let new_ctx = IDS.fetch_add(1, Ordering::Relaxed) as i64;
                 // Connection-state work is done synchronously here (in the read
                 // loop): swap the target's execution context and re-key its
@@ -1199,6 +1281,143 @@ async fn remote_eval(
         Ok(Value::String(s)) => serde_json::from_str(&s).unwrap_or(json!({ "type": "undefined" })),
         _ => json!({ "type": "undefined" }),
     }
+}
+
+/// Expand one completed request into the CDP events a client expects to see for
+/// it. Chrome spreads these over the request's lifetime; we know the outcome
+/// before we report anything, so they go out together — every field is real, the
+/// timings are just coarser. Playwright builds `page.goto()`'s response object
+/// out of `responseReceived`, which is why its absence made `goto` return `None`.
+fn network_events(
+    rec: &nokk::NetworkRecord,
+    frame_id: &str,
+    loader_id: &str,
+    session: &Option<String>,
+) -> Vec<Value> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or_default();
+    let kind = match rec.resource_type.as_str() {
+        "document" => "Document",
+        "script" => "Script",
+        "websocket" => "WebSocket",
+        "image" => "Image",
+        "beacon" | "fetch" => "Fetch",
+        _ => "Other",
+    };
+    // Chrome gives a navigation's document request the *same* id as its loader,
+    // and both Playwright and Puppeteer identify the navigation that way
+    // (`requestId === loaderId && type === 'Document'`). Without it `page.goto()`
+    // never finds its response and answers `None`.
+    let request_id = if kind == "Document" && !loader_id.is_empty() {
+        loader_id.to_string()
+    } else {
+        rec.request_id.clone()
+    };
+    let mut out = vec![event(
+        "Network.requestWillBeSent",
+        session,
+        json!({
+            "requestId": request_id,
+            "loaderId": loader_id,
+            "documentURL": rec.url,
+            "request": { "url": rec.url, "method": rec.method, "headers": {},
+                         "initialPriority": "High", "referrerPolicy": "strict-origin-when-cross-origin" },
+            "timestamp": now,
+            "wallTime": now,
+            "initiator": { "type": if kind == "Document" { "other" } else { "parser" } },
+            "type": kind,
+            "frameId": frame_id,
+            "hasUserGesture": false,
+        }),
+    )];
+    // Status 0 means the request never produced a response — a blocked tracker,
+    // a DNS failure, a reset. Chrome reports that as a loading failure, not as a
+    // response, and a client that waits for one would otherwise wait forever.
+    if rec.status == 0 {
+        out.push(event(
+            "Network.loadingFailed",
+            session,
+            json!({
+                "requestId": request_id,
+                "timestamp": now,
+                "type": kind,
+                "errorText": "net::ERR_FAILED",
+                "canceled": false,
+            }),
+        ));
+        return out;
+    }
+    let mime = rec
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.split(';').next().unwrap_or("").trim().to_string())
+        .unwrap_or_else(|| "text/plain".to_string());
+    out.push(event(
+        "Network.responseReceived",
+        session,
+        json!({
+            "requestId": request_id,
+            "loaderId": loader_id,
+            "timestamp": now,
+            "type": kind,
+            "frameId": frame_id,
+            "response": {
+                "url": rec.url,
+                "status": rec.status,
+                "statusText": reason_phrase(rec.status),
+                "headers": rec.headers,
+                "mimeType": mime,
+                "connectionReused": false,
+                "connectionId": 0,
+                "encodedDataLength": rec.body.len(),
+                "securityState": if rec.url.starts_with("https") { "secure" } else { "insecure" },
+                "protocol": "h2",
+            },
+        }),
+    ));
+    out.push(event(
+        "Network.loadingFinished",
+        session,
+        json!({
+            "requestId": request_id,
+            "timestamp": now,
+            "encodedDataLength": rec.body.len(),
+        }),
+    ));
+    out
+}
+
+/// A jar entry in CDP's `Network.Cookie` shape. `expires` is -1 for a session
+/// cookie (CDP's convention, not `null`), and `size` is what Chrome reports:
+/// the name and value lengths added together.
+fn cdp_cookie(c: nokk::CookieRecord) -> Value {
+    let domain = c.domain.clone().unwrap_or_default();
+    let path = c.path.clone().unwrap_or_else(|| "/".to_string());
+    let size = c.name.len() + c.value.len();
+    let mut out = json!({
+        "name": c.name,
+        "value": c.value,
+        "domain": domain,
+        "path": path,
+        "expires": c.expires.unwrap_or(-1.0),
+        "size": size,
+        "httpOnly": c.http_only,
+        "secure": c.secure,
+        "session": c.expires.is_none(),
+    });
+    if let Some(s) = c.same_site {
+        // CDP capitalises them: Strict / Lax / None.
+        let mut chars = s.chars();
+        let cap = match chars.next() {
+            Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+            None => s,
+        };
+        out["sameSite"] = json!(cap);
+    }
+    out
 }
 
 /// A JS string literal for `s` (safely quoted/escaped).

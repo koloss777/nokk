@@ -253,6 +253,12 @@ impl HttpClient for StubClient {
 #[derive(Clone)]
 pub struct FingerprintClient {
     inner: wreq::Client,
+    /// The jar behind this client, kept on our side of the fence so its contents
+    /// can be read back (CDP `Network.getCookies`, session export). wreq's own
+    /// `cookie_store(true)` would hold them where nothing can look — and every
+    /// cookie that matters for a warmed session (`cf_clearance`, Akamai's
+    /// `bm_s*`) is HttpOnly, so `document.cookie` is no substitute.
+    jar: Arc<SessionJar>,
 }
 
 /// Header names the emulation profile owns; caller-supplied values for these are
@@ -271,6 +277,11 @@ impl FingerprintClient {
     /// emulation, cookie jar and proxy as every request (see [`crate::websocket`]).
     pub(crate) fn inner(&self) -> &wreq::Client {
         &self.inner
+    }
+
+    /// Every unexpired cookie this client holds, HttpOnly included.
+    pub fn cookies(&self) -> Vec<CookieRecord> {
+        self.jar.snapshot()
     }
 
     /// The default Chrome profile we impersonate; must agree with the stealth JS
@@ -300,13 +311,11 @@ impl FingerprintClient {
             .platform(config.emulation_os.to_platform())
             .build();
         let mut builder = wreq::Client::builder().emulation(emulation);
-        builder = match session {
-            // A named/persistent session: cookies live in a jar the caller owns
-            // (and can serialize). Shared across contexts of the same identity.
-            Some(jar) => builder.cookie_provider(jar),
-            // Default: a private in-memory jar, replayed within this engine only.
-            None => builder.cookie_store(true),
-        };
+        // Named session or not, the jar is ours: a named one is shared (and
+        // serializable) across contexts of the same identity, an anonymous one is
+        // private to this client. Either way its contents stay readable.
+        let jar = session.unwrap_or_else(|| Arc::new(SessionJar::new()));
+        builder = builder.cookie_provider(jar.clone());
         builder = builder
             // Follow 3xx redirects like a real browser (wreq defaults to *none*).
             // Without this, navigating to e.g. `google.com` returns the `301
@@ -330,7 +339,7 @@ impl FingerprintClient {
         let inner = builder
             .build()
             .map_err(|e| NetError::Connect(e.to_string()))?;
-        Ok(Self { inner })
+        Ok(Self { inner, jar })
     }
 }
 
@@ -397,6 +406,18 @@ impl HttpClient for FingerprintClient {
 pub enum Client {
     Stub(StubClient),
     Fingerprint(FingerprintClient),
+}
+
+impl Client {
+    /// Every unexpired cookie this client holds — the real jar, HttpOnly
+    /// included, which is the only way to hand a warmed session to another
+    /// process. Empty for the stub (it never talks to a network).
+    pub fn cookies(&self) -> Vec<CookieRecord> {
+        match self {
+            Client::Stub(_) => Vec::new(),
+            Client::Fingerprint(c) => c.cookies(),
+        }
+    }
 }
 
 impl HttpClient for Client {

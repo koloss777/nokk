@@ -611,6 +611,7 @@ impl Engine {
             base_url: std::sync::Mutex::new("about:blank".to_string()),
             requests: std::sync::Mutex::new(Vec::new()),
             sockets: tokio::sync::Mutex::new(PageSockets::new()),
+            network_tx: std::sync::Mutex::new(None),
             session,
             _permit: permit,
             _load: load,
@@ -720,6 +721,9 @@ pub struct BrowserContext {
     session: Option<String>,
     /// The page's live `WebSocket`s (docs/websockets.md).
     sockets: tokio::sync::Mutex<PageSockets>,
+    /// Where to forward each completed request, when a CDP session is attached
+    /// and wants `Network.*` events.
+    network_tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<NetworkRecord>>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
     _load: nokk_pool::ContextLoadGuard,
 }
@@ -769,6 +773,11 @@ impl Drop for BrowserContext {
 /// and subresource script flows through here — this is the interception point.
 #[derive(Debug, Clone)]
 pub struct NetworkRecord {
+    /// Stable per-request identifier, shared by every CDP event about it.
+    pub request_id: String,
+    /// Response headers, for CDP `Network.responseReceived` (empty when the
+    /// request never got a response).
+    pub headers: std::collections::BTreeMap<String, String>,
     pub method: String,
     pub url: String,
     /// HTTP status, or `0` when the request never got a response (DNS failure,
@@ -1012,6 +1021,48 @@ impl BrowserContext {
         Ok(total_timers)
     }
 
+    /// Every cookie this context's client holds, HttpOnly included — the jar the
+    /// engine actually sends, not what the page can see. `urls` filters to the
+    /// cookies that would be sent to those URLs (empty = everything), matching
+    /// CDP `Network.getCookies`.
+    ///
+    /// This is the only way to export a warmed session (a `cf_clearance`, an
+    /// Akamai `bm_s*`) to another process: `document.cookie` cannot see any of it.
+    pub fn cookies(&self, urls: &[String]) -> Vec<CookieRecord> {
+        let all = self.client.cookies();
+        if urls.is_empty() {
+            return all;
+        }
+        let targets: Vec<(String, String)> = urls
+            .iter()
+            .filter_map(|u| url::Url::parse(u).ok())
+            .map(|u| {
+                (
+                    u.host_str().unwrap_or_default().to_ascii_lowercase(),
+                    u.path().to_string(),
+                )
+            })
+            .collect();
+        all.into_iter()
+            .filter(|c| {
+                targets.iter().any(|(host, path)| {
+                    let domain = c
+                        .domain
+                        .as_deref()
+                        .unwrap_or_default()
+                        .trim_start_matches('.');
+                    // A domain cookie matches the host itself and any subdomain.
+                    let host_ok = domain.is_empty()
+                        || host == domain
+                        || host.ends_with(&format!(".{domain}"));
+                    let cookie_path = c.path.as_deref().unwrap_or("/");
+                    let path_ok = path.starts_with(cookie_path);
+                    host_ok && path_ok
+                })
+            })
+            .collect()
+    }
+
     /// Whether this page is holding any socket open. The event loop treats that
     /// as "not finished" and the CDP server as "keep pumping".
     pub async fn has_open_sockets(&self) -> bool {
@@ -1208,7 +1259,14 @@ impl BrowserContext {
         let method = req.method.clone();
         match self.client.send(req).await {
             Ok(resp) => {
-                self.record(&method, &url, &kind, resp.status, &resp.body);
+                self.record_full(
+                    &method,
+                    &url,
+                    &kind,
+                    resp.status,
+                    &resp.body,
+                    resp.headers.clone(),
+                );
                 let headers_js =
                     serde_json::to_string(&resp.headers).unwrap_or_else(|_| "{}".into());
                 let body = String::from_utf8_lossy(&resp.body);
@@ -1266,7 +1324,14 @@ impl BrowserContext {
         };
         match self.client.send(req).await {
             Ok(resp) => {
-                self.record("GET", url, resource_type, resp.status, &resp.body);
+                self.record_full(
+                    "GET",
+                    url,
+                    resource_type,
+                    resp.status,
+                    &resp.body,
+                    resp.headers.clone(),
+                );
                 let final_url = if resp.url.is_empty() {
                     url.to_string()
                 } else {
@@ -1285,15 +1350,60 @@ impl BrowserContext {
 
     /// Append a request to this context's interception log.
     fn record(&self, method: &str, url: &str, resource_type: &str, status: u16, body: &[u8]) {
+        self.record_full(
+            method,
+            url,
+            resource_type,
+            status,
+            body,
+            std::collections::BTreeMap::new(),
+        )
+    }
+
+    /// Log one request and tell any subscriber (the CDP layer) about it. Called
+    /// once the outcome is known, which is why a subscriber receives the whole
+    /// lifecycle at once rather than a `willBeSent` ahead of time — the timings
+    /// are coarser than Chrome's, but every field a client reads is real.
+    fn record_full(
+        &self,
+        method: &str,
+        url: &str,
+        resource_type: &str,
+        status: u16,
+        body: &[u8],
+        headers: std::collections::BTreeMap<String, String>,
+    ) {
+        let rec = NetworkRecord {
+            request_id: format!(
+                "nokk-{}",
+                REQUEST_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+            headers,
+            method: method.to_string(),
+            url: url.to_string(),
+            status,
+            resource_type: resource_type.to_string(),
+            body: body.to_vec(),
+        };
         if let Ok(mut log) = self.requests.lock() {
-            log.push(NetworkRecord {
-                method: method.to_string(),
-                url: url.to_string(),
-                status,
-                resource_type: resource_type.to_string(),
-                body: body.to_vec(),
-            });
+            log.push(rec.clone());
         }
+        if let Ok(tx) = self.network_tx.lock() {
+            if let Some(tx) = tx.as_ref() {
+                let _ = tx.send(rec);
+            }
+        }
+    }
+
+    /// Receive every request this context makes from now on, as it completes.
+    /// One subscriber at a time (the attached CDP session); subscribing again
+    /// replaces the previous one.
+    pub fn subscribe_network(&self) -> tokio::sync::mpsc::UnboundedReceiver<NetworkRecord> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        if let Ok(mut slot) = self.network_tx.lock() {
+            *slot = Some(tx);
+        }
+        rx
     }
 
     /// All network requests the engine made for this context, in order — the
@@ -1302,6 +1412,10 @@ impl BrowserContext {
         self.requests.lock().map(|r| r.clone()).unwrap_or_default()
     }
 }
+
+/// Request ids are unique per process, so a client that watches several pages
+/// never sees two requests share one.
+static REQUEST_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// One round trip that empties both JS-side I/O queues. Written as an expression
 /// so a bare context (no stealth bootstrap, as in some tests) answers with empty
@@ -1358,8 +1472,9 @@ fn location_setter(u: &str) -> Option<String> {
 
 /// A short HTTP reason phrase for the common status codes `fetch` exposes as
 /// `Response.statusText`. Unlisted codes get an empty string (browsers do too on
-/// HTTP/2, which carries no reason phrase).
-fn reason_phrase(status: u16) -> &'static str {
+/// HTTP/2, which carries no reason phrase). Also used by the CDP layer for
+/// `Network.responseReceived`.
+pub fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
         201 => "Created",
@@ -3252,6 +3367,95 @@ mod tests {
         } else {
             eprintln!("skip strict check: webgl natives inactive (no EGL here)");
         }
+    }
+
+    /// A one-shot HTTP server that hands out the cookie flavours that matter:
+    /// an HttpOnly one (invisible to `document.cookie`, and exactly what a
+    /// `cf_clearance` or an Akamai `bm_s*` is), a plain one, and a persistent one.
+    async fn cookie_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let body = "<html><body>ok</body></html>";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: text/html\r\n\
+                         Set-Cookie: sess_secret=abc123; Path=/; HttpOnly\r\n\
+                         Set-Cookie: visible=yes; Path=/\r\n\
+                         Set-Cookie: keeper=v2; Path=/; Max-Age=3600\r\n\
+                         Content-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://127.0.0.1:{}/", addr.port())
+    }
+
+    #[tokio::test]
+    async fn cookies_are_readable_including_httponly() {
+        let _serial = serial().await;
+        let url = cookie_server().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 4,
+                max_heap_mb: None,
+            },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&url).await.unwrap();
+
+        let all = ctx.cookies(&[]);
+        let by = |n: &str| all.iter().find(|c| c.name == n).cloned();
+
+        let secret = by("sess_secret").expect("the HttpOnly cookie is in the jar");
+        assert!(secret.http_only, "and is reported as HttpOnly");
+        assert_eq!(secret.value, "abc123");
+        // The whole point: the page cannot see it, the engine can.
+        let visible_to_js = ctx.evaluate("document.cookie").await.unwrap();
+        let js = visible_to_js.as_str().unwrap_or_default();
+        assert!(
+            !js.contains("sess_secret"),
+            "an HttpOnly cookie must stay invisible to document.cookie, got {js:?}"
+        );
+
+        assert!(!by("visible").unwrap().http_only);
+        assert_eq!(
+            by("sess_secret").unwrap().domain.as_deref(),
+            Some("127.0.0.1"),
+            "a host-only cookie reports the host that set it, not an empty string"
+        );
+        assert!(
+            by("keeper").unwrap().expires.is_some(),
+            "a Max-Age cookie carries its expiry"
+        );
+        assert!(
+            by("visible").unwrap().expires.is_none(),
+            "a session cookie has none"
+        );
+
+        // `urls` filtering matches what would actually be sent there.
+        assert_eq!(
+            ctx.cookies(std::slice::from_ref(&url)).len(),
+            3,
+            "all three for its own origin"
+        );
+        assert!(
+            ctx.cookies(&["https://example.org/".to_string()])
+                .is_empty(),
+            "and none for an unrelated origin"
+        );
     }
 
     /// A WebSocket server that echoes `"echo:<what you sent>"` and then, on the
