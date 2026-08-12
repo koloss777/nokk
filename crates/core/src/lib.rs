@@ -43,6 +43,8 @@ pub enum EngineError {
     NavNotImplemented,
     #[error("session store error: {0}")]
     Session(String),
+    #[error("no such frame: {0}")]
+    NoSuchFrame(u32),
 }
 
 /// Top-level engine configuration.
@@ -738,6 +740,15 @@ pub struct BrowserContext {
     _load: nokk_pool::ContextLoadGuard,
 }
 
+/// What a caller outside the engine can know about a live frame.
+#[derive(Debug, Clone)]
+pub struct FrameInfo {
+    /// Stable for the frame's lifetime; the CDP layer builds its frame id from it.
+    pub id: u32,
+    pub url: String,
+    pub origin: String,
+}
+
 /// A live `<iframe>`: its own V8 context on the parent's worker, plus where it
 /// came from. `origin` decides what the parent may touch — a cross-origin frame
 /// exposes only `postMessage`, as in a browser.
@@ -844,6 +855,14 @@ impl BrowserContext {
         // a cookie; the in-session jar carries the cookie across hops, so following
         // the chain lands on the real page. Capped to avoid a refresh loop.
         const MAX_META_HOPS: usize = 6;
+        // `about:blank` is a document, not a request. Clients navigate to it
+        // routinely — Puppeteer's `newPage()` opens one — and sending it to the
+        // network layer produced "URI scheme is not allowed" instead of a page.
+        if url.is_empty() || url == "about:blank" {
+            return self
+                .load_html("about:blank", "<html><head></head><body></body></html>")
+                .await;
+        }
         let mut current = url.to_string();
         for _ in 0..MAX_META_HOPS {
             // Use the post-redirect URL as the document base, so `window.location`
@@ -1140,6 +1159,44 @@ impl BrowserContext {
     /// as "not finished" and the CDP server as "keep pumping".
     pub async fn has_open_sockets(&self) -> bool {
         !self.sockets.lock().await.open.is_empty()
+    }
+
+    /// Every live `<iframe>` on this page: the id its DOM assigned, the URL it
+    /// loaded, and its origin. The CDP layer turns these into frame lifecycle
+    /// events and per-frame execution contexts, which is what makes a frame
+    /// visible to Puppeteer's `page.frames()` — and reachable by an evaluate.
+    pub fn frame_list(&self) -> Vec<FrameInfo> {
+        self.frames
+            .lock()
+            .map(|f| {
+                let mut out: Vec<FrameInfo> = f
+                    .iter()
+                    .map(|(id, s)| FrameInfo {
+                        id: *id,
+                        url: s.url.clone(),
+                        origin: s.origin.clone(),
+                    })
+                    .collect();
+                out.sort_by_key(|f| f.id);
+                out
+            })
+            .unwrap_or_default()
+    }
+
+    /// Evaluate inside one of this page's frames. `Err(NoSuchFrame)` if it has
+    /// gone away — a frame outlives neither its element nor its page.
+    pub async fn evaluate_in_frame(
+        &self,
+        frame_id: u32,
+        script: &str,
+    ) -> Result<Value, EngineError> {
+        let index = self
+            .frames
+            .lock()
+            .ok()
+            .and_then(|f| f.get(&frame_id).map(|s| s.index))
+            .ok_or(EngineError::NoSuchFrame(frame_id))?;
+        self.eval_in(index, script).await
     }
 
     /// Whether this page has a live `<iframe>`. Same reasoning as a socket: the

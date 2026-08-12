@@ -220,6 +220,11 @@ struct Target {
     /// `page.goto()` waits for a response whose `loaderId` matches the one
     /// `Page.navigate` reported, and answers `None` when nothing ever does.
     loader_id: Arc<std::sync::Mutex<String>>,
+    /// Frames already announced to the client, so each is reported once. Frames
+    /// come into being asynchronously (a page inserts an `<iframe>`, the engine
+    /// builds it), so the tick compares this against the live set rather than
+    /// waiting for a command to notice.
+    known_frames: std::collections::HashSet<u32>,
     /// Extra sessions attached to this same page. Chrome mints a *fresh* session
     /// for every `Target.attachToTarget`, and a client that gets its existing one
     /// back sees an attach event for a session it already knows — which is what
@@ -399,7 +404,7 @@ async fn run_session<S>(
             // this tick a pushed frame would sit in the queue until the client
             // happened to evaluate something. Only pages with a live socket are
             // pumped, so the idle case costs one cheap check per tick.
-            _ = socket_pump.tick() => { conn.pump_live_pages().await; }
+            _ = socket_pump.tick() => { conn.pump_live_pages(&tx).await; }
         }
     }
     // Pages die with the connection that opened them, so drop them from the
@@ -416,8 +421,8 @@ impl Conn {
     /// WebSocket (frames may be waiting, and nothing else would fetch them) or it
     /// just ran JS that could have queued I/O. Called on a timer by the session
     /// loop; pages with neither cost one atomic read.
-    async fn pump_live_pages(&self) {
-        for t in &self.targets {
+    async fn pump_live_pages(&mut self, tx: &UnboundedSender<Message>) {
+        for t in &mut self.targets {
             if t.ran_js.swap(false, Ordering::Relaxed)
                 || t.ctx.has_frames()
                 || t.ctx.has_open_sockets().await
@@ -426,6 +431,71 @@ impl Conn {
                 tokio::spawn(async move {
                     let _ = ctx.run_event_loop().await;
                 });
+            }
+
+            // Announce frames as they appear and disappear. Without this a client
+            // never learns a page has any: `page.frames()` shows one, and there is
+            // no execution context to evaluate inside.
+            let live = t.ctx.frame_list();
+            let session = Some(t.session_id.clone());
+            for f in &live {
+                if !t.known_frames.insert(f.id) {
+                    continue;
+                }
+                let fid = child_frame_id(&t.target_id, f.id);
+                for m in [
+                    event(
+                        "Page.frameAttached",
+                        &session,
+                        json!({ "frameId": fid, "parentFrameId": t.target_id,
+                                "stack": { "callFrames": [] } }),
+                    ),
+                    event(
+                        "Page.frameNavigated",
+                        &session,
+                        json!({ "type": "Navigation", "frame": {
+                            "id": fid, "parentId": t.target_id,
+                            "loaderId": format!("LF{}", f.id), "url": f.url,
+                            "domainAndRegistry": "", "securityOrigin": f.origin,
+                            "mimeType": "text/html",
+                        }}),
+                    ),
+                    event(
+                        "Runtime.executionContextCreated",
+                        &session,
+                        json!({ "context": {
+                            "id": frame_ctx_id(f.id), "origin": f.origin, "name": "",
+                            "uniqueId": format!("{}.1", frame_ctx_id(f.id)),
+                            "auxData": { "isDefault": false, "type": "default", "frameId": fid },
+                        }}),
+                    ),
+                ] {
+                    let _ = tx.send(Message::Text(m.to_string()));
+                }
+            }
+            let gone: Vec<u32> = t
+                .known_frames
+                .iter()
+                .copied()
+                .filter(|id| !live.iter().any(|f| f.id == *id))
+                .collect();
+            for id in gone {
+                t.known_frames.remove(&id);
+                let fid = child_frame_id(&t.target_id, id);
+                for m in [
+                    event(
+                        "Runtime.executionContextDestroyed",
+                        &session,
+                        json!({ "executionContextId": frame_ctx_id(id) }),
+                    ),
+                    event(
+                        "Page.frameDetached",
+                        &session,
+                        json!({ "frameId": fid, "reason": "remove" }),
+                    ),
+                ] {
+                    let _ = tx.send(Message::Text(m.to_string()));
+                }
             }
         }
     }
@@ -457,6 +527,7 @@ impl Conn {
                     ran_js: Arc::new(AtomicBool::new(false)),
                     loader_id: Arc::new(std::sync::Mutex::new(String::new())),
                     extra_sessions: Vec::new(),
+                    known_frames: std::collections::HashSet::new(),
                 };
                 let info = target_info(&t);
                 self.registry.add(json!({
@@ -918,6 +989,24 @@ impl Conn {
                     .and_then(|v| v.as_str())
                     .unwrap_or("__isolated__")
                     .to_string();
+                // Asked for a world inside a child frame, hand back that frame's
+                // context. There are no separate isolated realms per frame here, so
+                // this is its main world — closer to right than the *page's* world,
+                // which is what a client would otherwise be handed.
+                if let Some(fid) = params.get("frameId").and_then(|v| v.as_str()) {
+                    if let Some(f) = self.targets[idx]
+                        .ctx
+                        .frame_list()
+                        .into_iter()
+                        .find(|f| child_frame_id(&self.targets[idx].target_id, f.id) == fid)
+                    {
+                        return vec![ok(
+                            id,
+                            session,
+                            json!({ "executionContextId": frame_ctx_id(f.id) }),
+                        )];
+                    }
+                }
                 let iso_id = IDS.fetch_add(1, Ordering::Relaxed) as i64;
                 let frame_id = self.targets[idx].target_id.clone();
                 self.targets[idx]
@@ -938,13 +1027,29 @@ impl Conn {
             }
             "Page.getFrameTree" => {
                 let t = &self.targets[idx];
+                let children: Vec<Value> = t
+                    .ctx
+                    .frame_list()
+                    .into_iter()
+                    .map(|f| {
+                        json!({ "frame": {
+                            "id": child_frame_id(&t.target_id, f.id),
+                            "parentId": t.target_id,
+                            "loaderId": format!("LF{}", f.id),
+                            "url": f.url,
+                            "domainAndRegistry": "",
+                            "securityOrigin": f.origin,
+                            "mimeType": "text/html",
+                        }})
+                    })
+                    .collect();
                 vec![ok(
                     id,
                     session,
                     json!({ "frameTree": {
                         "frame": { "id": t.target_id, "loaderId": "L1", "url": t.url,
                                    "domainAndRegistry": "", "securityOrigin": "://", "mimeType": "text/html" },
-                        "childFrames": []
+                        "childFrames": children
                     }}),
                 )]
             }
@@ -1068,13 +1173,23 @@ impl Conn {
                     .get("awaitPromise")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // `contextId` picks the realm: a frame's own context when the
+                // client is talking to a frame (that is how `page.frames()[1]
+                // .evaluate(…)` reaches the right document), the page otherwise.
+                let frame = params
+                    .get("contextId")
+                    .and_then(|v| v.as_i64())
+                    .and_then(frame_of_ctx_id);
                 let (ctx, session, tx) =
                     (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 // Whatever this evaluate queued (a fetch, a socket) gets pumped by
                 // the tick; the reply itself must not wait for the event loop.
                 self.targets[idx].ran_js.store(true, Ordering::Relaxed);
                 tokio::spawn(async move {
-                    let ro = remote_eval(&ctx, &expr, by_value, await_promise).await;
+                    let ro = match frame {
+                        Some(f) => frame_eval(&ctx, f, &expr, by_value).await,
+                        None => remote_eval(&ctx, &expr, by_value, await_promise).await,
+                    };
                     let _ = tx.send(Message::Text(
                         ok(id, &session, json!({ "result": ro })).to_string(),
                     ));
@@ -1118,13 +1233,24 @@ impl Conn {
                 // Newline-isolate the declaration too — Playwright's function
                 // sources can carry a trailing `//# sourceURL=` comment.
                 let expr = format!("(\n{decl}\n).apply({this_js}, [{}])", args_js.join(","));
+                // Same realm rule as `Runtime.evaluate`: a frame's context id sends
+                // the call into that frame. This is how `frame.evaluate(…)` reaches
+                // the right document — a client calls a function, it does not
+                // evaluate a string.
+                let frame = params
+                    .get("executionContextId")
+                    .and_then(|v| v.as_i64())
+                    .and_then(frame_of_ctx_id);
                 let (ctx, session, tx) =
                     (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 // Whatever this evaluate queued (a fetch, a socket) gets pumped by
                 // the tick; the reply itself must not wait for the event loop.
                 self.targets[idx].ran_js.store(true, Ordering::Relaxed);
                 tokio::spawn(async move {
-                    let ro = remote_eval(&ctx, &expr, by_value, await_promise).await;
+                    let ro = match frame {
+                        Some(f) => frame_eval(&ctx, f, &expr, by_value).await,
+                        None => remote_eval(&ctx, &expr, by_value, await_promise).await,
+                    };
                     let _ = tx.send(Message::Text(
                         ok(id, &session, json!({ "result": ro })).to_string(),
                     ));
@@ -1412,6 +1538,22 @@ impl Conn {
     }
 }
 
+/// `Runtime.evaluate` against a frame's own document. Same wrapper as the page
+/// path so the result shape matches; a frame that has gone away answers
+/// `undefined` rather than failing the command, since frames die on their own.
+async fn frame_eval(ctx: &BrowserContext, frame: u32, expr: &str, by_value: bool) -> Value {
+    let by = if by_value { "true" } else { "false" };
+    let js = format!(
+        "(() => {{ try {{ return JSON.stringify(__pt_wrap((0, eval)({}), {by})); }} \
+           catch (e) {{ return JSON.stringify(__pt_wrap(String(e), true)); }} }})()",
+        js_str(expr)
+    );
+    match ctx.evaluate_in_frame(frame, &js).await {
+        Ok(Value::String(s)) => serde_json::from_str(&s).unwrap_or(json!({ "type": "undefined" })),
+        _ => json!({ "type": "undefined" }),
+    }
+}
+
 /// Evaluate `expr` and return a CDP `RemoteObject` — by value (JSON) or as an
 /// `objectId` handle (via the JS `__pt_wrap` registry), matching `by_value`.
 /// Drives the event loop when awaiting a Promise.
@@ -1603,6 +1745,23 @@ fn cdp_cookie(c: nokk::CookieRecord) -> Value {
 /// A JS string literal for `s` (safely quoted/escaped).
 fn js_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
+}
+
+/// A child frame's CDP id. Derived from the page's own so it is stable and
+/// obviously related, which is what a client shows in its frame tree.
+fn child_frame_id(target_id: &str, frame_id: u32) -> String {
+    format!("{target_id}-F{frame_id}")
+}
+
+/// The frame behind an execution context id, if it names one.
+fn frame_of_ctx_id(ctx_id: i64) -> Option<u32> {
+    (ctx_id >= 1_000_000).then(|| (ctx_id - 1_000_000) as u32)
+}
+
+/// The execution context id a frame's evaluates run in. Kept in a range of its
+/// own so it cannot collide with the page's contexts or its isolated worlds.
+fn frame_ctx_id(frame_id: u32) -> i64 {
+    1_000_000 + frame_id as i64
 }
 
 fn target_info(t: &Target) -> Value {
@@ -1884,7 +2043,7 @@ mod tests {
         let ctx = conn.targets[0].ctx.clone();
         let mut state = String::new();
         for _ in 0..40 {
-            conn.pump_live_pages().await;
+            conn.pump_live_pages(&sink()).await;
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             if let Ok(v) = ctx
                 .evaluate("String(globalThis.__w && __w.readyState)")
