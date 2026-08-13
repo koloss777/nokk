@@ -1000,7 +1000,11 @@ impl BrowserContext {
                             continue;
                         }
                         match self.fetch_text(&abs, "script").await {
-                            Ok((_, code)) => code,
+                            // `sourceURL` — не отладочная мелочь: без него каждый
+                            // кадр стека выглядит как `<anonymous>`, тогда как в
+                            // браузере там адрес скрипта. `new Error().stack`
+                            // читают, и форма стека — часть отпечатка.
+                            Ok((_, code)) => format!("{code}\n//# sourceURL={abs}"),
                             Err(e) => {
                                 tracing::warn!(url = %abs, error = %e, "external script fetch failed");
                                 continue;
@@ -1456,6 +1460,12 @@ impl BrowserContext {
                 // opposite directions.
                 "post" => {
                     let data = op["data"].as_str().unwrap_or("null").to_string();
+                    // Виден весь обмен со фреймом — без патчей в JS, которые ломают
+                    // проверку `event.source === iframe.contentWindow`.
+                    if !data.contains("\"meow\"") && !data.contains("\"food\"") {
+                        tracing::debug!(to_parent = op["toParent"].as_bool().unwrap_or(false),
+                                        payload = %&data[..data.len().min(1800)], "frame message");
+                    }
                     let to_parent = op["toParent"].as_bool().unwrap_or(false);
                     let target = self.frames.lock().ok().and_then(|f| f.get(&id).cloned());
                     let Some(frame) = target else { continue };
@@ -1539,6 +1549,7 @@ impl BrowserContext {
             }
             match self.fetch_text(&url, "script").await {
                 Ok((_, code)) => {
+                    let code = format!("{code}\n//# sourceURL={url}");
                     if let Err(e) = self.eval_in(index, &code).await {
                         tracing::debug!(url = %url, error = %e, "inserted script threw");
                     }
