@@ -1002,7 +1002,10 @@ impl Conn {
             "Page.addScriptToEvaluateOnNewDocument" => {
                 if let Some(src) = params.get("source").and_then(|v| v.as_str()) {
                     self.targets[idx].init_scripts.push(src.to_string());
-                    // Chrome runs these in every frame, not just the top document.
+                    // "On new document" means before the document's own scripts,
+                    // in the page and in every frame — Chrome applies these to the
+                    // whole tree, and applying them afterwards defeats the purpose.
+                    self.targets[idx].ctx.add_init_script(src.to_string());
                     self.targets[idx].ctx.add_frame_init_script(src.to_string());
                 }
                 let ident = format!("initscript-{}", self.targets[idx].init_scripts.len());
@@ -1127,9 +1130,10 @@ impl Conn {
                     if let Some(e) = &nav_error {
                         tracing::debug!(error = %e, "Page.navigate error");
                     }
-                    for src in &scripts {
-                        let _ = ctx.evaluate(src).await;
-                    }
+                    // The init scripts already ran inside the navigation, ahead of
+                    // the document's own; running them again here would double every
+                    // side effect a client's hook has.
+                    let _ = &scripts;
                     let ev = |name: &str, params: Value| event(name, &session, params);
                     let lifecycle = |name: &str| {
                         ev(

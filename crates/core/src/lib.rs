@@ -618,6 +618,7 @@ impl Engine {
             frames: std::sync::Mutex::new(HashMap::new()),
             bootstrap,
             frame_init_scripts: std::sync::Mutex::new(Vec::new()),
+            init_scripts: std::sync::Mutex::new(Vec::new()),
             next_timer_at: std::sync::Mutex::new(None),
             session,
             _permit: permit,
@@ -742,6 +743,12 @@ pub struct BrowserContext {
     /// what `Page.addScriptToEvaluateOnNewDocument` means in Chrome — it applies
     /// to the whole frame tree, not just the top document.
     frame_init_scripts: std::sync::Mutex<Vec<String>>,
+    /// The same, for this page's own document. "On new document" means *before*
+    /// the document's own scripts — that is the whole point of the API, and what
+    /// every stealth patch and instrumentation hook depends on. Running them after
+    /// the page had already executed made them useless for anything that has to be
+    /// in place first.
+    init_scripts: std::sync::Mutex<Vec<String>>,
     /// When this page's earliest pending timer comes due, as of the last turn of
     /// the event loop. `None` means nothing is pending. Timers wait out their real
     /// delays now, so a page only advances while something drives it — this is how
@@ -954,6 +961,21 @@ impl BrowserContext {
         // Reflect the real URL into `window.location` before any script runs.
         if let Some(js) = location_setter(base_url) {
             let _ = self.eval_in(index, &js).await;
+        }
+        // Then the client's own "on new document" scripts, still before the
+        // document exists — a frame gets its set from `apply_frame_ops`, the page
+        // gets its own here. After the page's scripts would be too late to matter.
+        if index == self.index {
+            let init = self
+                .init_scripts
+                .lock()
+                .map(|v| v.clone())
+                .unwrap_or_default();
+            for src in init {
+                if let Err(e) = self.eval_in(index, &src).await {
+                    tracing::debug!(error = %e, "page init script threw");
+                }
+            }
         }
         let page = nokk_dom::parse(html);
 
@@ -1239,6 +1261,16 @@ impl BrowserContext {
     /// adding them cannot grow the list without limit.
     pub fn add_frame_init_script(&self, src: String) {
         if let Ok(mut v) = self.frame_init_scripts.lock() {
+            if v.len() < 32 {
+                v.push(src);
+            }
+        }
+    }
+
+    /// Run `src` in this page on every future navigation, before the document's
+    /// own scripts. The caller keeps the list; the load applies it.
+    pub fn add_init_script(&self, src: String) {
+        if let Ok(mut v) = self.init_scripts.lock() {
             if v.len() < 32 {
                 v.push(src);
             }
@@ -3982,6 +4014,41 @@ mod tests {
             out["show"],
             serde_json::json!([1, 4, 128]),
             "NodeFilter's constants are the spec's, not invented"
+        );
+    }
+
+    /// "On new document" has to mean *before* the document's own scripts. Ours ran
+    /// after the page had already executed, which is useless for the thing the API
+    /// exists for — putting a hook in place before the page can look. Every stealth
+    /// patch and every instrumentation probe depends on this ordering, and its
+    /// absence is silent: the script runs, the marker is there afterwards, and
+    /// nothing it was supposed to observe was ever observed.
+    #[tokio::test]
+    async fn an_init_script_runs_before_the_documents_own() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.add_init_script(
+            "globalThis.__initRan = true; globalThis.__initCount = (globalThis.__initCount || 0) + 1;"
+                .to_string(),
+        );
+        ctx.load_html(
+            "https://example.com/",
+            "<html><body><script>globalThis.sawInit = typeof globalThis.__initRan !== 'undefined';\
+             </script></body></html>",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            ctx.evaluate("String(sawInit)").await.unwrap(),
+            Value::String("true".into()),
+            "the page's own script must find the hook already in place"
+        );
+        assert_eq!(
+            ctx.evaluate("String(__initCount)").await.unwrap(),
+            Value::String("1".into()),
+            "and it must run once per document, not once more afterwards"
         );
     }
 
