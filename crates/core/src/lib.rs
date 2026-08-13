@@ -423,13 +423,16 @@ fn emulation_os_for(profile: &StealthProfile) -> nokk_net::EmulationOs {
 /// The full per-context bootstrap JS for a stealth `profile`, in dependency order:
 /// the stealth environment (navigator/window/screen/Intl/timers/fetch), then the
 /// DOM runtime (document/Element/Event…), then the fingerprint hardening layer
-/// (which patches HTMLElement.prototype + navigator, so it must run last).
+/// (which patches HTMLElement.prototype + navigator, so it must run after both),
+/// and last the remaining platform surface — it only fills names nothing else
+/// defined, so everything real has to exist before it looks.
 fn build_bootstrap(profile: &StealthProfile) -> String {
     format!(
-        "{}\n{}\n{}",
+        "{}\n{}\n{}\n{}",
         nokk_stealth::bootstrap_script(profile),
         nokk_dom::runtime_js(),
         nokk_stealth::fingerprint_script(profile),
+        nokk_stealth::web_surface_script(),
     )
 }
 
@@ -2460,6 +2463,72 @@ mod tests {
         }
     }
 
+    /// The global graph is what Turnstile actually fingerprints: it walks
+    /// `window`/`document`/`navigator`/`screen`/`location`/`history` up their
+    /// prototype chains and classifies every value. Measured against Chrome 148,
+    /// ours matches name-for-name — this pins the parts that took the longest to
+    /// get right, and each one of them was a tell before it was fixed.
+    #[tokio::test]
+    async fn the_global_graph_matches_the_shape_chrome_presents() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<!DOCTYPE html><html><head><title>g</title></head><body><p>x</p></body></html>",
+        )
+        .await
+        .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const walk = (o) => { const n = []; for (; o; o = Object.getPrototypeOf(o)) n.push(...Object.keys(o)); return n; };
+            const kids = document.body.childNodes;
+            return JSON.stringify({
+              // NodeList, not Array: the collector buckets an array under its own
+              // category, and `Array.isArray(node.childNodes)` is false on the platform.
+              kidsArray: Array.isArray(kids),
+              kidsSame: kids === document.body.childNodes,
+              kidsLen: kids.length,
+              kidsIter: [...kids].length,
+              kidsTag: Object.prototype.toString.call(kids),
+              // Own properties belong on the interface, never on the instance.
+              docOwn: Object.getOwnPropertyNames(document).length,
+              navOwn: Object.getOwnPropertyNames(navigator).length,
+              // The surface fill lands on the prototype, and it is enumerable there.
+              docGraph: walk(document).length,
+              navGraph: walk(navigator).length,
+              winGraph: walk(globalThis).length,
+              // `remove` comes from ChildNode: elements and text have it, documents do not.
+              docRemove: 'remove' in document,
+              elRemove: typeof document.body.remove,
+              // Chrome hides SharedArrayBuffer without cross-origin isolation.
+              sab: typeof SharedArrayBuffer,
+              isolated: globalThis.crossOriginIsolated,
+              // Location has its own enumerable valueOf; ours used to inherit Object's.
+              locValueOf: Object.keys(Object.getPrototypeOf(location)).includes('valueOf'),
+              // A document that declares nothing is parsed as windows-1252.
+              charset: document.characterSet,
+            });
+        })()"#).await;
+
+        assert_eq!(out["kidsArray"], false, "childNodes is a NodeList, not an Array");
+        assert_eq!(out["kidsSame"], true, "the same list object comes back each read");
+        assert_eq!(out["kidsLen"], 1, "and it still counts the children");
+        assert_eq!(out["kidsIter"], 1, "and still spreads");
+        assert_eq!(out["kidsTag"], "[object NodeList]");
+        assert_eq!(out["docOwn"], 0, "a real document has no own properties");
+        assert_eq!(out["navOwn"], 0, "nor does a real navigator");
+        assert!(out["docGraph"].as_u64().unwrap() > 280, "document graph: {}", out["docGraph"]);
+        assert!(out["navGraph"].as_u64().unwrap() > 75, "navigator graph: {}", out["navGraph"]);
+        assert!(out["winGraph"].as_u64().unwrap() > 1100, "window graph: {}", out["winGraph"]);
+        assert_eq!(out["docRemove"], false, "Document has no ChildNode.remove");
+        assert_eq!(out["elRemove"], "function", "elements keep theirs");
+        assert_eq!(out["sab"], "undefined", "no SharedArrayBuffer without isolation");
+        assert_eq!(out["isolated"], false);
+        assert_eq!(out["locValueOf"], true, "Location.valueOf is its own enumerable member");
+        assert_eq!(out["charset"], "windows-1252", "undeclared documents are windows-1252");
+    }
+
     /// Fingerprint regression guard. The page-visible surface must carry no trace
     /// of the engine, and this pins every property that has bitten us: an own
     /// property on a DOM instance (real nodes have none), a `__pt_*` bridge global
@@ -4066,7 +4135,10 @@ mod tests {
               scripts: document.scripts.length, forms: document.forms.length,
               images: document.images.length, docLinks: document.links.length,
               anchors: document.anchors.length, sheets: document.styleSheets.length,
-              sheetHref: document.styleSheets.map(s => s.href || 'inline'),
+              // Не массив, а коллекция — как на платформе: перебор, но без .map.
+              sheetHref: Array.from(document.styleSheets).map(s => s.href || 'inline'),
+              collection: [document.scripts.map, Array.isArray(document.forms)]
+                .every(x => !x),
               referrer: typeof document.referrer,
               show: [NodeFilter.SHOW_ELEMENT, NodeFilter.SHOW_TEXT, NodeFilter.SHOW_COMMENT],
               walkerType: typeof document.createTreeWalker,
@@ -4077,6 +4149,10 @@ mod tests {
             v => panic!("expected the report, got {v:?}"),
         };
 
+        assert_eq!(
+            out["collection"], true,
+            "document.scripts/forms are collections, not arrays, as on the platform"
+        );
         assert_eq!(
             out["tags"].as_array().unwrap().len(),
             5,

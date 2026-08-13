@@ -22,7 +22,7 @@
   function __walkTree(node, fn) {
     if (!node) return;
     fn(node);
-    const kids = node.childNodes;
+    const kids = node.__ptKids;
     if (kids) for (const c of kids.slice()) __walkTree(c, fn);
     if (node.__ptShadow) __walkTree(node.__ptShadow, fn);
   }
@@ -36,6 +36,70 @@
     if (n.__ptLocal === 'iframe') n.__ptConnectFrame();
     else if (n.__ptLocal === 'script') n.__ptRunScript();
   });
+
+  // Массив в обёртке HTMLCollection: length/item/namedItem/итератор, но не Array.
+  // Страницы читают `.length` и перебирают — этого достаточно, а `Array.isArray`
+  // на настоящей коллекции ложен, как и должно быть.
+  function __collection(arr) {
+    const list = Object.create(__collectionProto);
+    for (let i = 0; i < arr.length; i++) list[i] = arr[i];
+    Object.defineProperty(list, 'length', { value: arr.length, enumerable: false, configurable: true });
+    return list;
+  }
+  // childNodes отдаёт NodeList, а не массив: `Array.isArray(node.childNodes)`
+  // на платформе ложен, и сборщик отпечатков Turnstile метит массив отдельной
+  // категорией. Список живой и тождественный самому себе — виджеты сравнивают
+  // `a.childNodes === a.childNodes`, — поэтому он кэшируется на узле, а индексы
+  // пересобираются при каждом обращении.
+  function __nodeList(node) {
+    __linkNodeList();
+    let list = node.__ptList;
+    if (!list) {
+      list = Object.create(__nodeListProto);
+      Object.defineProperty(node, '__ptList', { value: list, enumerable: false, writable: true });
+    }
+    const kids = node.__ptKids, prev = list.length | 0;
+    for (let i = 0; i < kids.length; i++) list[i] = kids[i];
+    for (let i = kids.length; i < prev; i++) delete list[i];
+    Object.defineProperty(list, 'length', { value: kids.length, enumerable: false, configurable: true });
+    return list;
+  }
+  // Прототип связывается с интерфейсом NodeList при первом обращении: сам
+  // интерфейс появляется позже этого файла, а список создаётся уже на странице.
+  const __linkNodeList = () => {
+    const I = globalThis.NodeList;
+    if (!I || __nodeListProto.__ptLinked) return;
+    __nodeListProto.__ptLinked = true;
+    for (const k of Reflect.ownKeys(__nodeListProto)) {
+      if (k === '__ptLinked') continue;
+      Object.defineProperty(I.prototype, k, Object.getOwnPropertyDescriptor(__nodeListProto, k));
+    }
+    Object.setPrototypeOf(__nodeListProto, I.prototype);
+    for (const k of Reflect.ownKeys(__nodeListProto)) {
+      if (k !== '__ptLinked') delete __nodeListProto[k];
+    }
+  };
+  const __nodeListProto = {
+    get [Symbol.toStringTag]() { return 'NodeList'; },
+    item(i) { return this[i] != null ? this[i] : null; },
+    forEach(fn, thisArg) { for (let i = 0; i < this.length; i++) fn.call(thisArg, this[i], i, this); },
+    *entries() { for (let i = 0; i < this.length; i++) yield [i, this[i]]; },
+    *keys() { for (let i = 0; i < this.length; i++) yield i; },
+    *values() { for (let i = 0; i < this.length; i++) yield this[i]; },
+    [Symbol.iterator]() { return this.values(); },
+  };
+
+  const __collectionProto = {
+    item(i) { return this[i] != null ? this[i] : null; },
+    namedItem(n) {
+      for (let i = 0; i < this.length; i++) {
+        const e = this[i];
+        if (e && (e.id === n || (e.getAttribute && e.getAttribute('name') === n))) return e;
+      }
+      return null;
+    },
+    [Symbol.iterator]() { let i = 0; const self = this; return { next: () => i < self.length ? { value: self[i++], done: false } : { value: undefined, done: true } }; },
+  };
 
   // ---- Node -----------------------------------------------------------------
   class Node {
@@ -51,17 +115,17 @@
       this.__ptDoc = globalThis.document || null;
       this.__ptLis = Object.create(null);
     }
-    get firstChild() { return this.childNodes[0] || null; }
-    get lastChild() { return this.childNodes[this.childNodes.length - 1] || null; }
+    get firstChild() { return this.__ptKids[0] || null; }
+    get lastChild() { return this.__ptKids[this.__ptKids.length - 1] || null; }
     get nextSibling() {
       const p = this.parentNode; if (!p) return null;
-      const i = p.childNodes.indexOf(this); return p.childNodes[i + 1] || null;
+      const i = p.__ptKids.indexOf(this); return p.__ptKids[i + 1] || null;
     }
     get previousSibling() {
       const p = this.parentNode; if (!p) return null;
-      const i = p.childNodes.indexOf(this); return p.childNodes[i - 1] || null;
+      const i = p.__ptKids.indexOf(this); return p.__ptKids[i - 1] || null;
     }
-    hasChildNodes() { return this.childNodes.length > 0; }
+    hasChildNodes() { return this.__ptKids.length > 0; }
     contains(n) { for (; n; n = n.parentNode) if (n === this) return true; return false; }
     // Walks out through a shadow host too: a node inside an attached shadow tree
     // is connected, even though the root itself has no parent.
@@ -80,12 +144,12 @@
     appendChild(child) { return this.insertBefore(child, null); }
     insertBefore(child, ref) {
       if (child.nodeType === DOCUMENT_FRAGMENT_NODE) {
-        for (const c of child.childNodes.slice()) this.insertBefore(c, ref);
+        for (const c of child.__ptKids.slice()) this.insertBefore(c, ref);
         return child;
       }
       if (child.parentNode) child.parentNode.removeChild(child);
-      const i = ref ? this.childNodes.indexOf(ref) : -1;
-      if (i < 0) this.childNodes.push(child); else this.childNodes.splice(i, 0, child);
+      const i = ref ? this.__ptKids.indexOf(ref) : -1;
+      if (i < 0) this.__ptKids.push(child); else this.__ptKids.splice(i, 0, child);
       child.parentNode = this;
       __markDirty();
       __mutation(__childListRecord(this, [child], [], child.previousSibling, child.nextSibling));
@@ -99,10 +163,10 @@
       return child;
     }
     removeChild(child) {
-      const i = this.childNodes.indexOf(child);
+      const i = this.__ptKids.indexOf(child);
       if (i < 0) throw new Error('NotFoundError: removeChild');
-      const prev = this.childNodes[i - 1] || null, next = this.childNodes[i + 1] || null;
-      this.childNodes.splice(i, 1); child.parentNode = null; __markDirty();
+      const prev = this.__ptKids[i - 1] || null, next = this.__ptKids[i + 1] || null;
+      this.__ptKids.splice(i, 1); child.parentNode = null; __markDirty();
       __mutation(__childListRecord(this, [], [child], prev, next));
       // A removed frame is a closed browsing context. Without this its V8 context
       // outlives the element forever — a widget that replaces its iframe on a
@@ -112,18 +176,17 @@
       return child;
     }
     replaceChild(nw, old) { this.insertBefore(nw, old); return this.removeChild(old); }
-    remove() { if (this.parentNode) this.parentNode.removeChild(this); }
     cloneNode(deep) {
       const c = this.__ptShallowClone();
-      if (deep) for (const ch of this.childNodes) c.appendChild(ch.cloneNode(true));
+      if (deep) for (const ch of this.__ptKids) c.appendChild(ch.cloneNode(true));
       return c;
     }
 
     get textContent() {
-      let s = ''; for (const c of this.childNodes) s += c.textContent; return s;
+      let s = ''; for (const c of this.__ptKids) s += c.textContent; return s;
     }
     set textContent(v) {
-      this.childNodes = [];
+      this.__ptKids = [];
       if (v !== '') this.appendChild(new Text(String(v)));
     }
 
@@ -171,9 +234,28 @@
     try { Object.defineProperty(set, 'name', { value: 'set ' + name, configurable: true }); } catch (e) {}
     return { get, set, configurable: true, enumerable: false };
   };
+  // Имена кодировок Chrome отдаёт каноническими: utf-8 → UTF-8, latin1 →
+  // windows-1252. Прочие проходят как есть, в нижнем регистре.
+  const __ENCODINGS = {
+    'utf-8': 'UTF-8', 'utf8': 'UTF-8', 'unicode-1-1-utf-8': 'UTF-8',
+    'iso-8859-1': 'windows-1252', 'latin1': 'windows-1252', 'ascii': 'windows-1252',
+    'us-ascii': 'windows-1252', 'windows-1252': 'windows-1252', 'cp1252': 'windows-1252',
+    'utf-16': 'UTF-16LE', 'utf-16le': 'UTF-16LE', 'utf-16be': 'UTF-16BE',
+  };
+  const __normEncoding = (name) => {
+    const k = String(name).trim().toLowerCase();
+    return __ENCODINGS[k] || k;
+  };
+
+  // ChildNode.remove живёт на элементах и текстовых узлах — у документа его нет,
+  // и лишнее имя на `document` заметно ровно так же, как недостающее.
+  const __removeSelf = function remove() { if (this.parentNode) this.parentNode.removeChild(this); };
+
   Object.defineProperties(Node.prototype, {
     nodeType: accessor('nodeType', function () { return this.__ptType; }, function (v) { this.__ptType = v; }),
-    childNodes: accessor('childNodes', function () { return this.__ptKids; }, function (v) { this.__ptKids = v; }),
+    childNodes: accessor('childNodes',
+      function () { return __nodeList(this); },
+      function (v) { this.__ptKids = Array.from(v); }),
     parentNode: accessor('parentNode', function () { return this.__ptParent; }, function (v) { this.__ptParent = v; }),
     ownerDocument: accessor('ownerDocument', function () { return this.__ptDoc; }, function (v) { this.__ptDoc = v; }),
   });
@@ -215,11 +297,11 @@
     get mode() { return this.__ptMode; }
     get nodeName() { return '#document-fragment'; }
     get nodeValue() { return null; }
-    get textContent() { return this.childNodes.map(n => n.textContent).join(''); }
-    set textContent(v) { this.childNodes = []; if (v !== '') this.appendChild(new Text(String(v))); }
-    get innerHTML() { return this.childNodes.map(serializeNode).join(''); }
-    set innerHTML(html) { this.childNodes = []; for (const n of parseFragment(String(html))) this.appendChild(n); }
-    get children() { return this.childNodes.filter(n => n.nodeType === ELEMENT_NODE); }
+    get textContent() { return this.__ptKids.map(n => n.textContent).join(''); }
+    set textContent(v) { this.__ptKids = []; if (v !== '') this.appendChild(new Text(String(v))); }
+    get innerHTML() { return this.__ptKids.map(serializeNode).join(''); }
+    set innerHTML(html) { this.__ptKids = []; for (const n of parseFragment(String(html))) this.appendChild(n); }
+    get children() { return this.__ptKids.filter(n => n.nodeType === ELEMENT_NODE); }
     get firstElementChild() { return this.children[0] || null; }
     get lastElementChild() { const c = this.children; return c[c.length - 1] || null; }
     get childElementCount() { return this.children.length; }
@@ -359,7 +441,7 @@
     get defer() { return this.hasAttribute('defer'); }
     set defer(v) { v ? this.setAttribute('defer', '') : this.removeAttribute('defer'); }
 
-    get children() { return this.childNodes.filter(n => n.nodeType === ELEMENT_NODE); }
+    get children() { return this.__ptKids.filter(n => n.nodeType === ELEMENT_NODE); }
     get childElementCount() { return this.children.length; }
     get firstElementChild() { return this.children[0] || null; }
     get lastElementChild() { const c = this.children; return c[c.length - 1] || null; }
@@ -483,8 +565,8 @@
       return r && r.mode === 'open' ? r : null;
     }
 
-    get innerHTML() { return this.childNodes.map(serializeNode).join(''); }
-    set innerHTML(html) { this.childNodes = []; for (const n of parseFragment(String(html))) this.appendChild(n); }
+    get innerHTML() { return this.__ptKids.map(serializeNode).join(''); }
+    set innerHTML(html) { this.__ptKids = []; for (const n of parseFragment(String(html))) this.appendChild(n); }
     get outerHTML() { return serializeNode(this); }
     // Rendered text (hidden subtrees excluded, whitespace collapsed) — an
     // approximation of `innerText` good enough for tools that read it.
@@ -612,24 +694,61 @@
     // the reply — which the widget waits for forever, silently, because a listener
     // that throws is swallowed by the event dispatch. `referrer` is read on the
     // same line and must be a string ('' for a direct load), not `undefined`.
-    get scripts() { return this.getElementsByTagName('script'); }
-    get forms() { return this.getElementsByTagName('form'); }
-    get images() { return this.getElementsByTagName('img'); }
-    get embeds() { return this.getElementsByTagName('embed'); }
-    get plugins() { return this.getElementsByTagName('embed'); }
+    // Коллекции документа — это HTMLCollection, а не массив: `Array.isArray`
+    // на них ложен, а сборщик отпечатка кладёт массив в корзину по его
+    // строковому значению, из-за чего пустой список выглядел как пустая строка.
+    get scripts() { return __collection(this.getElementsByTagName('script')); }
+    get forms() { return __collection(this.getElementsByTagName('form')); }
+    get images() { return __collection(this.getElementsByTagName('img')); }
+    get embeds() { return __collection(this.getElementsByTagName('embed')); }
+    get plugins() { return __collection(this.getElementsByTagName('embed')); }
     // `links` is `<a>`/`<area>` *with an href*, and `anchors` is `<a>` with a name.
     get links() {
-      return this.getElementsByTagName('a').concat(this.getElementsByTagName('area'))
-        .filter(e => e.hasAttribute('href'));
+      return __collection(this.getElementsByTagName('a').concat(this.getElementsByTagName('area'))
+        .filter(e => e.hasAttribute('href')));
     }
-    get anchors() { return this.getElementsByTagName('a').filter(e => e.hasAttribute('name')); }
+    get anchors() { return __collection(this.getElementsByTagName('a').filter(e => e.hasAttribute('name'))); }
     get styleSheets() {
-      return this.getElementsByTagName('style')
+      return __collection(this.getElementsByTagName('style')
         .concat(this.getElementsByTagName('link').filter(e => /stylesheet/i.test(e.getAttribute('rel') || '')))
         .map(owner => ({ ownerNode: owner, href: owner.getAttribute('href') || null,
                          type: 'text/css', disabled: false, media: owner.getAttribute('media') || '',
-                         title: owner.getAttribute('title') || null, cssRules: [], rules: [] }));
+                         title: owner.getAttribute('title') || null, cssRules: [], rules: [] })));
     }
+    // Кодировка — объявленная, а не всегда UTF-8: страница без объявления
+    // разбирается как windows-1252, и Chrome именно это и сообщает. Отвечать
+    // «UTF-8» на документ, который ничего не объявил, — заметная разница.
+    get characterSet() {
+      if (this.__ptCharset) return this.__ptCharset;
+      for (const m of this.getElementsByTagName('meta')) {
+        const c = m.getAttribute('charset');
+        if (c) return __normEncoding(c);
+        if (/^content-type$/i.test(m.getAttribute('http-equiv') || '')) {
+          const hit = /charset\s*=\s*"?([\w-]+)/i.exec(m.getAttribute('content') || '');
+          if (hit) return __normEncoding(hit[1]);
+        }
+      }
+      return 'windows-1252';
+    }
+    get charset() { return this.characterSet; }
+    get inputEncoding() { return this.characterSet; }
+    get contentType() { return 'text/html'; }
+    get compatMode() { return 'CSS1Compat'; }
+    get designMode() { return 'off'; }
+    set designMode(v) {}
+    // Формат браузера — MM/DD/YYYY HH:MM:SS, а не локализованная строка.
+    get lastModified() {
+      const d = new Date(), p2 = (n) => String(n).padStart(2, '0');
+      return `${p2(d.getMonth() + 1)}/${p2(d.getDate())}/${d.getFullYear()} ` +
+             `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
+    }
+    get webkitVisibilityState() { return this.visibilityState; }
+    get adoptedStyleSheets() { return this.__ptAdopted || (this.__ptAdopted = []); }
+    set adoptedStyleSheets(v) { this.__ptAdopted = v; }
+    // В браузере у документа textContent равен null — узла-контейнера нет.
+    get textContent() { return null; }
+    set textContent(v) {}
+
     get referrer() { return this.__ptReferrer || ''; }
     set referrer(v) { this.__ptReferrer = String(v); }
 
@@ -990,7 +1109,7 @@
     let found = null; walk(root, e => { if (!found && pred(e)) found = e; }); return found;
   }
   function walk(node, visit) {
-    for (const c of node.childNodes) {
+    for (const c of node.__ptKids) {
       if (c.nodeType === ELEMENT_NODE) { visit(c); walk(c, visit); }
     }
   }
@@ -1100,12 +1219,12 @@
   function serializeNode(n) {
     if (n.nodeType === TEXT_NODE) return esc(n.data, false);
     if (n.nodeType === COMMENT_NODE) return `<!--${n.data}-->`;
-    if (n.nodeType !== ELEMENT_NODE) return n.childNodes.map(serializeNode).join('');
+    if (n.nodeType !== ELEMENT_NODE) return n.__ptKids.map(serializeNode).join('');
     const tag = n.localName;
     let attrs = '';
     for (const { name, value } of n.attributes) attrs += ` ${name}="${esc(value, true)}"`;
     if (VOID.has(tag)) return `<${tag}${attrs}>`;
-    return `<${tag}${attrs}>${n.childNodes.map(serializeNode).join('')}</${tag}>`;
+    return `<${tag}${attrs}>${n.__ptKids.map(serializeNode).join('')}</${tag}>`;
   }
 
   // ---- HTML fragment parser (innerHTML setter) ------------------------------
@@ -1152,7 +1271,7 @@
         i = stop;
       }
     }
-    return root.childNodes.slice();
+    return root.__ptKids.slice();
   }
   function unescapeEntities(s) {
     return s.replace(/&(amp|lt|gt|quot|#39|apos|nbsp);/g, (_, e) =>
@@ -1248,7 +1367,7 @@
 
   // Called by the loader with the Rust-parsed <html> tree.
   globalThis.__pt_installDocument = (tree) => {
-    document.childNodes = [];
+    document.__ptKids = [];
     document.documentElement = null;
     document.currentScript = null;
     if (tree && tree.k === 'e') {
@@ -1333,7 +1452,7 @@
     return {
       backendNodeId: globalThis.__pt_nodeId(n), nodeId: 0, nodeType: n.nodeType,
       nodeName: n.nodeName || '', localName: n.localName || '', nodeValue: n.nodeValue || '',
-      childNodeCount: (n.childNodes || []).length, attributes: attrs
+      childNodeCount: (n.__ptKids || []).length, attributes: attrs
     };
   };
   // ---- synthetic layout + interaction (no real rendering) ------------------
@@ -1605,7 +1724,7 @@
 
   // The node after `node` in document order, without leaving `root`.
   const __ptFollowing = (node, root, skipChildren) => {
-    if (!skipChildren && node.childNodes && node.childNodes.length) return node.childNodes[0];
+    if (!skipChildren && node.__ptKids && node.__ptKids.length) return node.__ptKids[0];
     for (let n = node; n && n !== root; n = n.parentNode) {
       if (n.nextSibling) return n.nextSibling;
     }
@@ -1640,7 +1759,7 @@
       while (node && node !== this.__ptRoot) {
         let prev = node.previousSibling;
         if (prev) {
-          while (prev.childNodes && prev.childNodes.length) prev = prev.childNodes[prev.childNodes.length - 1];
+          while (prev.__ptKids && prev.__ptKids.length) prev = prev.__ptKids[prev.__ptKids.length - 1];
           node = prev;
         } else {
           node = node.parentNode;
@@ -1662,7 +1781,7 @@
     firstChild() { return this.__ptChild(0); }
     lastChild() { return this.__ptChild(-1); }
     __ptChild(from) {
-      const kids = this.__ptCur.childNodes || [];
+      const kids = this.__ptCur.__ptKids || [];
       const list = from === 0 ? kids : kids.slice().reverse();
       for (const c of list) {
         if (__ptVerdict(this, c) === FILTER_ACCEPT) { this.__ptCur = c; return c; }
@@ -1722,6 +1841,10 @@
   globalThis.MutationObserver = MutationObserver;
   globalThis.ResizeObserver = ResizeObserver;
 
+  for (const C of [Element, Text, Comment]) {
+    Object.defineProperty(C.prototype, 'remove', { value: __removeSelf, writable: true, configurable: true });
+  }
+
   // Now that every interface exists, publish their members the way the platform
   // does — enumerable on the prototype (see `__webidl` above).
   for (const name of ['Node', 'Element', 'HTMLElement', 'Document', 'Text', 'Comment',
@@ -1774,8 +1897,8 @@
       // дереве, не имеет коробки вовсе: rect выходит нулевым, и код, который
       // проверяет видимость (загрузчик Turnstile — проверяет), считает элемент
       // скрытым и не показывает интерактивную часть.
-      if (el.__ptShadow) for (const c of el.__ptShadow.childNodes) walk(c);
-      for (const c of el.childNodes) walk(c);
+      if (el.__ptShadow) for (const c of el.__ptShadow.__ptKids) walk(c);
+      for (const c of el.__ptKids) walk(c);
     };
     const de = globalThis.document && globalThis.document.documentElement;
     if (de) walk(de);
@@ -1840,7 +1963,7 @@
     // etc. is not rendered, so it must not leak into it (`textContent` includes it).
     if (__INNERTEXT_SKIP.has(el.tagName)) return '';
     let s = '';
-    for (const c of el.childNodes) {
+    for (const c of el.__ptKids) {
       if (c.nodeType === TEXT_NODE) s += c.data;
       else if (c.nodeType === ELEMENT_NODE && !__isHiddenEl(c)) s += ' ' + __innerText(c);
     }
