@@ -2950,7 +2950,44 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   globalThis.PerformanceObserver = globalThis.PerformanceObserver || class PerformanceObserver { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } };
   globalThis.PerformanceObserver.supportedEntryTypes = [];
 
-  globalThis.matchMedia = globalThis.matchMedia || ((q) => ({ matches: false, media: String(q), onchange: null, addListener: noop, removeListener: noop, addEventListener: noop, removeEventListener: noop, dispatchEvent: () => false }));
+  // A media query that answers `false` to everything is not neutral, it is
+  // impossible: exactly one of light/dark matches in any real browser, and a
+  // widget with `theme: auto` asks both. Answer the handful that carry meaning —
+  // colour scheme, motion, pointer, and the viewport dimensions we already
+  // report — and stay `false` for the rest.
+  globalThis.matchMedia = globalThis.matchMedia || function matchMedia(q) {
+    const query = String(q);
+    const num = (re) => { const m = re.exec(query); return m ? parseFloat(m[1]) : null; };
+    const w = globalThis.innerWidth || 0, h = globalThis.innerHeight || 0;
+    let matches = false;
+    if (/prefers-color-scheme\s*:\s*light/i.test(query)) matches = true;
+    else if (/prefers-color-scheme\s*:\s*dark/i.test(query)) matches = false;
+    else if (/prefers-reduced-motion\s*:\s*no-preference/i.test(query)) matches = true;
+    else if (/prefers-reduced-transparency\s*:\s*no-preference/i.test(query)) matches = true;
+    else if (/prefers-contrast\s*:\s*no-preference/i.test(query)) matches = true;
+    else if (/any-pointer\s*:\s*fine|[^-]pointer\s*:\s*fine/i.test(query)) matches = true;
+    else if (/any-hover\s*:\s*hover|[^-]hover\s*:\s*hover/i.test(query)) matches = true;
+    else if (/pointer\s*:\s*coarse|hover\s*:\s*none/i.test(query)) matches = false;
+    else if (/orientation\s*:\s*landscape/i.test(query)) matches = w >= h;
+    else if (/orientation\s*:\s*portrait/i.test(query)) matches = w < h;
+    else {
+      const maxW = num(/max-width\s*:\s*(\d+(?:\.\d+)?)px/i), minW = num(/min-width\s*:\s*(\d+(?:\.\d+)?)px/i);
+      const maxH = num(/max-height\s*:\s*(\d+(?:\.\d+)?)px/i), minH = num(/min-height\s*:\s*(\d+(?:\.\d+)?)px/i);
+      if (maxW !== null || minW !== null || maxH !== null || minH !== null) {
+        matches = (maxW === null || w <= maxW) && (minW === null || w >= minW)
+               && (maxH === null || h <= maxH) && (minH === null || h >= minH);
+      }
+    }
+    const listeners = [];
+    return {
+      matches, media: query, onchange: null,
+      addListener: (f) => { if (f) listeners.push(f); },
+      removeListener: (f) => { const i = listeners.indexOf(f); if (i >= 0) listeners.splice(i, 1); },
+      addEventListener: (t, f) => { if (t === 'change' && f) listeners.push(f); },
+      removeEventListener: (t, f) => { const i = listeners.indexOf(f); if (i >= 0) listeners.splice(i, 1); },
+      dispatchEvent: () => false,
+    };
+  };
   globalThis.getComputedStyle = globalThis.getComputedStyle || (() => ({ getPropertyValue: () => '', getPropertyPriority: () => '', length: 0, cssText: '', item: () => '', display: '', visibility: 'visible' }));
   globalThis.requestIdleCallback = globalThis.requestIdleCallback || ((cb) => setTimeout(() => cb({ didTimeout: false, timeRemaining: () => 50 }), 1));
   globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || ((id) => clearTimeout(id));
