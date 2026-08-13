@@ -979,6 +979,8 @@ impl Conn {
             "Page.addScriptToEvaluateOnNewDocument" => {
                 if let Some(src) = params.get("source").and_then(|v| v.as_str()) {
                     self.targets[idx].init_scripts.push(src.to_string());
+                    // Chrome runs these in every frame, not just the top document.
+                    self.targets[idx].ctx.add_frame_init_script(src.to_string());
                 }
                 let ident = format!("initscript-{}", self.targets[idx].init_scripts.len());
                 vec![ok(id, session, json!({ "identifier": ident }))]

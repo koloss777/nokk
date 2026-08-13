@@ -1229,6 +1229,154 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     };
   }
 
+  // --- DOMException, MessageChannel, and the fetch classes ----------------
+  // All present in every browser and all absent here, which breaks pages in the
+  // quietest possible way: a widget that opens a `MessageChannel` to talk to its
+  // embedder, or constructs a `Request`, simply stops — no error, no output.
+  if (!globalThis.DOMException) {
+    globalThis.DOMException = class DOMException extends Error {
+      constructor(message, name) {
+        super(message === undefined ? '' : String(message));
+        this.name = name === undefined ? 'Error' : String(name);
+      }
+      get code() {
+        const codes = { IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
+          InvalidCharacterError: 5, NotFoundError: 8, NotSupportedError: 9, InvalidStateError: 11,
+          SyntaxError: 12, InvalidModificationError: 13, NamespaceError: 14, SecurityError: 18,
+          NetworkError: 19, AbortError: 20, TimeoutError: 23, DataCloneError: 25 };
+        return codes[this.name] || 0;
+      }
+    };
+  }
+
+  if (!globalThis.MessagePort) {
+    // A pair of ports, each delivering to the other. Messages arrive in a
+    // microtask (never synchronously), and a port that has not been `start`ed
+    // queues them — both of which real code depends on.
+    globalThis.MessagePort = class MessagePort {
+      constructor() {
+        Object.defineProperty(this, '__pt', {
+          value: { peer: null, started: false, queue: [], onmessage: null, listeners: [] },
+          enumerable: false,
+        });
+      }
+      get onmessage() { return this.__pt.onmessage; }
+      set onmessage(fn) { this.__pt.onmessage = fn; this.start(); }
+      addEventListener(type, fn) {
+        if (type !== 'message' || typeof fn !== 'function') return;
+        this.__pt.listeners.push(fn);
+        this.start();
+      }
+      removeEventListener(type, fn) {
+        const l = this.__pt.listeners, i = l.indexOf(fn);
+        if (i >= 0) l.splice(i, 1);
+      }
+      dispatchEvent() { return true; }
+      start() {
+        const st = this.__pt;
+        if (st.started) return;
+        st.started = true;
+        for (const ev of st.queue.splice(0)) this.__ptDeliver(ev);
+      }
+      close() { this.__pt.peer = null; }
+      postMessage(data) {
+        const peer = this.__pt.peer;
+        if (!peer) return;
+        const ev = { type: 'message', data, origin: '', lastEventId: '', source: null, ports: [], isTrusted: true, target: peer, currentTarget: peer };
+        queueMicrotask(() => {
+          const st = peer.__pt;
+          if (!st.started) { st.queue.push(ev); return; }
+          peer.__ptDeliver(ev);
+        });
+      }
+      __ptDeliver(ev) {
+        const st = this.__pt;
+        try { if (typeof st.onmessage === 'function') st.onmessage.call(this, ev); } catch (e) {}
+        for (const fn of st.listeners.slice()) { try { fn.call(this, ev); } catch (e) {} }
+      }
+    };
+    globalThis.MessageChannel = class MessageChannel {
+      constructor() {
+        const a = new globalThis.MessagePort(), b = new globalThis.MessagePort();
+        a.__pt.peer = b; b.__pt.peer = a;
+        Object.defineProperty(this, 'port1', { value: a, enumerable: true });
+        Object.defineProperty(this, 'port2', { value: b, enumerable: true });
+      }
+    };
+  }
+
+  if (!globalThis.Headers) {
+    globalThis.Headers = class Headers {
+      constructor(init) {
+        Object.defineProperty(this, '__h', { value: new Map(), enumerable: false });
+        if (init) {
+          const put = (k, v) => this.append(k, v);
+          if (typeof init.forEach === 'function' && !Array.isArray(init)) init.forEach((v, k) => put(k, v));
+          else if (Array.isArray(init)) for (const [k, v] of init) put(k, v);
+          else for (const k of Object.keys(init)) put(k, init[k]);
+        }
+      }
+      append(k, v) {
+        const key = String(k).toLowerCase(), cur = this.__h.get(key);
+        this.__h.set(key, cur === undefined ? String(v) : cur + ', ' + String(v));
+      }
+      set(k, v) { this.__h.set(String(k).toLowerCase(), String(v)); }
+      get(k) { const v = this.__h.get(String(k).toLowerCase()); return v === undefined ? null : v; }
+      has(k) { return this.__h.has(String(k).toLowerCase()); }
+      delete(k) { this.__h.delete(String(k).toLowerCase()); }
+      forEach(fn, thisArg) { for (const [k, v] of this.__h) fn.call(thisArg, v, k, this); }
+      keys() { return this.__h.keys(); }
+      values() { return this.__h.values(); }
+      entries() { return this.__h.entries(); }
+      [Symbol.iterator]() { return this.__h.entries(); }
+    };
+  }
+  if (!globalThis.Request) {
+    globalThis.Request = class Request {
+      constructor(input, init) {
+        init = init || {};
+        this.url = String(input && input.url !== undefined ? input.url : input);
+        this.method = String(init.method || (input && input.method) || 'GET').toUpperCase();
+        this.headers = new globalThis.Headers(init.headers || (input && input.headers));
+        this.credentials = init.credentials || 'same-origin';
+        this.mode = init.mode || 'cors';
+        this.cache = init.cache || 'default';
+        this.redirect = init.redirect || 'follow';
+        this.referrer = init.referrer === undefined ? 'about:client' : String(init.referrer);
+        this.signal = init.signal || null;
+        Object.defineProperty(this, '__body', { value: init.body === undefined ? null : init.body, enumerable: false });
+        this.bodyUsed = false;
+      }
+      clone() { return new globalThis.Request(this); }
+      text() { this.bodyUsed = true; return Promise.resolve(this.__body == null ? '' : String(this.__body)); }
+      json() { return this.text().then(JSON.parse); }
+      arrayBuffer() { return this.text().then(t => new TextEncoder().encode(t).buffer); }
+    };
+  }
+  if (!globalThis.Response) {
+    globalThis.Response = class Response {
+      constructor(body, init) {
+        init = init || {};
+        this.status = init.status === undefined ? 200 : (init.status | 0);
+        this.statusText = init.statusText === undefined ? '' : String(init.statusText);
+        this.headers = new globalThis.Headers(init.headers);
+        this.ok = this.status >= 200 && this.status < 300;
+        this.redirected = false;
+        this.type = 'default';
+        this.url = '';
+        this.bodyUsed = false;
+        Object.defineProperty(this, '__body', { value: body == null ? '' : body, enumerable: false });
+      }
+      static error() { const r = new globalThis.Response(null, { status: 0 }); r.type = 'error'; return r; }
+      static json(data, init) { return new globalThis.Response(JSON.stringify(data), init); }
+      clone() { return new globalThis.Response(this.__body, { status: this.status, statusText: this.statusText, headers: this.headers }); }
+      text() { this.bodyUsed = true; return Promise.resolve(String(this.__body)); }
+      json() { return this.text().then(JSON.parse); }
+      arrayBuffer() { return this.text().then(t => new TextEncoder().encode(t).buffer); }
+      blob() { return this.text().then(t => new Blob([t])); }
+    };
+  }
+
   // --- WebSocket ----------------------------------------------------------
   // Same shape as fetch above: JS owns the object and its state machine, Rust
   // owns the socket. Operations pile onto a queue the event loop drains
@@ -2536,12 +2684,18 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     [globalThis, 'XMLHttpRequest'], [globalThis, 'AudioContext'], [globalThis, 'Image'],
     [globalThis, 'getComputedStyle'], [globalThis, 'matchMedia'], [globalThis, 'TextEncoder'],
     [globalThis, 'TextDecoder'], [globalThis, 'Blob'], [globalThis, 'FormData'], [globalThis, 'URL'],
-    [globalThis, 'WebSocket']]) {
+    [globalThis, 'WebSocket'], [globalThis, 'DOMException'], [globalThis, 'MessageChannel'],
+    [globalThis, 'MessagePort'], [globalThis, 'Headers'], [globalThis, 'Request'],
+    [globalThis, 'Response'], [globalThis, 'atob'], [globalThis, 'btoa'],
+    [globalThis, 'structuredClone'], [globalThis, 'AbortController'], [globalThis, 'AbortSignal']]) {
     if (obj[key]) mask(obj[key], key);
   }
   // `send`/`close`/`addEventListener` on a socket must read native too — the
   // class body is otherwise readable through `WebSocket.prototype.send.toString()`.
   if (globalThis.WebSocket) maskProto(globalThis.WebSocket.prototype);
+  for (const n of ['MessagePort', 'Headers', 'Request', 'Response', 'DOMException']) {
+    if (globalThis[n]) maskProto(globalThis[n].prototype);
+  }
   // Real DOM/Web-API methods and accessors are all native — mark the ones on our
   // prototypes so `document.querySelector.toString()` and
   // `Object.getOwnPropertyDescriptor(Navigator.prototype,'userAgent').get.toString()`

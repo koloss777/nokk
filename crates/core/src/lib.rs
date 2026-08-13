@@ -617,6 +617,7 @@ impl Engine {
             network_tx: std::sync::Mutex::new(None),
             frames: std::sync::Mutex::new(HashMap::new()),
             bootstrap,
+            frame_init_scripts: std::sync::Mutex::new(Vec::new()),
             session,
             _permit: permit,
             _load: load,
@@ -736,6 +737,10 @@ pub struct BrowserContext {
     /// This context's bootstrap, kept so a child frame is built with the same
     /// stealth profile — an iframe of this browser is the same machine.
     bootstrap: String,
+    /// Scripts to run in every *new* frame before its own document does, which is
+    /// what `Page.addScriptToEvaluateOnNewDocument` means in Chrome — it applies
+    /// to the whole frame tree, not just the top document.
+    frame_init_scripts: std::sync::Mutex<Vec<String>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
     _load: nokk_pool::ContextLoadGuard,
 }
@@ -1161,6 +1166,17 @@ impl BrowserContext {
         !self.sockets.lock().await.open.is_empty()
     }
 
+    /// Register a script to run in every frame this page opens from now on,
+    /// before that frame's own document scripts. Bounded so a page that keeps
+    /// adding them cannot grow the list without limit.
+    pub fn add_frame_init_script(&self, src: String) {
+        if let Ok(mut v) = self.frame_init_scripts.lock() {
+            if v.len() < 32 {
+                v.push(src);
+            }
+        }
+    }
+
     /// Every live `<iframe>` on this page: the id its DOM assigned, the URL it
     /// loaded, and its origin. The CDP layer turns these into frame lifecycle
     /// events and per-frame execution contexts, which is what makes a frame
@@ -1268,6 +1284,19 @@ impl BrowserContext {
                     let _ = self
                         .eval_in(index, &format!("__pt_markAsFrame({id});"))
                         .await;
+                    // Init scripts run before the frame's document, as they do for
+                    // a page — that is how a client instruments a frame at all,
+                    // since a frame's own scripts run the moment it is built.
+                    let init = self
+                        .frame_init_scripts
+                        .lock()
+                        .map(|v| v.clone())
+                        .unwrap_or_default();
+                    for src in init {
+                        if let Err(e) = self.eval_in(index, &src).await {
+                            tracing::debug!(error = %e, "frame init script threw");
+                        }
+                    }
                     let origin = origin_of(&url);
                     if let Ok(mut frames) = self.frames.lock() {
                         frames.insert(
