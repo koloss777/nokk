@@ -836,8 +836,9 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   globalThis.requestAnimationFrame = (fn) =>
     add(() => fn(globalThis.performance ? globalThis.performance.now() : clock()), 16, false, []);
   globalThis.cancelAnimationFrame = globalThis.clearTimeout;
-  globalThis.setImmediate = (fn, ...args) => add(fn, 0, false, args);
-  globalThis.clearImmediate = globalThis.clearTimeout;
+  // No browser has `setImmediate`/`clearImmediate` — they are Node's, and we were
+  // the ones putting them on the page. An extra global is as much a tell as a
+  // missing one, and this pair is a well-known signature.
 
   // `performance` is defined by PERFORMANCE_TEMPLATE (wall-clock coherent); a
   // frame callback receives the same high-res timestamp a real browser passes.

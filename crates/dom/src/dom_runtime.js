@@ -1187,6 +1187,25 @@
   };
   Object.assign(Node, NODE_TYPES);
   Object.assign(Node.prototype, NODE_TYPES);
+  // A WebIDL interface's members are *enumerable* on its prototype: in a browser
+  // `Object.keys(Document.prototype)` lists `body`, `title`, `querySelector` and
+  // the rest. Ours were declared with `class`, whose members are non-enumerable by
+  // language rule, so the same call returned two names. That is not an internal
+  // detail — the Turnstile VM fingerprints by walking `Object.keys` up the whole
+  // prototype chain, and against a browser's 1600-odd properties our graph showed
+  // 318. Mark them the way the platform does; `constructor` stays hidden, as it is
+  // in a browser.
+  const __webidl = (ctor) => {
+    if (!ctor || !ctor.prototype) return;
+    for (const k of Object.getOwnPropertyNames(ctor.prototype)) {
+      if (k === 'constructor') continue;
+      const d = Object.getOwnPropertyDescriptor(ctor.prototype, k);
+      if (!d || d.enumerable || !d.configurable) continue;
+      d.enumerable = true;
+      try { Object.defineProperty(ctor.prototype, k, d); } catch (e) {}
+    }
+  };
+
   globalThis.Node = Node;
   globalThis.Element = Element;
   globalThis.HTMLElement = Element;
@@ -1702,6 +1721,21 @@
   // document present there is a real tree to watch.
   globalThis.MutationObserver = MutationObserver;
   globalThis.ResizeObserver = ResizeObserver;
+
+  // Now that every interface exists, publish their members the way the platform
+  // does — enumerable on the prototype (see `__webidl` above).
+  for (const name of ['Node', 'Element', 'HTMLElement', 'Document', 'Text', 'Comment',
+    'DocumentFragment', 'ShadowRoot', 'Event', 'UIEvent', 'MouseEvent', 'PointerEvent',
+    'KeyboardEvent', 'InputEvent', 'FocusEvent', 'MessageEvent', 'CustomEvent',
+    'MutationObserver', 'ResizeObserver', 'IntersectionObserver', 'NodeFilter',
+    'TreeWalker', 'NodeIterator', 'DOMTokenList', 'NamedNodeMap', 'Attr',
+    'HTMLCollection', 'NodeList', 'CSSStyleDeclaration', 'DOMRect', 'Worker',
+    'XMLHttpRequest', 'EventTarget', 'Blob', 'File', 'FileReader', 'FormData',
+    'Headers', 'Request', 'Response', 'URL', 'URLSearchParams', 'ReadableStream',
+    'WritableStream', 'TransformStream', 'BroadcastChannel', 'MessageChannel',
+    'MessagePort', 'AbortController', 'AbortSignal', 'DOMException']) {
+    __webidl(globalThis[name]);
+  }
 
   function __isHiddenEl(el) {
     if (el.hasAttribute && el.hasAttribute('hidden')) return true;
