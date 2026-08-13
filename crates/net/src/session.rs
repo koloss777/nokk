@@ -170,6 +170,11 @@ impl CookieStore for SessionJar {
                 .map(|(n, v)| (n.to_owned(), v.to_owned()))
                 .collect()
         };
+        tracing::debug!(
+            url = %url,
+            sent = %pairs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(","),
+            "jar → request"
+        );
         if pairs.is_empty() {
             return Cookies::Empty;
         }
