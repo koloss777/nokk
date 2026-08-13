@@ -1508,6 +1508,92 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       }
       cancel(r) { const st = this.__pt; st.closed = true; try { st.source.cancel && st.source.cancel(r); } catch (e) {} return Promise.resolve(); }
       tee() { return [this, this]; }
+      // Not decoration: Cloudflare's challenge gates on
+      // `ReadableStream.prototype.pipeTo === undefined` and calls the browser
+      // unsupported if it is — one missing method and the challenge never starts.
+      pipeTo(dest, opts) {
+        const reader = this.getReader();
+        const writer = dest && typeof dest.getWriter === 'function' ? dest.getWriter() : null;
+        const pump = () => reader.read().then(({ value, done }) => {
+          if (done) {
+            reader.releaseLock();
+            if (writer && !(opts && opts.preventClose)) { try { return writer.close(); } catch (e) {} }
+            return undefined;
+          }
+          if (writer) { try { writer.write(value); } catch (e) {} }
+          return pump();
+        });
+        return pump();
+      }
+      pipeThrough(pair, opts) {
+        if (!pair || !pair.writable || !pair.readable) throw new TypeError('pipeThrough needs a { writable, readable }');
+        this.pipeTo(pair.writable, opts);
+        return pair.readable;
+      }
+      [Symbol.asyncIterator]() {
+        const reader = this.getReader();
+        return { next: () => reader.read(), return: () => { reader.releaseLock(); return Promise.resolve({ done: true }); } };
+      }
+      values() { return this[Symbol.asyncIterator](); }
+    };
+  }
+
+  // `pipeTo` needs somewhere to pipe *to*, and the same probes that ask for it
+  // ask whether these exist at all.
+  if (!globalThis.WritableStream) {
+    globalThis.WritableStream = class WritableStream {
+      constructor(sink, strategy) {
+        const st = { chunks: [], closed: false, locked: false, sink: sink || {} };
+        Object.defineProperty(this, '__pt', { value: st, enumerable: false });
+        const controller = { error: (e) => { st.error = e; }, get signal() { return undefined; } };
+        st.controller = controller;
+        try { if (typeof st.sink.start === 'function') st.sink.start(controller); } catch (e) { st.error = e; }
+      }
+      get locked() { return this.__pt.locked; }
+      getWriter() {
+        const st = this.__pt;
+        if (st.locked) throw new TypeError('WritableStream is locked');
+        st.locked = true;
+        const call = (name, arg) => {
+          const f = st.sink[name];
+          try { return Promise.resolve(typeof f === 'function' ? f.call(st.sink, arg, st.controller) : undefined); }
+          catch (e) { return Promise.reject(e); }
+        };
+        return {
+          write: (c) => { st.chunks.push(c); return call('write', c); },
+          close: () => { st.closed = true; return call('close'); },
+          abort: (r) => { st.closed = true; return call('abort', r); },
+          releaseLock: () => { st.locked = false; },
+          get desiredSize() { return 1; },
+          get closed() { return Promise.resolve(); },
+          get ready() { return Promise.resolve(); },
+        };
+      }
+      close() { this.__pt.closed = true; return Promise.resolve(); }
+      abort(r) { this.__pt.closed = true; return Promise.resolve(r); }
+    };
+  }
+
+  if (!globalThis.TransformStream) {
+    globalThis.TransformStream = class TransformStream {
+      constructor(transformer) {
+        const t = transformer || {};
+        let enqueue = null;
+        const readable = new globalThis.ReadableStream({ start(c) { enqueue = (v) => c.enqueue(v); } });
+        const controller = { enqueue: (v) => enqueue && enqueue(v), terminate() {}, error() {} };
+        const writable = new globalThis.WritableStream({
+          write(chunk) {
+            if (typeof t.transform === 'function') return t.transform(chunk, controller);
+            controller.enqueue(chunk);
+            return undefined;
+          },
+          close() { if (typeof t.flush === 'function') return t.flush(controller); return undefined; },
+        });
+        Object.defineProperty(this, '__pt', { value: { readable, writable }, enumerable: false });
+        try { if (typeof t.start === 'function') t.start(controller); } catch (e) {}
+      }
+      get readable() { return this.__pt.readable; }
+      get writable() { return this.__pt.writable; }
     };
   }
 
