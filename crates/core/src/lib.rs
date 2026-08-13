@@ -288,6 +288,7 @@ impl EngineInner {
             headers,
             body: None,
             kind: nokk_net::RequestKind::Xhr,
+            user_activated: false,
         };
         match client.send(req).await {
             Ok(resp) => nokk_net::parse_geo(&resp.body),
@@ -703,6 +704,8 @@ impl Engine {
             headers,
             body: None,
             kind: nokk_net::RequestKind::Document,
+            // A one-shot fetch is someone asking for an address, like typing one.
+            user_activated: true,
         };
         match self.inner.client.send(req).await {
             Ok(resp) => Ok(resp),
@@ -873,6 +876,19 @@ impl BrowserContext {
     /// [`load_html`](Self::load_html) it. Requires real networking (the stub
     /// client reports [`EngineError::NavNotImplemented`]).
     pub async fn navigate(&self, url: &str) -> Result<(), EngineError> {
+        self.navigate_from(url, None).await
+    }
+
+    /// The same, for a page that navigated itself. `referrer` is the document
+    /// that did it — a browser sends it, marks the request same-origin, and does
+    /// *not* claim a human gesture. Cloudflare's interstitial finishes by
+    /// reloading itself, so this is the difference between landing on the site
+    /// and being handed the challenge again.
+    pub async fn navigate_from(
+        &self,
+        url: &str,
+        referrer: Option<&str>,
+    ) -> Result<(), EngineError> {
         // Follow client-side `<meta http-equiv="refresh">` redirects, not just the
         // HTTP ones the network layer already follows. Some gates (e.g. Google's
         // "enable JavaScript" handoff) bounce through a meta-refresh that also sets
@@ -891,7 +907,9 @@ impl BrowserContext {
         for _ in 0..MAX_META_HOPS {
             // Use the post-redirect URL as the document base, so `window.location`
             // and relative-URL resolution reflect where we actually landed.
-            let (final_url, html) = self.fetch_text(&current, "document").await?;
+            let (final_url, html) = self
+                .fetch_text_from(&current, "document", referrer)
+                .await?;
             self.load_html(&final_url, &html).await?;
             match self.meta_refresh_target(&final_url).await {
                 Some(next) if next != final_url && next != current => current = next,
@@ -992,6 +1010,32 @@ impl BrowserContext {
         // can point `document.currentScript` at the running node (document.write
         // positioning); `__pt_endScript` clears it afterward.
         for (idx, script) in page.scripts.iter().enumerate() {
+            // A module is not a script with different syntax: it is parsed, linked
+            // and evaluated as a graph, so it goes down its own path.
+            if let nokk_dom::Script::InlineModule(code) | nokk_dom::Script::ExternalModule(code) =
+                script
+            {
+                let inline = matches!(script, nokk_dom::Script::InlineModule(_));
+                let _ = self
+                    .eval_in(index, &format!("__pt_beginScript({idx})"))
+                    .await;
+                let outcome = if inline {
+                    self.run_module(index, base_url, code.clone()).await
+                } else {
+                    match resolve_url(base_url, code) {
+                        Some(abs) => match self.fetch_text(&abs, "script").await {
+                            Ok((_, source)) => self.run_module(index, &abs, source).await,
+                            Err(e) => Err(EngineError::Js(e.to_string())),
+                        },
+                        None => Err(EngineError::Js(format!("cannot resolve {code}"))),
+                    }
+                };
+                if let Err(e) = outcome {
+                    tracing::debug!(error = %e, "page module threw");
+                }
+                let _ = self.eval_in(index, "__pt_endScript()").await;
+                continue;
+            }
             let code = match script {
                 nokk_dom::Script::Inline(code) => code.clone(),
                 nokk_dom::Script::External(src) => match resolve_url(base_url, src) {
@@ -1019,6 +1063,8 @@ impl BrowserContext {
                         continue;
                     }
                 },
+                // Handled above, before this match.
+                nokk_dom::Script::InlineModule(_) | nokk_dom::Script::ExternalModule(_) => continue,
             };
             let _ = self
                 .eval_in(index, &format!("__pt_beginScript({idx})"))
@@ -1160,7 +1206,9 @@ impl BrowserContext {
                         tracing::debug!(url = %to, "page navigated itself");
                         // Boxed: the loop is reached *from* `navigate`, so this
                         // is a recursive async call and needs an indirection.
-                        if let Err(e) = Box::pin(self.navigate(&to)).await {
+                        let from = base.clone();
+                        let from = (!from.is_empty() && from != "about:blank").then_some(from);
+                        if let Err(e) = Box::pin(self.navigate_from(&to, from.as_deref())).await {
                             tracing::debug!(url = %to, error = %e, "self-navigation failed");
                         }
                         return Ok(total_timers);
@@ -1551,6 +1599,60 @@ impl BrowserContext {
     /// fetched on this context's client (so cookies and fingerprint are the page's
     /// own), then evaluated in the context that asked. The element hears back
     /// either way, so `onload`/`onerror` fire where the page expects them.
+    /// Load and run an ES module graph. V8 resolves imports through a callback
+    /// that cannot wait for the network, so the graph is walked first: compile,
+    /// ask what it imports, fetch that, repeat — and only then instantiate. A
+    /// modern site is one `<script type="module">` and nothing else, so without
+    /// this the page stays blank and says nothing about why.
+    async fn run_module(
+        &self,
+        index: usize,
+        url: &str,
+        source: String,
+    ) -> Result<(), EngineError> {
+        /// A page's own graph, not a package tree — this is a guard, not a budget.
+        const MAX_MODULES: usize = 256;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen.insert(url.to_string());
+        let mut pending = vec![(url.to_string(), source)];
+
+        while let Some((at, code)) = pending.pop() {
+            let (i, u, c) = (index, at.clone(), code);
+            let requests = self
+                .engine
+                .pool
+                .dispatch(self.worker, move |iso| iso.module_requests(i, &u, &c))
+                .await?
+                .map_err(EngineError::Js)?;
+
+            for spec in requests {
+                // A bare specifier ("react") needs an import map to mean anything;
+                // a bundled page never has one, and guessing would be worse.
+                let Some(target) = resolve_url(&at, &spec) else { continue };
+                let (i, from, sp, to) = (index, at.clone(), spec.clone(), target.clone());
+                self.engine
+                    .pool
+                    .dispatch(self.worker, move |iso| iso.link_module(i, &from, &sp, &to))
+                    .await?;
+                if seen.contains(&target) || seen.len() >= MAX_MODULES {
+                    continue;
+                }
+                seen.insert(target.clone());
+                match self.fetch_text(&target, "script").await {
+                    Ok((_, code)) => pending.push((target, code)),
+                    Err(e) => tracing::debug!(url = %target, error = %e, "import failed to load"),
+                }
+            }
+        }
+
+        let (i, u) = (index, url.to_string());
+        self.engine
+            .pool
+            .dispatch(self.worker, move |iso| iso.eval_module(i, &u))
+            .await?
+            .map_err(EngineError::Js)
+    }
+
     async fn apply_script_ops(&self, index: usize, base: &str, ops: &[Value]) {
         const MAX_SCRIPTS: usize = 64;
         for op in ops.iter().take(MAX_SCRIPTS) {
@@ -1585,6 +1687,15 @@ impl BrowserContext {
                 }
                 continue;
             }
+            // <script type="module"> без src: исходник пришёл вместе с операцией,
+            // но исполнять его всё равно надо как модуль — со своим `import`.
+            if let Some(code) = op["code"].as_str() {
+                if let Err(e) = self.run_module(index, base, code.to_string()).await {
+                    tracing::debug!(error = %e, "inline module threw");
+                }
+                let _ = self.eval_in(index, &done(true)).await;
+                continue;
+            }
             let Some(url) = resolve_url(base, raw) else {
                 let _ = self.eval_in(index, &done(false)).await;
                 continue;
@@ -1598,6 +1709,13 @@ impl BrowserContext {
             }
             match self.fetch_text(&url, "script").await {
                 Ok((_, code)) => {
+                    if op["module"].as_bool().unwrap_or(false) {
+                        if let Err(e) = self.run_module(index, &url, code).await {
+                            tracing::debug!(url = %url, error = %e, "module threw");
+                        }
+                        let _ = self.eval_in(index, &done(true)).await;
+                        continue;
+                    }
                     let code = format!("{code}\n//# sourceURL={url}");
                     if let Err(e) = self.eval_in(index, &code).await {
                         tracing::debug!(url = %url, error = %e, "inserted script threw");
@@ -1897,6 +2015,7 @@ impl BrowserContext {
             headers,
             body,
             kind: nokk_net::RequestKind::Xhr,
+            user_activated: false,
         };
 
         let method = req.method.clone();
@@ -1950,6 +2069,18 @@ impl BrowserContext {
         url: &str,
         resource_type: &str,
     ) -> Result<(String, String), EngineError> {
+        self.fetch_text_from(url, resource_type, None).await
+    }
+
+    /// The same, for a navigation the page made itself: `referrer` is the
+    /// document that asked, and it changes what goes on the wire — a referrer,
+    /// `sec-fetch-site: same-origin`, and no claim of a human gesture.
+    async fn fetch_text_from(
+        &self,
+        url: &str,
+        resource_type: &str,
+        referrer: Option<&str>,
+    ) -> Result<(String, String), EngineError> {
         let mut headers = std::collections::BTreeMap::new();
         headers.insert(
             "User-Agent".to_string(),
@@ -1962,11 +2093,16 @@ impl BrowserContext {
         // A subresource carries the document that asked for it. Without a
         // `Referer` there is no way to tell same-origin from cross-site, and the
         // request reads as one nobody's page made.
-        if resource_type != "document" {
-            let base = self.base_url.lock().map(|b| b.clone()).unwrap_or_default();
-            if !base.is_empty() && base != "about:blank" {
-                headers.insert("Referer".to_string(), base);
+        let from = match referrer {
+            Some(r) if !r.is_empty() && r != "about:blank" => Some(r.to_string()),
+            _ if resource_type != "document" => {
+                let base = self.base_url.lock().map(|b| b.clone()).unwrap_or_default();
+                (!base.is_empty() && base != "about:blank").then_some(base)
             }
+            _ => None,
+        };
+        if let Some(r) = from {
+            headers.insert("Referer".to_string(), r);
         }
         let req = Request {
             method: "GET".into(),
@@ -1979,6 +2115,8 @@ impl BrowserContext {
                 "xhr" | "fetch" => nokk_net::RequestKind::Xhr,
                 _ => nokk_net::RequestKind::Subresource,
             },
+            // A navigation nobody's page asked for is one a person asked for.
+            user_activated: resource_type == "document" && referrer.is_none(),
         };
         match self.client.send(req).await {
             Ok(resp) => {
@@ -4636,6 +4774,141 @@ mod tests {
         assert!(
             seq - ack <= 5,
             "the answer must keep up with the pings, not fall behind: {state}"
+        );
+    }
+
+    /// Serves a module graph and records the headers of every request, so a test
+    /// can assert both what ran and what went on the wire.
+    async fn module_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .to_string();
+                    if let Ok(mut l) = log.lock() {
+                        l.push((path.clone(), req.to_ascii_lowercase()));
+                    }
+                    let (ctype, body) = match path.as_str() {
+                        "/app.js" => (
+                            "text/javascript",
+                            "import { tag } from './tag.js';\n\
+                             class Boxed extends HTMLElement {\n\
+                               connectedCallback() { this.textContent = tag(); }\n\
+                             }\n\
+                             customElements.define('x-boxed', Boxed);\n\
+                             document.body.appendChild(document.createElement('x-boxed'));\n\
+                             globalThis.__meta = import.meta.url;\n",
+                        ),
+                        "/tag.js" => (
+                            "text/javascript",
+                            "export const tag = () => 'built by a module';",
+                        ),
+                        "/second" => ("text/html", "<html><body>second</body></html>"),
+                        _ => (
+                            "text/html",
+                            "<html><body><script type=\"module\" src=\"/app.js\"></script></body></html>",
+                        ),
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{}/", addr.port()), seen)
+    }
+
+    /// A modern site is one `<script type="module">` and nothing else. Compiled as
+    /// a classic script it dies on its first `import` — silently, since a page
+    /// script that throws must not fail the load — and the page stays blank with
+    /// nothing to explain it. The graph is fetched, linked and evaluated instead,
+    /// and the custom element it defines gets upgraded like a browser's.
+    #[tokio::test]
+    async fn a_module_graph_runs_and_defines_a_custom_element() {
+        let _serial = serial().await;
+        let (url, _log) = module_server().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 4, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&url).await.unwrap();
+
+        let out = probe(&ctx, r#"JSON.stringify({
+            text: (document.querySelector('x-boxed') || {}).textContent,
+            defined: typeof customElements.get('x-boxed'),
+            meta: String(globalThis.__meta || '').split('/').pop(),
+            // A page-built event stays untrusted even here.
+            trusted: new MouseEvent('click').isTrusted,
+        })"#).await;
+
+        assert_eq!(out["text"], "built by a module", "the import chain ran: {out}");
+        assert_eq!(out["defined"], "function", "and defined its element");
+        assert_eq!(out["meta"], "app.js", "import.meta.url names the module itself");
+        assert_eq!(out["trusted"], false);
+    }
+
+    /// `window.location = url` is a navigation, and it was the one shape we did
+    /// not implement: the assignment replaced the Location object with a string,
+    /// so nothing moved and every later read of `location` was broken. A page that
+    /// finishes by sending itself somewhere — a Cloudflare interstitial does —
+    /// stopped there. What goes on the wire matters as much: a navigation the page
+    /// made carries a referrer and is same-origin, and claims no human gesture.
+    #[tokio::test]
+    async fn a_page_can_send_itself_somewhere_the_way_a_browser_does() {
+        let _serial = serial().await;
+        let (url, log) = module_server().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 4, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&url).await.unwrap();
+        ctx.evaluate("window.location = '/second'").await.unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        let out = probe(&ctx, r#"JSON.stringify({
+            where: location.pathname,
+            text: document.body.textContent.trim(),
+            isObject: typeof location === 'object' && typeof location.href === 'string',
+        })"#).await;
+        assert_eq!(out["where"], "/second", "the assignment navigated");
+        assert_eq!(out["text"], "second");
+        assert_eq!(out["isObject"], true, "and location is still Location, not a string");
+
+        let seen = log.lock().unwrap().clone();
+        let first = seen.iter().find(|(p, _)| p == "/").expect("the first load");
+        let second = seen.iter().find(|(p, _)| p == "/second").expect("the navigation");
+        assert!(
+            first.1.contains("sec-fetch-site: none") && first.1.contains("sec-fetch-user: ?1"),
+            "an address someone asked for comes from nowhere, by a person"
+        );
+        assert!(
+            second.1.contains("sec-fetch-site: same-origin") && second.1.contains("referer:"),
+            "a navigation the page made says where it came from: {}",
+            second.1
+        );
+        assert!(
+            !second.1.contains("sec-fetch-user"),
+            "and never claims a gesture nobody made"
         );
     }
 

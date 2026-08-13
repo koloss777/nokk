@@ -6,6 +6,7 @@
 //! are only ever touched from the worker thread that created them — which is
 //! exactly the [`crate::IsolatePool`] contract.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -13,6 +14,22 @@ use std::sync::{Mutex, Once};
 use std::time::Duration;
 
 use crate::WorkerId;
+
+/// Every module this isolate has compiled, and what it imports. A module graph
+/// is instantiated through a *synchronous* callback, so the whole graph has to
+/// be compiled and its specifiers resolved before instantiation begins — the
+/// fetching happens outside, in the engine, and lands here. Kept in an isolate
+/// slot because the resolve callback is a bare fn with no state of its own.
+#[derive(Default)]
+struct ModuleRegistry {
+    /// "{context index}:{absolute url}" → the compiled module.
+    modules: HashMap<String, v8::Global<v8::Module>>,
+    /// V8's identity hash for a module → the same key, so a referrer can be
+    /// named when it asks for one of its imports.
+    by_hash: HashMap<i32, String>,
+    /// (referrer key, specifier as written) → key of what it resolves to.
+    edges: HashMap<(String, String), String>,
+}
 
 static V8_INIT: Once = Once::new();
 /// Serialises `v8::Isolate::new`. Concurrent isolate construction from multiple
@@ -121,6 +138,11 @@ impl Isolate {
             let _guard = CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             v8::Isolate::new(params)
         };
+        // Modules live for the isolate's whole life: their registry, and the hook
+        // that gives each one its `import.meta.url`.
+        isolate.set_slot(ModuleRegistry::default());
+        isolate.set_host_initialize_import_meta_object_callback(import_meta);
+
         // Install the graceful-OOM callback once, if a cap is in effect.
         let heap_state = max_heap_mb.map(|mb| {
             let state = Box::new(HeapLimitState {
@@ -231,6 +253,98 @@ impl Isolate {
         if self.took_oom() {
             return Err("JavaScript heap out of memory (isolate cap reached)".to_string());
         }
+        result
+    }
+
+    /// Compile `source` as an ES module and report what it imports, without
+    /// instantiating it. The engine fetches those, hands them back the same way,
+    /// and repeats until the graph is closed — only then can it be instantiated,
+    /// because V8 resolves imports synchronously and the network is not.
+    pub fn module_requests(
+        &mut self,
+        index: usize,
+        url: &str,
+        source: &str,
+    ) -> Result<Vec<String>, String> {
+        let global = self.context(index)?;
+        let key = format!("{index}:{url}");
+        let scope = &mut v8::HandleScope::new(&mut self.isolate);
+        let context = v8::Local::new(scope, &global);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+
+        let module = match compile_module(scope, url, source) {
+            Some(m) => m,
+            None => return Err(exception_message(scope)),
+        };
+        let requests = module.get_module_requests();
+        let mut out = Vec::new();
+        for i in 0..requests.length() {
+            let Some(req) = requests.get(scope, i) else { continue };
+            let Ok(req) = v8::Local::<v8::ModuleRequest>::try_from(req) else { continue };
+            out.push(req.get_specifier().to_rust_string_lossy(scope));
+        }
+        let hash = module.get_identity_hash().get();
+        let handle = v8::Global::new(scope, module);
+        let registry = scope
+            .get_slot_mut::<ModuleRegistry>()
+            .expect("module registry installed with the isolate");
+        registry.by_hash.insert(hash, key.clone());
+        registry.modules.insert(key, handle);
+        Ok(out)
+    }
+
+    /// Record where one module's import specifier leads, so the synchronous
+    /// resolve callback can answer without touching the network.
+    pub fn link_module(&mut self, index: usize, url: &str, specifier: &str, target: &str) {
+        if let Some(reg) = self.isolate.get_slot_mut::<ModuleRegistry>() {
+            reg.edges.insert(
+                (format!("{index}:{url}"), specifier.to_string()),
+                format!("{index}:{target}"),
+            );
+        }
+    }
+
+    /// Instantiate and evaluate an already-compiled module graph. Top-level
+    /// `await` makes evaluation a promise; a rejection is reported like a throw.
+    pub fn eval_module(&mut self, index: usize, url: &str) -> Result<(), String> {
+        let global = self.context(index)?;
+        let key = format!("{index}:{url}");
+        let watchdog = TerminateWatchdog::arm(&mut self.isolate);
+
+        let result = (|| {
+            let scope = &mut v8::HandleScope::new(&mut self.isolate);
+            let context = v8::Local::new(scope, &global);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let scope = &mut v8::TryCatch::new(scope);
+
+            let handle = scope
+                .get_slot::<ModuleRegistry>()
+                .and_then(|r| r.modules.get(&key).cloned())
+                .ok_or_else(|| format!("module {url} was never compiled"))?;
+            let module = v8::Local::new(scope, &handle);
+            if module.instantiate_module(scope, resolve_module).is_none() {
+                return Err(exception_message(scope));
+            }
+            let Some(value) = module.evaluate(scope) else {
+                return Err(exception_message(scope));
+            };
+            // Top-level await: a still-pending promise is left running, but a
+            // rejection is an error the page would have reported.
+            if let Ok(promise) = v8::Local::<v8::Promise>::try_from(value) {
+                if promise.state() == v8::PromiseState::Rejected {
+                    let reason = promise.result(scope);
+                    return Err(reason
+                        .to_string(scope)
+                        .map(|s| s.to_rust_string_lossy(scope))
+                        .unwrap_or_else(|| "module rejected".to_string()));
+                }
+            }
+            Ok(())
+        })();
+
+        watchdog.disarm();
+        self.isolate.cancel_terminate_execution();
         result
     }
 
@@ -376,6 +490,75 @@ impl TerminateWatchdog {
             let _ = handle.join();
         }
     }
+}
+
+/// Compile `source` as a module, tagged with its URL so stacks and
+/// `import.meta.url` name the right file.
+fn compile_module<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    url: &str,
+    source: &str,
+) -> Option<v8::Local<'s, v8::Module>> {
+    let code = v8::String::new(scope, source)?;
+    let name = v8::String::new(scope, url)?;
+    let origin = v8::ScriptOrigin::new(
+        scope,
+        name.into(),
+        0,
+        0,
+        false,
+        0,
+        None,
+        false,
+        false,
+        true, // is_module
+        None,
+    );
+    let mut src = v8::script_compiler::Source::new(code, Some(&origin));
+    v8::script_compiler::compile_module(scope, &mut src)
+}
+
+/// `import.meta.url` — the module's own address, which bundles use to build
+/// paths to their sibling chunks and assets.
+unsafe extern "C" fn import_meta(
+    context: v8::Local<v8::Context>,
+    module: v8::Local<v8::Module>,
+    meta: v8::Local<v8::Object>,
+) {
+    let scope = &mut unsafe { v8::CallbackScope::new(context) };
+    let hash = module.get_identity_hash().get();
+    let Some(key) = scope.get_slot::<ModuleRegistry>().and_then(|r| r.by_hash.get(&hash).cloned())
+    else {
+        return;
+    };
+    // The key is "{context index}:{url}"; the page only ever sees the URL.
+    let url = key.split_once(':').map(|(_, u)| u).unwrap_or(&key).to_string();
+    let (Some(name), Some(value)) = (v8::String::new(scope, "url"), v8::String::new(scope, &url))
+    else {
+        return;
+    };
+    meta.set(scope, name.into(), value.into());
+}
+
+/// Answer one import. Everything it needs was put in the registry before
+/// instantiation started; an unknown specifier is a missing fetch, not a
+/// resolution the callback can do itself.
+fn resolve_module<'a>(
+    context: v8::Local<'a, v8::Context>,
+    specifier: v8::Local<'a, v8::String>,
+    _attributes: v8::Local<'a, v8::FixedArray>,
+    referrer: v8::Local<'a, v8::Module>,
+) -> Option<v8::Local<'a, v8::Module>> {
+    let scope = &mut unsafe { v8::CallbackScope::new(context) };
+    let spec = specifier.to_rust_string_lossy(scope);
+    let hash = referrer.get_identity_hash().get();
+    let handle = {
+        let reg = scope.get_slot::<ModuleRegistry>()?;
+        let from = reg.by_hash.get(&hash)?.clone();
+        let target = reg.edges.get(&(from, spec))?.clone();
+        reg.modules.get(&target)?.clone()
+    };
+    Some(v8::Local::new(scope, &handle))
 }
 
 /// Compile and run `source` in the current context, returning its result as a

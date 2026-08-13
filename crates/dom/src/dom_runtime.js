@@ -35,6 +35,10 @@
   const __connectSubtree = (node) => __walkTree(node, (n) => {
     if (n.__ptLocal === 'iframe') n.__ptConnectFrame();
     else if (n.__ptLocal === 'script') n.__ptRunScript();
+    if (n.nodeType === ELEMENT_NODE && __customs.has(n.__ptLocal)) {
+      if (!n.__ptUpgraded) __customUpgrade(n, __customs.get(n.__ptLocal));
+      else __customCallback(n, 'connectedCallback');
+    }
   });
 
   // Массив в обёртке HTMLCollection: length/item/namedItem/итератор, но не Array.
@@ -172,7 +176,10 @@
       // outlives the element forever — a widget that replaces its iframe on a
       // retry (Turnstile does, repeatedly) would pile them up until the cap. The
       // whole subtree goes, for the same reason it connects as a whole.
-      __walkTree(child, (f) => { if (f.__ptFrameId) __ptDisconnectFrame(f); });
+      __walkTree(child, (f) => {
+        if (f.__ptFrameId) __ptDisconnectFrame(f);
+        if (f.__ptUpgraded) __customCallback(f, 'disconnectedCallback');
+      });
       return child;
     }
     replaceChild(nw, old) { this.insertBefore(nw, old); return this.removeChild(old); }
@@ -319,9 +326,85 @@
     elementFromPoint() { return null; }
   }
 
+  // --- пользовательские элементы -------------------------------------------
+  // `customElements` был объектом без методов: `customElements.get` роняло любой
+  // бандл, который просто спрашивает, определён ли компонент. Реестр настоящий:
+  // определение, обновление уже стоящих в документе узлов и три обратных вызова
+  // жизненного цикла.
+  const __customs = new Map();          // имя → класс
+  const __customPending = new Map();    // имя → { promise, resolve }
+  const __customName = (ctor) => {
+    for (const [name, C] of __customs) if (C === ctor) return name;
+    return null;
+  };
+  const __customCallback = (el, name, args) => {
+    const fn = el[name];
+    if (typeof fn === 'function') { try { fn.apply(el, args || []); } catch (e) { /* компонент бросил */ } }
+  };
+  const __customUpgrade = (el, Ctor) => {
+    if (el.__ptUpgraded) return;
+    Object.defineProperty(el, '__ptUpgraded', { value: true, configurable: true, enumerable: false });
+    // Повторно выполнить тело конструктора над готовым узлом нельзя, поэтому
+    // элемент получает прототип класса — методы и обратные вызовы на месте.
+    try { Object.setPrototypeOf(el, Ctor.prototype); } catch (e) { return; }
+    const watched = Ctor.observedAttributes;
+    if (Array.isArray(watched)) {
+      for (const a of watched) {
+        const v = el.getAttribute(a);
+        if (v !== null) __customCallback(el, 'attributeChangedCallback', [a, null, v, null]);
+      }
+    }
+    if (el.isConnected) __customCallback(el, 'connectedCallback');
+  };
+
+  class CustomElementRegistry {
+    define(name, ctor, options) {
+      name = String(name);
+      if (!/^[a-z][a-z0-9._]*-[a-z0-9._-]*$/.test(name)) {
+        throw new (globalThis.DOMException || Error)(`"${name}" is not a valid custom element name`, 'SyntaxError');
+      }
+      if (__customs.has(name)) {
+        throw new (globalThis.DOMException || Error)(`"${name}" has already been defined`, 'NotSupportedError');
+      }
+      if (typeof ctor !== 'function') throw new TypeError('constructor is not a constructor');
+      __customs.set(name, ctor);
+      const doc = globalThis.document;
+      if (doc && doc.documentElement) {
+        for (const el of doc.getElementsByTagName(name)) __customUpgrade(el, ctor);
+      }
+      const pending = __customPending.get(name);
+      if (pending) { pending.resolve(ctor); __customPending.delete(name); }
+    }
+    get(name) { return __customs.get(String(name)); }
+    getName(ctor) { return __customName(ctor); }
+    whenDefined(name) {
+      name = String(name);
+      const known = __customs.get(name);
+      if (known) return Promise.resolve(known);
+      let entry = __customPending.get(name);
+      if (!entry) {
+        let resolve;
+        const promise = new Promise((r) => { resolve = r; });
+        entry = { promise, resolve };
+        __customPending.set(name, entry);
+      }
+      return entry.promise;
+    }
+    upgrade(root) {
+      __walkTree(root, (el) => {
+        if (el.nodeType !== ELEMENT_NODE) return;
+        const C = __customs.get(el.__ptLocal);
+        if (C) __customUpgrade(el, C);
+      });
+    }
+  }
+
   class Element extends Node {
     constructor(tag) {
       super(ELEMENT_NODE);
+      // `new MyElement()` не передаёт имя тега — его знает реестр, по классу,
+      // от которого элемент произошёл. Так работает и настоящий HTMLElement.
+      if (tag === undefined && new.target) tag = __customName(new.target) || 'unknown';
       this.__ptTag = String(tag).toUpperCase();
       this.__ptLocal = String(tag).toLowerCase();
       this.__ptAttrs = new Map();
@@ -337,6 +420,13 @@
     setAttribute(n, v) {
       const name = n.toLowerCase(), old = this.__ptAttrs.get(name);
       this.__ptAttrs.set(name, String(v));
+      if (this.__ptUpgraded) {
+        const watched = this.constructor && this.constructor.observedAttributes;
+        if (Array.isArray(watched) && watched.indexOf(name) >= 0) {
+          __customCallback(this, 'attributeChangedCallback',
+            [name, old === undefined ? null : old, String(v), null]);
+        }
+      }
       __markDirty();
       __mutation({ type: 'attributes', target: this, attributeName: name, attributeNamespace: null,
         oldValue: old === undefined ? null : old, addedNodes: [], removedNodes: [],
@@ -524,14 +614,24 @@
       // arrives, so the flag must not be set until there is something to do.
       if (!src && !this.textContent) return;
       Object.defineProperty(this, '__ptRan', { value: true, configurable: true, enumerable: false });
+      // Модуль исполняется не как обычный скрипт: у него свой разбор, свои
+      // `import` и своя область. Такой отдаём движку — и со ссылкой, и вписанный
+      // прямо в страницу.
+      const isModule = type === 'module';
       if (src) {
         const id = __nextScriptId++;
         __scriptEls.set(id, this);
-        __scriptOps.push({ op: 'load', id, src: String(src) });
+        __scriptOps.push({ op: 'load', id, src: String(src), module: isModule });
         return;
       }
       const code = this.textContent;
       if (!code) return;
+      if (isModule) {
+        const id = __nextScriptId++;
+        __scriptEls.set(id, this);
+        __scriptOps.push({ op: 'load', id, src: '', code: String(code), module: true });
+        return;
+      }
       // Indirect eval: a classic script runs in global scope, not in ours.
       try { (0, eval)(code); } catch (e) { /* page script threw */ }
     }
@@ -777,7 +877,13 @@
       this.__ptCookie = kept.join('; ');
     }
 
-    createElement(tag) { const e = new Element(tag); e.ownerDocument = this; return e; }
+    createElement(tag) {
+      const C = __customs.get(String(tag).toLowerCase());
+      const e = C ? new C() : new Element(tag);
+      if (C) Object.defineProperty(e, '__ptUpgraded', { value: true, configurable: true, enumerable: false });
+      e.ownerDocument = this;
+      return e;
+    }
     createElementNS(_ns, tag) { return this.createElement(tag); }
     createTextNode(t) { const n = new Text(t); n.ownerDocument = this; return n; }
     createComment(t) { const n = new Comment(t); n.ownerDocument = this; return n; }
@@ -1845,6 +1951,8 @@
   // Assigned here, after the declarations (a class stays in its temporal dead
   // zone until then). These override the stealth layer's inert stubs: with a
   // document present there is a real tree to watch.
+  globalThis.CustomElementRegistry = CustomElementRegistry;
+  globalThis.customElements = new CustomElementRegistry();
   globalThis.MutationObserver = MutationObserver;
   globalThis.ResizeObserver = ResizeObserver;
 

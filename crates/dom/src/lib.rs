@@ -22,6 +22,12 @@ pub enum Script {
     Inline(String),
     /// External script: the (possibly relative) `src` URL to fetch.
     External(String),
+    /// `<script type="module">`, inline. It has its own parse goal — `import`
+    /// only means anything inside one — so it cannot be run as a classic script.
+    InlineModule(String),
+    /// `<script type="module" src=…>`: the whole of a modern site is usually
+    /// this one line.
+    ExternalModule(String),
 }
 
 /// The result of parsing an HTML document.
@@ -74,14 +80,30 @@ fn serialize(node: &Handle, scripts: &mut Vec<Script>) -> Value {
                 .collect();
 
             if tag == "script" {
-                let src = attrs
-                    .borrow()
-                    .iter()
-                    .find(|a| &*a.name.local == "src")
-                    .map(|a| a.value.to_string());
-                match src {
-                    Some(src) if !src.is_empty() => scripts.push(Script::External(src)),
-                    _ => scripts.push(Script::Inline(text_content(node))),
+                let attr = |name: &str| {
+                    attrs
+                        .borrow()
+                        .iter()
+                        .find(|a| &*a.name.local == name)
+                        .map(|a| a.value.to_string())
+                };
+                let module = attr("type")
+                    .map(|t| t.trim().eq_ignore_ascii_case("module"))
+                    .unwrap_or(false);
+                match attr("src") {
+                    Some(src) if !src.is_empty() => scripts.push(if module {
+                        Script::ExternalModule(src)
+                    } else {
+                        Script::External(src)
+                    }),
+                    _ => {
+                        let code = text_content(node);
+                        scripts.push(if module {
+                            Script::InlineModule(code)
+                        } else {
+                            Script::Inline(code)
+                        })
+                    }
                 }
             }
 

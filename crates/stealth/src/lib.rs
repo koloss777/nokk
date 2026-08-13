@@ -636,7 +636,14 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   protoMethod(LocationProto, "replace", function replace(u){ askNav(u, true); });
   protoMethod(LocationProto, "reload", function reload(){ askNav(locState.href, true); });
   protoMethod(LocationProto, "toString", function toString(){ return locState.href; });
-  win.location = Object.create(LocationProto);
+  // `window.location = url` — такой же переход, как `location.href = url`, и
+  // именно им завершают себя многие потоки (в том числе челлендж Cloudflare).
+  // Данным свойством окно ловило строку вместо объекта: адрес затирался,
+  // перехода не было, и страница дальше жила со сломанным `location`.
+  const locationObject = Object.create(LocationProto);
+  accessor(win, 'location', () => locationObject, (v) => {
+    if (v !== locationObject) askNav(v, false);
+  });
   // Rust calls this on navigation to populate `location` from the real URL —
   // a static `about:blank` is an instant tell (and breaks relative logic).
   globalThis.__pt_setLocation = (o) => { for (const k in o) if (k in locState) locState[k] = o[k]; };
@@ -701,6 +708,57 @@ const INTL_SHIM_TEMPLATE: &str = r#"(() => {
     };
   }
 
+  // `Intl.Locale` — не заглушка из двух полей: страницы вызывают `maximize()`,
+  // чтобы узнать регион, и `getTextInfo()`, чтобы выбрать направление письма.
+  // Отсутствующий метод роняет весь бандл (у CapSolver — ровно так), а полный
+  // CLDR нам не нужен: хватает наиболее вероятных подтегов для живых языков и
+  // списка языков с письмом справа налево.
+  const RTL = new Set(['ar', 'arc', 'ckb', 'dv', 'fa', 'he', 'ks', 'ku', 'pnb', 'ps',
+    'sd', 'ug', 'ur', 'yi']);
+  const LIKELY = {
+    ar: ['Arab', 'EG'], bg: ['Cyrl', 'BG'], cs: ['Latn', 'CZ'], da: ['Latn', 'DK'],
+    de: ['Latn', 'DE'], el: ['Grek', 'GR'], en: ['Latn', 'US'], es: ['Latn', 'ES'],
+    fa: ['Arab', 'IR'], fi: ['Latn', 'FI'], fr: ['Latn', 'FR'], he: ['Hebr', 'IL'],
+    hi: ['Deva', 'IN'], hu: ['Latn', 'HU'], id: ['Latn', 'ID'], it: ['Latn', 'IT'],
+    ja: ['Jpan', 'JP'], ko: ['Kore', 'KR'], nl: ['Latn', 'NL'], no: ['Latn', 'NO'],
+    pl: ['Latn', 'PL'], pt: ['Latn', 'BR'], ro: ['Latn', 'RO'], ru: ['Cyrl', 'RU'],
+    sv: ['Latn', 'SE'], th: ['Thai', 'TH'], tr: ['Latn', 'TR'], uk: ['Cyrl', 'UA'],
+    ur: ['Arab', 'PK'], vi: ['Latn', 'VN'], zh: ['Hans', 'CN'],
+  };
+
+  function Locale(tag, options) {
+    if (!(this instanceof Locale)) throw new TypeError("Constructor Intl.Locale requires 'new'");
+    const parts = String(norm(tag) || 'en-US').split('-');
+    const opts = options || {};
+    const script = parts.find((p) => p.length === 4 && /^[A-Za-z]+$/.test(p));
+    const region = parts.slice(1).find((p) => /^([A-Za-z]{2}|\d{3})$/.test(p));
+    const set = (k, v) => Object.defineProperty(this, k, { value: v, enumerable: true, configurable: true });
+    set('language', opts.language || parts[0].toLowerCase());
+    set('script', opts.script || (script ? script[0].toUpperCase() + script.slice(1).toLowerCase() : undefined));
+    set('region', opts.region || (region ? region.toUpperCase() : undefined));
+    for (const k of ['calendar', 'caseFirst', 'collation', 'hourCycle', 'numeric', 'numberingSystem']) {
+      set(k, opts[k]);
+    }
+    set('baseName', [this.language, this.script, this.region].filter(Boolean).join('-'));
+  }
+  Locale.prototype = {
+    toString() { return this.baseName; },
+    maximize() {
+      const [script, region] = LIKELY[this.language] || ['Latn', (this.language || 'en').toUpperCase()];
+      return new Locale([this.language, this.script || script, this.region || region].join('-'));
+    },
+    minimize() { return new Locale(this.language); },
+    getTextInfo() { return { direction: RTL.has(this.language) ? 'rtl' : 'ltr' }; },
+    getWeekInfo() { return { firstDay: 1, weekend: [6, 7], minimalDays: 1 }; },
+    getCalendars() { return ['gregory']; },
+    getCollations() { return ['default']; },
+    getHourCycles() { return ['h12']; },
+    getNumberingSystems() { return ['latn']; },
+    getTimeZones() { return this.region ? [] : undefined; },
+  };
+  Object.defineProperty(Locale.prototype, 'constructor', { value: Locale, writable: true, configurable: true });
+  try { Object.defineProperty(Locale.prototype, Symbol.toStringTag, { value: 'Intl.Locale', configurable: true }); } catch (e) {}
+
   globalThis.Intl = {
     DateTimeFormat, NumberFormat, Collator,
     RelativeTimeFormat: passthru({ format: (v, u) => v + ' ' + u, formatToParts: (v, u) => [{ type: 'literal', value: v + ' ' + u }] }),
@@ -708,7 +766,7 @@ const INTL_SHIM_TEMPLATE: &str = r#"(() => {
     ListFormat: passthru({ format: (a) => list(a).join(', '), formatToParts: (a) => list(a).map(v => ({ type: 'element', value: v })) }),
     DisplayNames: passthru({ of: (c) => String(c) }),
     Segmenter: passthru({ segment: (s) => [{ segment: String(s), index: 0, input: String(s) }] }),
-    Locale: function (tag) { this.baseName = norm(tag); this.language = String(norm(tag)).split('-')[0]; this.toString = () => this.baseName; },
+    Locale: Locale,
     getCanonicalLocales: list,
     supportedValuesOf: () => [],
   };

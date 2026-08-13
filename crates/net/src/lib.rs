@@ -206,6 +206,12 @@ pub struct Request {
     /// of them — which is what a single emulation profile does — contradicts the
     /// page's own behaviour on every subresource.
     pub kind: RequestKind,
+    /// Whether a person started this navigation — typing an address, following a
+    /// link — as opposed to the page's own script. Only the first carries
+    /// `sec-fetch-user`, and the difference is readable: Cloudflare's interstitial
+    /// reloads *itself*, and a reload that claims a human gesture is one no
+    /// browser sends. Meaningless for anything but a navigation.
+    pub user_activated: bool,
 }
 
 /// The destination a request is for, in the sense `Sec-Fetch-Dest` means it.
@@ -446,8 +452,14 @@ impl HttpClient for FingerprintClient {
             .find(|(k, _)| k.eq_ignore_ascii_case("referer"))
             .map(|(_, r)| same_site(r, &req.url))
             .unwrap_or(false);
+        let has_referer = req
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("referer"));
         let site = match req.kind {
-            RequestKind::Document => "none",
+            // A navigation with no referrer came from outside the web — typed, or
+            // opened by a driver. One the page made carries where it came from.
+            RequestKind::Document if !has_referer => "none",
             _ if same_origin => "same-origin",
             _ => "cross-site",
         };
@@ -469,18 +481,22 @@ impl HttpClient for FingerprintClient {
         for name in ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"] {
             order.insert(name);
         }
+        let claims_user = req.kind == RequestKind::Document && req.user_activated;
         if req.kind == RequestKind::Document {
-            // Only a navigation carries these two, and their absence is the
-            // difference between a browser and something replaying its cookies.
-            rb = rb
-                .header("upgrade-insecure-requests", "1")
-                .header("sec-fetch-user", "?1");
+            // Only a navigation carries `upgrade-insecure-requests`, and its
+            // absence is the difference between a browser and something replaying
+            // cookies. `sec-fetch-user` is narrower still: it means a person did
+            // this, so a script-driven navigation must not carry it.
+            rb = rb.header("upgrade-insecure-requests", "1");
             order.insert("upgrade-insecure-requests");
+            if claims_user {
+                rb = rb.header("sec-fetch-user", "?1");
+            }
         }
         for name in ["user-agent", "accept", "sec-fetch-site", "sec-fetch-mode"] {
             order.insert(name);
         }
-        if req.kind == RequestKind::Document {
+        if claims_user {
             order.insert("sec-fetch-user");
         }
         for name in [
@@ -590,6 +606,7 @@ mod tests {
             headers: BTreeMap::new(),
             body: None,
             kind: RequestKind::default(),
+            user_activated: true,
         }
     }
 
