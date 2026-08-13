@@ -4090,6 +4090,42 @@ mod tests {
         );
     }
 
+    /// An element that states its own size reports it. The row layout stands in
+    /// for what the engine does not compute; it must not contradict what the page
+    /// declared. A widget sized 300x65 answering 1280x20 reads as clipped, and
+    /// code that measures before deciding whether it is visible — Cloudflare's
+    /// loader measures its widget iframe exactly so — decides wrong.
+    #[tokio::test]
+    async fn a_declared_size_is_the_size_reported() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let probe = r#"(() => {
+            const mk = (f) => { const e = document.createElement('iframe'); f(e); document.body.appendChild(e); return e; };
+            const byAttr = mk(e => { e.setAttribute('width', '300'); e.setAttribute('height', '65'); });
+            const byStyle = mk(e => { e.style.width = '300px'; e.style.height = '65px'; });
+            const plain = mk(() => {});
+            const box = (e) => { const r = e.getBoundingClientRect(); return [Math.round(r.width), Math.round(r.height)]; };
+            return JSON.stringify({
+              attr: box(byAttr), style: box(byStyle),
+              offset: [byAttr.offsetWidth, byAttr.offsetHeight],
+              plainHasBox: box(plain)[0] > 0 && box(plain)[1] > 0,
+            });
+        })()"#;
+        let out = match ctx.evaluate(probe).await.unwrap() {
+            Value::String(s) => serde_json::from_str::<Value>(&s).unwrap(),
+            v => panic!("expected the probe result, got {v:?}"),
+        };
+        assert_eq!(out["attr"], serde_json::json!([300, 65]), "width/height attributes");
+        assert_eq!(out["style"], serde_json::json!([300, 65]), "and inline CSS");
+        assert_eq!(out["offset"], serde_json::json!([300, 65]), "offsetWidth/Height agree");
+        assert_eq!(out["plainHasBox"], true, "an unsized element still has a box");
+    }
+
     /// An `XMLHttpRequest` is an `EventTarget`, and ours was not: `addEventListener`
     /// did not exist on it at all. Setting `onload` worked, so most things looked
     /// fine — until code that *listens* fired a request, got its answer, and never

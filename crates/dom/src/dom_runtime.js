@@ -1722,7 +1722,17 @@
     const walk = (el) => {
       if (!el || el.nodeType !== ELEMENT_NODE) return;
       if (__isHiddenEl(el)) return;               // display:none hides the subtree
-      el.__ptBox = { x: 0, y: row * LAYOUT.ROW, w: LAYOUT.W, h: LAYOUT.ROW };
+      // An element that states its own size gets it. The row layout is a stand-in
+      // for what we do not compute, not a licence to contradict the page: a widget
+      // sized 300x65 reported back as 1280x20 reads as clipped, and code that
+      // measures before deciding whether it is visible — Cloudflare's loader
+      // measures its widget's iframe exactly this way — decides wrong.
+      const sized = __declaredSize(el);
+      el.__ptBox = {
+        x: 0, y: row * LAYOUT.ROW,
+        w: sized.w != null ? sized.w : LAYOUT.W,
+        h: sized.h != null ? sized.h : LAYOUT.ROW,
+      };
       el.__ptBoxV = __layoutBuilt;
       __rows[row] = el;
       row++;
@@ -1730,6 +1740,24 @@
     };
     const de = globalThis.document && globalThis.document.documentElement;
     if (de) walk(de);
+  }
+
+  // Width/height an element declares for itself: the CSS `width`/`height` it was
+  // given, else the presentational attributes `<iframe width height>`/`<img>`/
+  // `<canvas>` carry. Percentages and other units are left to the row default —
+  // guessing at them would be worse than admitting we do not lay out.
+  function __declaredSize(el) {
+    const out = { w: null, h: null };
+    const px = (v) => {
+      if (v == null) return null;
+      const m = /^\s*(\d+(?:\.\d+)?)(px)?\s*$/.exec(String(v));
+      return m ? Math.round(parseFloat(m[1])) : null;
+    };
+    const st = el.style;
+    if (st) { out.w = px(st.width); out.h = px(st.height); }
+    if (out.w == null && el.getAttribute) out.w = px(el.getAttribute('width'));
+    if (out.h == null && el.getAttribute) out.h = px(el.getAttribute('height'));
+    return out;
   }
 
   function __boxOf(el) {
