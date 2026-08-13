@@ -845,6 +845,10 @@ pub struct NetworkRecord {
     /// `"document"`, `"script"`, or `"fetch"` (covers XHR, layered on fetch).
     pub resource_type: String,
     pub body: Vec<u8>,
+    /// What was sent *up*. A challenge is an exchange, and half of it was
+    /// invisible: every driver reads `postData`, and so does anyone trying to
+    /// find out why an answer was rejected.
+    pub request_body: Vec<u8>,
 }
 
 impl BrowserContext {
@@ -1439,6 +1443,67 @@ impl BrowserContext {
         Ok(out.as_bool().unwrap_or(false))
     }
 
+    /// Press the first control a widget offers, wherever it lives — this page or
+    /// any of its frames, light tree or shadow. Returns what was pressed, or
+    /// `None` when there is nothing to press yet.
+    ///
+    /// Deliberately knows nothing about any particular challenge: it presses a
+    /// checkbox, switch or button the way a person would, and the difference
+    /// between that and a widget-specific script is that this cannot go stale.
+    /// A driver cannot do it itself — the control is usually inside a closed
+    /// shadow root in a cross-origin frame, where page script has no reach.
+    pub async fn press_widget_control(&self) -> Result<Option<String>, EngineError> {
+        // Frames first: a challenge widget is one, and its control is the one
+        // worth pressing.
+        let mut targets: Vec<Option<u32>> = self.frame_list().iter().map(|f| Some(f.id)).collect();
+        targets.push(None);
+
+        for frame in targets {
+            let found = match frame {
+                // In this page, only what belongs to an embedded widget — a
+                // control in a shadow tree. The page's own form is not ours to
+                // submit, and pressing its button would be worse than doing
+                // nothing. Inside a frame, the whole document is the widget.
+                None => self.evaluate("__pt_findControl(true)").await,
+                Some(id) => self.evaluate_in_frame(id, "__pt_findControl(false)").await,
+            };
+            let Ok(v) = found else { continue };
+            let Some(list) = v
+                .as_str()
+                .and_then(|t| serde_json::from_str::<Vec<Value>>(t).ok())
+            else {
+                continue;
+            };
+            let Some(c) = list.into_iter().next() else { continue };
+            let (x, y) = (
+                c["x"].as_f64().unwrap_or(0.0),
+                c["y"].as_f64().unwrap_or(0.0),
+            );
+            // Inside the frame that owns it, so no coordinate has to survive a
+            // trip through a parent that lays its frames out differently.
+            for kind in ["mouseMoved", "mousePressed", "mouseReleased"] {
+                let js = format!("__pt_mouse({}, {x}, {y}, \"left\", 1)", js_str(kind));
+                let _ = match frame {
+                    None => self.evaluate(&js).await,
+                    Some(id) => self.evaluate_in_frame(id, &js).await,
+                };
+            }
+            let what = format!(
+                "{}[{}]@{}{}",
+                c["tag"].as_str().unwrap_or("?"),
+                c["type"].as_str().unwrap_or(""),
+                c["at"].as_i64().unwrap_or(0),
+                match frame {
+                    Some(id) => format!(" in frame {id}"),
+                    None => String::new(),
+                }
+            );
+            tracing::debug!(control = %what, "pressed a widget control");
+            return Ok(Some(what));
+        }
+        Ok(None)
+    }
+
     /// Whether this page has a live `<iframe>`. Same reasoning as a socket: the
     /// frame is a running document with timers and requests of its own, and it
     /// freezes the moment nothing pumps it.
@@ -2009,6 +2074,7 @@ impl BrowserContext {
             );
         }
         let body = r["body"].as_str().map(|s| s.as_bytes().to_vec());
+        let sent = body.clone().unwrap_or_default();
         let req = Request {
             method,
             url: url.clone(),
@@ -2028,6 +2094,7 @@ impl BrowserContext {
                     resp.status,
                     &resp.body,
                     resp.headers.clone(),
+                    &sent,
                 );
                 let headers_js =
                     serde_json::to_string(&resp.headers).unwrap_or_else(|_| "{}".into());
@@ -2127,6 +2194,7 @@ impl BrowserContext {
                     resp.status,
                     &resp.body,
                     resp.headers.clone(),
+                    &[],
                 );
                 let final_url = if resp.url.is_empty() {
                     url.to_string()
@@ -2153,6 +2221,7 @@ impl BrowserContext {
             status,
             body,
             std::collections::BTreeMap::new(),
+            &[],
         )
     }
 
@@ -2160,6 +2229,7 @@ impl BrowserContext {
     /// once the outcome is known, which is why a subscriber receives the whole
     /// lifecycle at once rather than a `willBeSent` ahead of time — the timings
     /// are coarser than Chrome's, but every field a client reads is real.
+    #[allow(clippy::too_many_arguments)]
     fn record_full(
         &self,
         method: &str,
@@ -2168,6 +2238,7 @@ impl BrowserContext {
         status: u16,
         body: &[u8],
         headers: std::collections::BTreeMap<String, String>,
+        request_body: &[u8],
     ) {
         let rec = NetworkRecord {
             request_id: format!(
@@ -2180,6 +2251,7 @@ impl BrowserContext {
             status,
             resource_type: resource_type.to_string(),
             body: body.to_vec(),
+            request_body: request_body.to_vec(),
         };
         if let Ok(mut log) = self.requests.lock() {
             log.push(rec.clone());
@@ -4940,7 +5012,12 @@ mod tests {
                         </script></body></html>"#;
                     let outer = r#"<html><body><div id="wrap"><p>above</p>
                         <iframe id="w" src="/inner" style="width:300px;height:65px"></iframe>
-                        </div></body></html>"#;
+                        <form><button id="danger" type="submit">Send my form</button></form>
+                        </div>
+                        <script>
+                          globalThis.__pageClicks = 0;
+                          document.getElementById('danger').addEventListener('click', () => { __pageClicks++; });
+                        </script></body></html>"#;
                     let body = if req.contains("GET /inner") { inner } else { outer };
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
@@ -4952,6 +5029,49 @@ mod tests {
             }
         });
         format!("http://127.0.0.1:{}/", addr.port())
+    }
+
+    /// The engine can press what a widget puts up, wherever it keeps it — this
+    /// one is in a closed shadow root inside a frame, where page script has no
+    /// reach at all, which is why a driver cannot do this for itself.
+    ///
+    /// And it presses only what belongs to a widget. The page's own form is not
+    /// ours to submit: a helper that hunts for "a button" and finds the login
+    /// form's would do real damage, quietly.
+    #[tokio::test]
+    async fn the_engine_presses_a_widget_and_leaves_the_page_alone() {
+        let _serial = serial().await;
+        let url = frame_server().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 4, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&url).await.unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        let pressed = ctx.press_widget_control().await.unwrap();
+        assert!(
+            pressed.as_deref().is_some_and(|w| w.starts_with("INPUT[checkbox]")),
+            "the widget's checkbox is what gets pressed: {pressed:?}"
+        );
+
+        let frame = ctx.frame_list().first().map(|f| f.id).expect("the frame is live");
+        let hits = ctx
+            .evaluate_in_frame(frame, "JSON.stringify(globalThis.__hits || [])")
+            .await
+            .unwrap();
+        let hits: Value = serde_json::from_str(hits.as_str().unwrap_or("[]")).unwrap();
+        assert_eq!(hits.as_array().map(|a| a.len()), Some(1), "and it received it");
+
+        let page_clicks = ctx.evaluate("String(globalThis.__pageClicks)").await.unwrap();
+        assert_eq!(
+            page_clicks,
+            Value::String("0".into()),
+            "the page's own submit button was never touched"
+        );
     }
 
     /// A click has to reach the document that owns the point. Turnstile's checkbox

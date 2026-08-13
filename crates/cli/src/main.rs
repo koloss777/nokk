@@ -4,7 +4,7 @@
 //! one-shot `--fetch`/`--eval`/`--load` modes, or (the default) a CDP WebSocket
 //! server on `--port` that Puppeteer can attach to.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
@@ -61,6 +61,14 @@ struct Cli {
     /// networking. Pair with `--eval` to probe the resulting DOM.
     #[arg(long, value_name = "URL")]
     load: Option<String>,
+
+    /// Wait for a challenge widget to finish, pressing whatever it puts up —
+    /// a checkbox, a switch — the way a person would. The engine can reach the
+    /// control (widgets keep it in a closed shadow root inside a cross-origin
+    /// frame, where page script cannot); a driver only says how long to wait, in
+    /// seconds. Stops early once a `cf_clearance` is in the jar.
+    #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "60")]
+    solve_challenge: Option<u64>,
 
     /// Route all requests through a proxy, e.g.
     /// `http://user:pass@host:port` or `socks5://host:port`. Essential for
@@ -331,6 +339,45 @@ async fn main() -> Result<()> {
         }
         let ctx = ctx.expect("retry loop runs at least once");
         tracing::info!(elapsed_ms = t.elapsed().as_millis(), "page loaded");
+
+        if let Some(seconds) = cli.solve_challenge {
+            let deadline = Instant::now() + Duration::from_secs(seconds);
+            /// A widget asks once or twice; more than this is a loop, not a user.
+            const MAX_PRESSES: usize = 3;
+            let mut pressed = 0usize;
+            let mut seen_controls = std::collections::HashSet::new();
+            loop {
+                ctx.run_event_loop().await.ok();
+                let cleared = ctx.cookies(&[]).iter().any(|c| c.name == "cf_clearance");
+                if cleared {
+                    tracing::info!(
+                        elapsed_ms = t.elapsed().as_millis(),
+                        presses = pressed,
+                        "challenge cleared"
+                    );
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    tracing::warn!(presses = pressed, "challenge did not clear in time");
+                    break;
+                }
+                // Press only what is offered; a widget still verifying offers
+                // nothing, and pressing nothing is the correct thing to do.
+                // One press per control that appears. A widget that ignores it is
+                // not asking to be pressed again — a person would not keep
+                // clicking either, and a flurry of clicks is its own signature.
+                if pressed < MAX_PRESSES {
+                    if let Ok(Some(what)) = ctx.press_widget_control().await {
+                        if seen_controls.insert(what.clone()) {
+                            pressed += 1;
+                            tracing::info!(control = %what, "pressed the challenge widget");
+                            tokio::time::sleep(Duration::from_millis(1_500)).await;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+        }
 
         // Run `--eval` first — it may trigger further requests (fetch/beacon/img)
         // that should then appear in the interception log.

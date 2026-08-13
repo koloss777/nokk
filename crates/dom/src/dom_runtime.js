@@ -2157,6 +2157,46 @@
   // его контекст и повторит попадание уже в координатах фрейма. Виджет
   // Turnstile живёт ровно так — iframe в закрытой тени хоста, — и без этого
   // спуска нажать его нечем.
+  // Первый видимый управляющий элемент документа — чекбокс, переключатель или
+  // кнопка, — вместе с точкой, куда по нему бьют. Ищет и в теневых деревьях:
+  // виджеты держат свой UI именно там, и обычный querySelector их не находит.
+  // Знания о конкретной капче здесь нет и быть не должно — есть «нажимаемое».
+  // `widgetOnly` — искать только внутри теневых деревьев: собственная форма
+  // страницы виджету не принадлежит, и нажимать её кнопку «отправить» нельзя ни
+  // при каких обстоятельствах. Во фрейме виджета ограничение снимается: там всё
+  // содержимое и есть виджет.
+  globalThis.__pt_findControl = (widgetOnly) => {
+    __relayout();
+    const seen = [];
+    const scan = (root, shadowed) => {
+      for (const n of (root.__ptKids || [])) {
+        if (n.nodeType !== ELEMENT_NODE) continue;
+        if (!__isHiddenEl(n)) {
+          const role = (n.getAttribute && n.getAttribute('role')) || '';
+          const type = (n.getAttribute && n.getAttribute('type')) || '';
+          const control = (n.tagName === 'INPUT' && /^(checkbox|radio|submit|button)$/i.test(type))
+            || n.tagName === 'BUTTON'
+            || role === 'checkbox' || role === 'button' || role === 'switch';
+          if (control && (shadowed || !widgetOnly)) {
+            const r = n.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+              seen.push({ tag: n.tagName, type: type || role,
+                          x: r.x + Math.min(r.width, 24) / 2,
+                          y: r.y + Math.min(r.height, 24) / 2,
+                          at: Math.round(r.y),
+                          label: (n.getAttribute && n.getAttribute('aria-label')) || '' });
+            }
+          }
+          if (n.__ptShadow) scan(n.__ptShadow, true);
+          scan(n, shadowed);
+        }
+      }
+    };
+    const de = globalThis.document && globalThis.document.documentElement;
+    if (de) scan(de, false);
+    return JSON.stringify(seen.slice(0, 8));
+  };
+
   globalThis.__pt_hitFrame = (x, y) => {
     for (let el = __elementFromPoint(x, y); el && el.nodeType === ELEMENT_NODE; el = el.parentNode) {
       if (el.__ptLocal === 'iframe' && el.__ptFrameId) {

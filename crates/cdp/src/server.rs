@@ -1689,8 +1689,14 @@ fn network_events(
             "requestId": request_id,
             "loaderId": loader_id,
             "documentURL": rec.url,
-            "request": { "url": rec.url, "method": rec.method, "headers": {},
-                         "initialPriority": "High", "referrerPolicy": "strict-origin-when-cross-origin" },
+            "request": {
+                "url": rec.url, "method": rec.method, "headers": {},
+                "initialPriority": "High", "referrerPolicy": "strict-origin-when-cross-origin",
+                // What the page sent up. Absent when there is no body, exactly as
+                // Chrome reports it — a GET has no `postData` field at all.
+                "postData": String::from_utf8_lossy(&rec.request_body),
+                "hasPostData": !rec.request_body.is_empty(),
+            },
             "timestamp": now,
             "wallTime": now,
             "initiator": { "type": if kind == "Document" { "other" } else { "parser" } },
