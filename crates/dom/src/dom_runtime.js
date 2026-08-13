@@ -1736,6 +1736,11 @@
       el.__ptBoxV = __layoutBuilt;
       __rows[row] = el;
       row++;
+      // Внутрь shadow root — тоже. Без этого всё, что виджет рисует в закрытом
+      // дереве, не имеет коробки вовсе: rect выходит нулевым, и код, который
+      // проверяет видимость (загрузчик Turnstile — проверяет), считает элемент
+      // скрытым и не показывает интерактивную часть.
+      if (el.__ptShadow) for (const c of el.__ptShadow.childNodes) walk(c);
       for (const c of el.childNodes) walk(c);
     };
     const de = globalThis.document && globalThis.document.documentElement;

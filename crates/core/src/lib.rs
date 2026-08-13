@@ -1464,7 +1464,7 @@ impl BrowserContext {
                     // проверку `event.source === iframe.contentWindow`.
                     if !data.contains("\"meow\"") && !data.contains("\"food\"") {
                         tracing::debug!(to_parent = op["toParent"].as_bool().unwrap_or(false),
-                                        payload = %&data[..data.len().min(1800)], "frame message");
+                                        payload = %&data[..data.len().min(9000)], "frame message");
                     }
                     let to_parent = op["toParent"].as_bool().unwrap_or(false);
                     let target = self.frames.lock().ok().and_then(|f| f.get(&id).cloned());
@@ -4099,6 +4099,43 @@ mod tests {
             serde_json::json!([1, 4, 128]),
             "NodeFilter's constants are the spec's, not invented"
         );
+    }
+
+    /// Elements inside a shadow root have geometry. Ours had none — the layout
+    /// walked the document tree only — so anything a widget drew into its shadow
+    /// tree reported a zero rect. Code that checks visibility before showing an
+    /// interactive step reads that as hidden: Cloudflare's loader says so in as
+    /// many words, `unexpectedHidden` with reason `zs` (zero size).
+    #[tokio::test]
+    async fn a_shadow_tree_has_geometry() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let probe = r#"(() => {
+            const host = document.createElement('div');
+            document.body.appendChild(host);
+            const sr = host.attachShadow({ mode: 'closed' });
+            const f = document.createElement('iframe');
+            f.setAttribute('width', '300'); f.setAttribute('height', '65');
+            sr.appendChild(f);
+            const r = f.getBoundingClientRect();
+            return JSON.stringify({
+              w: Math.round(r.width), h: Math.round(r.height),
+              connected: f.isConnected, offset: [f.offsetWidth, f.offsetHeight],
+            });
+        })()"#;
+        let out = match ctx.evaluate(probe).await.unwrap() {
+            Value::String(s) => serde_json::from_str::<Value>(&s).unwrap(),
+            v => panic!("expected the probe result, got {v:?}"),
+        };
+        assert_eq!(out["connected"], true);
+        assert_eq!((out["w"].as_i64(), out["h"].as_i64()), (Some(300), Some(65)),
+                   "an element in a closed shadow root is laid out like any other");
+        assert_eq!(out["offset"], serde_json::json!([300, 65]));
     }
 
     /// An element that states its own size reports it. The row layout stands in
