@@ -294,6 +294,42 @@
     }
     get href() { return this.__ptUrlAttr('href'); }
     set href(v) { this.setAttribute('href', v); }
+
+    // A link reflects the parts of its URL, and parsing a URL by assigning it to a
+    // throwaway `<a>` and reading the pieces back is one of the oldest idioms on
+    // the web — Cloudflare's challenge does it, and got `undefined` where it
+    // expected a hostname, then died reading a property of that. Only `<a>` and
+    // `<area>` have these; anything else reports `undefined`, as in a browser.
+    get protocol() { const u = this.__ptLinkURL(); return u && u.protocol; }
+    set protocol(v) { this.__ptSetLinkPart('protocol', v); }
+    get host() { const u = this.__ptLinkURL(); return u && u.host; }
+    set host(v) { this.__ptSetLinkPart('host', v); }
+    get hostname() { const u = this.__ptLinkURL(); return u && u.hostname; }
+    set hostname(v) { this.__ptSetLinkPart('hostname', v); }
+    get port() { const u = this.__ptLinkURL(); return u && u.port; }
+    set port(v) { this.__ptSetLinkPart('port', v); }
+    get pathname() { const u = this.__ptLinkURL(); return u && u.pathname; }
+    set pathname(v) { this.__ptSetLinkPart('pathname', v); }
+    get search() { const u = this.__ptLinkURL(); return u && u.search; }
+    set search(v) { this.__ptSetLinkPart('search', v); }
+    get hash() { const u = this.__ptLinkURL(); return u && u.hash; }
+    set hash(v) { this.__ptSetLinkPart('hash', v); }
+    get origin() { const u = this.__ptLinkURL(); return u && u.origin; }
+    get username() { const u = this.__ptLinkURL(); return u && (u.username || ''); }
+    get password() { const u = this.__ptLinkURL(); return u && (u.password || ''); }
+    __ptLinkURL() {
+      const tag = this.__ptLocal;
+      if (tag !== 'a' && tag !== 'area') return undefined;
+      const raw = this.getAttribute('href');
+      if (raw == null) return undefined;
+      const base = (globalThis.location && location.href) || 'about:blank';
+      try { return new URL(raw, base); } catch (e) { return undefined; }
+    }
+    __ptSetLinkPart(part, v) {
+      const u = this.__ptLinkURL();
+      if (!u) return;
+      try { u[part] = v; this.setAttribute('href', u.href); } catch (e) {}
+    }
     get action() { return this.__ptUrlAttr('action'); }
     set action(v) { this.setAttribute('action', v); }
     __ptUrlAttr(n) {
@@ -568,6 +604,19 @@
     }
     get referrer() { return this.__ptReferrer || ''; }
     set referrer(v) { this.__ptReferrer = String(v); }
+
+    // `document.location` is `window.location` — the same object, not a copy. Its
+    // absence is not a missing nicety: `document.location.hostname` is how a great
+    // deal of code asks where it is, and against `undefined` that throws. It is
+    // what stopped Cloudflare's full-page challenge here, inside its own timer,
+    // where nothing surfaced the error.
+    get location() { return globalThis.location; }
+    set location(v) { try { globalThis.location.href = String(v); } catch (e) {} }
+    get URL() { return (globalThis.location && globalThis.location.href) || 'about:blank'; }
+    get documentURI() { return this.URL; }
+    get baseURI() { return this.URL; }
+    get domain() { return (globalThis.location && globalThis.location.hostname) || ''; }
+    set domain(v) { /* only ever narrowed to a parent domain; nothing to do here */ }
 
     get cookie() { return this.__ptCookie; }
     set cookie(v) {
