@@ -1498,6 +1498,34 @@ impl BrowserContext {
             let id = op["id"].as_u64().unwrap_or(0);
             let raw = op["src"].as_str().unwrap_or("");
             let done = |ok: bool| format!("__pt_scriptDone({id}, {ok});");
+            // A `blob:` or `data:` script never goes to the network — its source is
+            // in the page's own memory, and handing such a URL to the HTTP client
+            // fails with "invalid authority". Cloudflare's orchestrator loads its
+            // next stage exactly this way, so the chain ended here in silence.
+            if raw.starts_with("blob:") || raw.starts_with("data:") {
+                let src = self
+                    .eval_in(
+                        index,
+                        &format!(
+                            "(() => {{ const s = globalThis.__pt_localSource && __pt_localSource({}); \
+                               return typeof s === 'string' ? s : ''; }})()",
+                            js_str(raw)
+                        ),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                if src.is_empty() {
+                    let _ = self.eval_in(index, &done(false)).await;
+                } else {
+                    if let Err(e) = self.eval_in(index, &src).await {
+                        tracing::debug!(error = %e, "inline-source script threw");
+                    }
+                    let _ = self.eval_in(index, &done(true)).await;
+                }
+                continue;
+            }
             let Some(url) = resolve_url(base, raw) else {
                 let _ = self.eval_in(index, &done(false)).await;
                 continue;

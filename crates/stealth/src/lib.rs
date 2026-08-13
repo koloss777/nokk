@@ -1173,6 +1173,10 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     return null;
   };
 
+  // The driver asks for these by name when a `<script src="blob:…">` is inserted:
+  // the bytes live here, not on any server.
+  globalThis.__pt_localSource = (u) => { const r = localResponse(u); return r ? r.body : null; };
+
   globalThis.fetch = (url, opts) => {
     opts = opts || {};
     const local = localResponse(url);
