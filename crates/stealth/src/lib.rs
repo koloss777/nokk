@@ -1231,30 +1231,94 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   };
 
   // XMLHttpRequest layered on the same queue -------------------------------
-  globalThis.XMLHttpRequest = class XMLHttpRequest {
+  // Every event surface a page listens on is an EventTarget, and ours was not:
+  // `xhr.addEventListener('load', …)` — how modern code reads a response, and how
+  // Cloudflare's challenge widget learns its POST succeeded — did not exist at
+  // all. Setting `onload` worked, adding a listener did nothing, so the widget
+  // fired three requests, got three answers it never heard about, waited out its
+  // own timeout and reported failure (300010). A missing `EventTarget` global is
+  // also a one-line tell in its own right.
+  if (!globalThis.EventTarget) {
+    globalThis.EventTarget = class EventTarget {
+      constructor() { Object.defineProperty(this, '__ptLis', { value: Object.create(null), enumerable: false, writable: true }); }
+      addEventListener(type, fn, opts) {
+        if (!fn) return;
+        if (!this.__ptLis) Object.defineProperty(this, '__ptLis', { value: Object.create(null), enumerable: false, writable: true });
+        const l = (this.__ptLis[type] = this.__ptLis[type] || []);
+        if (!l.some(e => e.fn === fn)) l.push({ fn, once: !!(opts && opts.once) });
+      }
+      removeEventListener(type, fn) {
+        const l = this.__ptLis && this.__ptLis[type];
+        if (l) this.__ptLis[type] = l.filter(e => e.fn !== fn);
+      }
+      dispatchEvent(ev) {
+        const type = ev && ev.type;
+        const l = (this.__ptLis && this.__ptLis[type]) || [];
+        for (const e of l.slice()) {
+          if (e.once) this.removeEventListener(type, e.fn);
+          try { typeof e.fn === 'function' ? e.fn.call(this, ev) : (e.fn.handleEvent && e.fn.handleEvent(ev)); } catch (x) {}
+        }
+        const on = this['on' + type];
+        if (typeof on === 'function') { try { on.call(this, ev); } catch (x) {} }
+        return !ev || !ev.defaultPrevented;
+      }
+    };
+  }
+
+  globalThis.XMLHttpRequest = class XMLHttpRequest extends globalThis.EventTarget {
     constructor() {
+      super();
       this.readyState = 0; this.status = 0; this.statusText = '';
       this.responseText = ''; this.response = ''; this.responseType = '';
-      this._headers = {}; this._respHeaders = {};
-      this.onreadystatechange = null; this.onload = null; this.onerror = null; this.onloadend = null;
+      this.responseURL = ''; this.responseXML = null;
+      this.withCredentials = false; this.timeout = 0;
+      this._headers = {}; this._respHeaders = {}; this._aborted = false;
+      this.upload = new globalThis.EventTarget();
+      this.onreadystatechange = null; this.onload = null; this.onerror = null;
+      this.onloadend = null; this.onloadstart = null; this.onprogress = null;
+      this.onabort = null; this.ontimeout = null;
     }
     open(method, url) { this.method = String(method).toUpperCase(); this.url = String(url); this._set(1); }
     setRequestHeader(k, v) { this._headers[k] = String(v); }
+    overrideMimeType() {}
     getAllResponseHeaders() { return Object.entries(this._respHeaders).map(([k, v]) => k + ': ' + v).join('\r\n'); }
     getResponseHeader(k) { return this._respHeaders[k.toLowerCase()] ?? null; }
-    abort() {}
+    abort() {
+      this._aborted = true;
+      this.readyState = 4; this.status = 0;
+      this._fire('abort'); this._fire('loadend');
+    }
     send(body) {
+      this._fire('loadstart');
       fetch(this.url, { method: this.method, headers: this._headers, body })
         .then(async (r) => {
-          this.status = r.status; this.statusText = r.statusText;
+          if (this._aborted) return;
+          this.status = r.status; this.statusText = r.statusText; this.responseURL = r.url || this.url;
           r.headers.forEach((v, k) => { this._respHeaders[k] = v; });
+          this._set(2); this._set(3);
           this.responseText = await r.text();
-          this.response = this.responseType === 'json' ? JSON.parse(this.responseText || 'null') : this.responseText;
-          this._set(4); if (this.onload) this.onload(); if (this.onloadend) this.onloadend();
+          try { this.response = this.responseType === 'json' ? JSON.parse(this.responseText || 'null') : this.responseText; }
+          catch (e) { this.response = null; }
+          this._set(4);
+          this._fire('progress', { lengthComputable: true, loaded: this.responseText.length, total: this.responseText.length });
+          this._fire('load'); this._fire('loadend');
         })
-        .catch((e) => { this.status = 0; this._set(4); if (this.onerror) this.onerror(e); if (this.onloadend) this.onloadend(); });
+        .catch(() => {
+          if (this._aborted) return;
+          this.status = 0; this._set(4);
+          this._fire('error'); this._fire('loadend');
+        });
     }
-    _set(s) { this.readyState = s; if (this.onreadystatechange) this.onreadystatechange(); }
+    // The order matters: `readystatechange` reaches both a property handler and
+    // anything added as a listener, which is the whole point of this class.
+    _set(s) { this.readyState = s; this._fire('readystatechange'); }
+    _fire(type, extra) {
+      const ev = Object.assign({
+        type, target: this, currentTarget: this, isTrusted: true,
+        lengthComputable: false, loaded: 0, total: 0, bubbles: false, cancelable: false,
+      }, extra || {});
+      this.dispatchEvent(ev);
+    }
   };
 
   // Minimal Headers/TextEncoder if missing.

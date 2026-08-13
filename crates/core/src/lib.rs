@@ -4090,6 +4090,56 @@ mod tests {
         );
     }
 
+    /// An `XMLHttpRequest` is an `EventTarget`, and ours was not: `addEventListener`
+    /// did not exist on it at all. Setting `onload` worked, so most things looked
+    /// fine — until code that *listens* fired a request, got its answer, and never
+    /// heard about it. Cloudflare's widget does exactly that: three POSTs, three
+    /// answers nobody delivered, then its own timeout and `fail` code 300010.
+    #[tokio::test]
+    async fn an_xhr_delivers_its_events_to_listeners() {
+        let _serial = serial().await;
+        let url = cookie_server().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 4, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&url).await.unwrap();
+
+        ctx.evaluate(&format!(
+            "globalThis.seen = []; globalThis.done = false;
+             const x = new XMLHttpRequest();
+             for (const t of ['loadstart','readystatechange','progress','load','loadend'])
+               x.addEventListener(t, () => {{ seen.push(t + ':' + x.readyState); if (t === 'loadend') done = true; }});
+             globalThis.isTarget = typeof EventTarget === 'function' && typeof x.upload.addEventListener === 'function';
+             x.open('GET', {}); x.send();",
+            js_str(&url)
+        ))
+        .await
+        .unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        assert_eq!(
+            ctx.evaluate("String(done)").await.unwrap(),
+            Value::String("true".into()),
+            "a listener must hear the request finish"
+        );
+        assert_eq!(
+            ctx.evaluate("String(isTarget)").await.unwrap(),
+            Value::String("true".into()),
+            "EventTarget exists and `upload` is one too"
+        );
+        let seen = match ctx.evaluate("seen.join(',')").await.unwrap() {
+            Value::String(s) => s,
+            v => panic!("expected the list, got {v:?}"),
+        };
+        for expected in ["loadstart:1", "readystatechange:4", "load:4", "loadend:4"] {
+            assert!(seen.contains(expected), "missing {expected} in {seen}");
+        }
+    }
+
     /// A page that assigns `location.href` goes there. Ours only rewrote the
     /// address and stayed on the same document, so the last step of a form
     /// handoff, an OAuth bounce or a challenge — all of which end by navigating
