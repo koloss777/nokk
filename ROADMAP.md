@@ -382,22 +382,25 @@ value-to-effort:
 - ⬜ **docs.rs** (Rust API docs). Free and automatic once on crates.io; needs the public
   API documented and a `[package.metadata.docs.rs]` config for the heavy build deps.
 - 🟡 **npm** (Node) — the **highest-value** channel (primary driver is Puppeteer/Playwright).
-  **Scaffolded** in [`npm/`](npm/): a package that **downloads the prebuilt binary on install**
-  (postinstall pulls the matching GitHub Release asset) and exposes `launch(opts)` →
-  `server.wsEndpoint` for `puppeteer.connect` / `chromium.connectOverCDP`, plus `npx nokk` to
-  run the server and a `.d.ts`. Launcher **validated end-to-end** against a local binary.
-  Remaining: `npm publish` (manual first, then a tag-triggered publish workflow with npm
-  provenance/OIDC), and macOS/Windows binaries for those platforms (Linux x64 only today).
+  **Published**: [`npm install @koloss777/nokk`](https://www.npmjs.com/package/@koloss777/nokk)
+  works, and every `v*` tag publishes automatically with npm provenance
+  ([`npm-publish.yml`](.github/workflows/npm-publish.yml)) — the version is synced from the
+  tag. The package **downloads the prebuilt binary on install** (postinstall pulls the
+  matching GitHub Release asset) and exposes `launch(opts)` → `server.wsEndpoint` for
+  `puppeteer.connect` / `chromium.connectOverCDP`, plus `npx nokk` to run the server and a
+  `.d.ts`. Remaining: macOS/Windows binaries for those platforms (Linux x64 only today).
 - 🟡 **PyPI** (`pip`) — **published**: [`pip install nokk`](https://pypi.org/project/nokk/)
-  works (name claimed, seven alphas published, `0.1.25a1` live). A thin launcher wheel in [`python/`](python/) bundles
+  works (name claimed, published on every `v*` tag by
+  [`python-wheels.yml`](.github/workflows/python-wheels.yml), which syncs the PEP 440 version
+  from the tag). A thin launcher wheel in [`python/`](python/) bundles
   the binary (the `ruff`/`uv` pattern), built with `maturin` (`bindings = "bin"`,
   `manifest-path` → `crates/cli`) so each wheel embeds the `nokk` binary — no toolchain, no
   BoringSSL build, no Docker. `nokk.launch(…)` / async `nokk.launch_async(…)` spawn the CDP
   server, wait on `/json/version`, and return a self-cleaning server whose `ws_endpoint` goes
   to `playwright`/`pyppeteer` `connect_over_cdp`. Also ships an **MCP server** — see below.
-  Remaining: automate releases via the [wheel CI](.github/workflows/python-wheels.yml)
-  (manylinux_2_28 building BoringSSL + prebuilt V8 — see [BUILD.md](docs/BUILD.md)) with PyPI
-  trusted publishing; the first publish was a manual `twine upload`. Native PyO3 bindings are
+  The wheel CI builds manylinux_2_28 (BoringSSL + prebuilt V8 — see
+  [BUILD.md](docs/BUILD.md)) and publishes on tag; only the very first release went out as a
+  manual `twine upload`. Native PyO3 bindings are
   a heavier follow-up with unclear benefit (the interface is CDP). macOS/Windows wheels wait
   on those binaries.
 - 🟡 **MCP server** (`nokk[mcp]`) — nokk as a [Model Context Protocol](https://modelcontextprotocol.io)
