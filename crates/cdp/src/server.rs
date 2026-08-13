@@ -1478,15 +1478,8 @@ impl Conn {
                 let (ctx, session, tx) =
                     (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
-                    let js = format!(
-                        "__pt_mouse({}, {}, {}, {}, {})",
-                        js_str(&mtype),
-                        x,
-                        y,
-                        js_str(&button),
-                        clicks
-                    );
-                    let _ = ctx.evaluate(&js).await;
+                    // The context routes the point into the frame that owns it.
+                    let _ = ctx.dispatch_mouse(&mtype, x, y, &button, clicks).await;
                     let _ = ctx.run_event_loop().await; // let click handlers settle
                     let _ = tx.send(Message::Text(ok(id, &session, json!({})).to_string()));
                 });

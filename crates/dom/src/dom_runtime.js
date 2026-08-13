@@ -832,7 +832,9 @@
       this.__ptE = {
         type, bubbles: !!init.bubbles, cancelable: !!init.cancelable,
         defaultPrevented: false, target: null, currentTarget: null,
-        eventPhase: 0, timeStamp: 0, isTrusted: true,
+        // Событие, созданное страницей, не доверенное — доверенные приходят
+        // только от движка (ввод, load, message), и он метит их __ptTrust.
+        eventPhase: 0, timeStamp: (globalThis.performance && performance.now()) || 0, isTrusted: false,
       };
       this.__ptStop = false; this.__ptStopImm = false;
     }
@@ -841,6 +843,10 @@
     stopImmediatePropagation() { this.__ptStop = true; this.__ptStopImm = true; }
     composedPath() { const p = []; for (let n = this.target; n; n = n.parentNode) p.push(n); return p; }
   }
+  // Пометить событие как пришедшее от движка. Страница до этого не дотянется:
+  // имя __pt-скрыто из любого перечисления, а слепок делается один раз.
+  const __ptTrust = (ev) => { if (ev && ev.__ptE) ev.__ptE.isTrusted = true; return ev; };
+
   evtAccessors(Event, ['type', 'bubbles', 'cancelable', 'defaultPrevented', 'target',
     'currentTarget', 'eventPhase', 'timeStamp', 'isTrusted']);
 
@@ -1465,7 +1471,8 @@
   let __layoutSeq = 0;      // bumped on every DOM mutation
   let __layoutBuilt = -1;   // __layoutSeq the current boxes were built at
   let __rows = [];          // row index → element occupying it
-  let __mouseDownEl = null; // element that received the last mousedown
+  let __mouseDownEl = null;
+  let __hoverEl = null; // element the pointer is currently over
 
   function __markDirty() { __layoutSeq++; }
 
@@ -1860,8 +1867,18 @@
     __webidl(globalThis[name]);
   }
 
+  // Теги, которые не рисуют ничего: занимать место в раскладке они не вправе.
+  // Пока занимали, содержимое фрейма съезжало на их высоту, и точка попадала
+  // в <style> вместо кнопки.
+  const __UNRENDERED = new Set(['HEAD', 'META', 'STYLE', 'SCRIPT', 'LINK', 'TITLE',
+    'BASE', 'NOSCRIPT', 'TEMPLATE', 'PARAM', 'SOURCE', 'TRACK']);
+
   function __isHiddenEl(el) {
+    if (__UNRENDERED.has(el.tagName)) return true;
+    if (__hiddenBySheet.has(el)) return true;
     if (el.hasAttribute && el.hasAttribute('hidden')) return true;
+    // Скрытое поле формы ничего не занимает — и строки тоже.
+    if (el.tagName === 'INPUT' && /^hidden$/i.test(el.getAttribute('type') || '')) return true;
     const s = el.style;
     if (s) {
       const d = String(s.display || '').toLowerCase();
@@ -1871,34 +1888,79 @@
     return false;
   }
 
+  // Минимальный CSS: из таблиц берём только правила, которые прячут. Полного
+  // каскада у нас нет, но `display:none` игнорировать нельзя — спрятанный
+  // классом блок занимал строку, и содержимое виджета выходило втрое выше
+  // настоящего, а точка клика уезжала мимо.
+  const __HIDE_RE = /(?:^|[;{])\s*(?:display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse))\s*(?:;|$)/i;
+  let __hiddenBySheet = new WeakSet();
+  function __collectHidden() {
+    __hiddenBySheet = new WeakSet();
+    const sheets = [];
+    const scan = (node, root) => {
+      for (const n of (node.__ptKids || [])) {
+        if (n.nodeType !== ELEMENT_NODE) continue;
+        if (n.tagName === 'STYLE') sheets.push([root, n.textContent || '']);
+        if (n.__ptShadow) scan(n.__ptShadow, n.__ptShadow);
+        scan(n, root);
+      }
+    };
+    const doc = globalThis.document;
+    if (!doc || !doc.documentElement) return;
+    scan(doc.documentElement, doc.documentElement);
+    for (const [root, css] of sheets) {
+      for (const chunk of String(css).split('}')) {
+        const brace = chunk.indexOf('{');
+        if (brace < 0) continue;
+        const sel = chunk.slice(0, brace).trim();
+        // `@media` и прочие блочные правила пропускаем целиком: применить их
+        // мы не умеем, а «не спрятано» — безопасная сторона ошибки.
+        if (!sel || sel.charCodeAt(0) === 64) continue;
+        if (!__HIDE_RE.test(chunk.slice(brace + 1))) continue;
+        try { for (const el of query(root, sel)) __hiddenBySheet.add(el); } catch (e) {}
+      }
+    }
+  }
+
   function __relayout() {
     if (__layoutBuilt === __layoutSeq) return;
     __layoutBuilt = __layoutSeq;
+    __collectHidden();
     __rows = [];
     let row = 0;
+    // Строку занимает лист — то, что действительно что-то рисует. Контейнер
+    // охватывает своих детей, а не встаёт над ними отдельной полосой: в
+    // браузере вложенные обёртки лежат друг на друге, и точка внутри виджета
+    // попадает в самый глубокий элемент, а не в его обёртку. Пока строки
+    // раздавались всем подряд, iframe виджета оказывался ниже рамки своего
+    // хоста — кликнуть по нему было нечем.
     const walk = (el) => {
       if (!el || el.nodeType !== ELEMENT_NODE) return;
       if (__isHiddenEl(el)) return;               // display:none hides the subtree
+      const kids = [];
+      if (el.__ptShadow) for (const c of el.__ptShadow.__ptKids) kids.push(c);
+      for (const c of el.__ptKids) kids.push(c);
+      const boxed = kids.some((c) => c.nodeType === ELEMENT_NODE && !__isHiddenEl(c));
       // An element that states its own size gets it. The row layout is a stand-in
       // for what we do not compute, not a licence to contradict the page: a widget
       // sized 300x65 reported back as 1280x20 reads as clipped, and code that
       // measures before deciding whether it is visible — Cloudflare's loader
       // measures its widget's iframe exactly this way — decides wrong.
       const sized = __declaredSize(el);
+      const start = row;
+      if (boxed) {
+        for (const c of kids) walk(c);
+      } else {
+        __rows[row] = el;
+        row++;
+      }
+      const span = Math.max(row - start, 1) * LAYOUT.ROW;
       el.__ptBox = {
-        x: 0, y: row * LAYOUT.ROW,
+        x: 0, y: start * LAYOUT.ROW,
         w: sized.w != null ? sized.w : LAYOUT.W,
-        h: sized.h != null ? sized.h : LAYOUT.ROW,
+        h: sized.h != null ? sized.h : span,
       };
       el.__ptBoxV = __layoutBuilt;
-      __rows[row] = el;
-      row++;
-      // Внутрь shadow root — тоже. Без этого всё, что виджет рисует в закрытом
-      // дереве, не имеет коробки вовсе: rect выходит нулевым, и код, который
-      // проверяет видимость (загрузчик Turnstile — проверяет), считает элемент
-      // скрытым и не показывает интерактивную часть.
-      if (el.__ptShadow) for (const c of el.__ptShadow.__ptKids) walk(c);
-      for (const c of el.__ptKids) walk(c);
     };
     const de = globalThis.document && globalThis.document.documentElement;
     if (de) walk(de);
@@ -1983,25 +2045,67 @@
   // A mouse action at (x,y): resolve the topmost element there and fire the
   // matching pointer + mouse events, synthesizing `click` on release over the
   // same element that received the press (as a real browser does).
+  // Точка попала во фрейм? Тогда клик принадлежит не нам: движок спустится в
+  // его контекст и повторит попадание уже в координатах фрейма. Виджет
+  // Turnstile живёт ровно так — iframe в закрытой тени хоста, — и без этого
+  // спуска нажать его нечем.
+  globalThis.__pt_hitFrame = (x, y) => {
+    for (let el = __elementFromPoint(x, y); el && el.nodeType === ELEMENT_NODE; el = el.parentNode) {
+      if (el.__ptLocal === 'iframe' && el.__ptFrameId) {
+        const r = el.getBoundingClientRect();
+        // Один к одному, как в настоящем окне: фрейм не сжимает содержимое под
+        // свою рамку, он показывает его верх, а остальное уходит под обрез.
+        // Точка внутри рамки — та же точка в координатах фрейма.
+        return JSON.stringify({ frame: el.__ptFrameId, x: x - r.x, y: y - r.y });
+      }
+    }
+    return '';
+  };
+
+
   globalThis.__pt_mouse = (type, x, y, button, clickCount) => {
     const el = __elementFromPoint(x, y) || (globalThis.document && globalThis.document.body);
     if (!el) return false;
     const b = button === 'right' ? 2 : button === 'middle' ? 1 : (button | 0);
-    const base = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: b, detail: clickCount || 1 };
+    const base = { bubbles: true, cancelable: true, composed: true,
+                   clientX: x, clientY: y, screenX: x, screenY: y,
+                   button: b, detail: clickCount || 1 };
+    // Ввод от движка — доверенный: настоящий клик несёт isTrusted=true, и
+    // виджеты, которые ждут нажатия человека, только такой и принимают.
+    const send = (ev) => el.dispatchEvent(__ptTrust(ev));
     if (type === 'mousePressed') {
-      el.dispatchEvent(new PointerEvent('pointerdown', { ...base, buttons: 1 }));
-      el.dispatchEvent(new MouseEvent('mousedown', { ...base, buttons: 1 }));
+      if (__hoverEl !== el) {
+        __hoverEl = el;
+        send(new PointerEvent('pointerover', base));
+        send(new MouseEvent('mouseover', base));
+      }
+      send(new PointerEvent('pointerdown', { ...base, buttons: 1 }));
+      send(new MouseEvent('mousedown', { ...base, buttons: 1 }));
       const f = __focusableAncestor(el);
       if (f) f.focus(); else if (globalThis.document) { const a = globalThis.document.activeElement; if (a && a.blur) a.blur(); }
       __mouseDownEl = el;
     } else if (type === 'mouseReleased') {
-      el.dispatchEvent(new PointerEvent('pointerup', base));
-      el.dispatchEvent(new MouseEvent('mouseup', base));
-      if (__mouseDownEl === el) el.dispatchEvent(new MouseEvent('click', base));
+      send(new PointerEvent('pointerup', base));
+      send(new MouseEvent('mouseup', base));
+      if (__mouseDownEl === el) {
+        // Нажатие на чекбокс/радио переключает его до того, как всплывёт click,
+        // — обработчик читает уже новое состояние.
+        if (el.tagName === 'INPUT' && /^(checkbox|radio)$/i.test(el.getAttribute('type') || '')) {
+          el.checked = el.getAttribute('type').toLowerCase() === 'radio' ? true : !el.checked;
+          el.dispatchEvent(__ptTrust(new Event('input', { bubbles: true })));
+          el.dispatchEvent(__ptTrust(new Event('change', { bubbles: true })));
+        }
+        send(new MouseEvent('click', base));
+      }
       __mouseDownEl = null;
     } else if (type === 'mouseMoved') {
-      el.dispatchEvent(new PointerEvent('pointermove', base));
-      el.dispatchEvent(new MouseEvent('mousemove', base));
+      if (__hoverEl !== el) {
+        __hoverEl = el;
+        send(new PointerEvent('pointerover', base));
+        send(new MouseEvent('mouseover', base));
+      }
+      send(new PointerEvent('pointermove', base));
+      send(new MouseEvent('mousemove', base));
     }
     return true;
   };
@@ -2013,7 +2117,7 @@
     } else if (el.isContentEditable) {
       el.textContent = (el.textContent || '') + text;
     } else return false;
-    el.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
+    el.dispatchEvent(__ptTrust(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' })));
     return true;
   }
   globalThis.__pt_insertText = (text) => {
@@ -2031,13 +2135,13 @@
     if (!el) return false;
     const name = { keyDown: 'keydown', rawKeyDown: 'keydown', keyUp: 'keyup', char: 'keypress' }[type] || type;
     const ev = { bubbles: true, cancelable: true, key: init.key || '', code: init.code || '', keyCode: init.keyCode || 0 };
-    el.dispatchEvent(new KeyboardEvent(name, ev));
+    el.dispatchEvent(__ptTrust(new KeyboardEvent(name, ev)));
     if (name === 'keydown') {
       if (init.text) { if (__editable(el)) __insertInto(el, init.text); }
       else if (init.key === 'Backspace' && __editable(el)) {
         if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') el.value = String(el.value || '').slice(0, -1);
         else el.textContent = String(el.textContent || '').slice(0, -1);
-        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+        el.dispatchEvent(__ptTrust(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' })));
       }
     }
     return true;

@@ -1345,6 +1345,52 @@ impl BrowserContext {
         self.eval_in(index, script).await
     }
 
+    /// Deliver a mouse action at page coordinates, into whatever document owns
+    /// that point. A frame is its own context with its own layout, so the point
+    /// has to be handed down: hit-test here, and if it lands on an `<iframe>`,
+    /// repeat inside that frame in its own coordinates. Turnstile's checkbox
+    /// sits exactly there — an iframe in a closed shadow root — so without the
+    /// descent there is nothing at those coordinates to click.
+    pub async fn dispatch_mouse(
+        &self,
+        kind: &str,
+        x: f64,
+        y: f64,
+        button: &str,
+        clicks: i64,
+    ) -> Result<bool, EngineError> {
+        let mut frame: Option<u32> = None;
+        let (mut fx, mut fy) = (x, y);
+        // Frames nest; the bound is a guard against a cycle, not a real depth.
+        for _ in 0..8 {
+            let probe = format!("__pt_hitFrame({fx}, {fy})");
+            let hit = match frame {
+                None => self.evaluate(&probe).await?,
+                Some(id) => self.evaluate_in_frame(id, &probe).await?,
+            };
+            let Some(text) = hit.as_str().filter(|s| !s.is_empty()) else { break };
+            let Ok(v) = serde_json::from_str::<Value>(text) else { break };
+            let (Some(id), Some(nx), Some(ny)) =
+                (v["frame"].as_u64(), v["x"].as_f64(), v["y"].as_f64())
+            else {
+                break;
+            };
+            frame = Some(id as u32);
+            fx = nx;
+            fy = ny;
+        }
+        let js = format!(
+            "__pt_mouse({}, {fx}, {fy}, {}, {clicks})",
+            serde_json::to_string(kind).unwrap_or_else(|_| "\"\"".into()),
+            serde_json::to_string(button).unwrap_or_else(|_| "\"left\"".into()),
+        );
+        let out = match frame {
+            None => self.evaluate(&js).await?,
+            Some(id) => self.evaluate_in_frame(id, &js).await?,
+        };
+        Ok(out.as_bool().unwrap_or(false))
+    }
+
     /// Whether this page has a live `<iframe>`. Same reasoning as a socket: the
     /// frame is a running document with timers and requests of its own, and it
     /// freezes the moment nothing pumps it.
@@ -4591,6 +4637,103 @@ mod tests {
             seq - ack <= 5,
             "the answer must keep up with the pings, not fall behind: {state}"
         );
+    }
+
+    /// A page with a widget-shaped frame: an `<iframe>` inside a container, whose
+    /// document keeps its control in a shadow root — the shape Turnstile uses.
+    async fn frame_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let inner = r#"<html><head><style>.gone{display:none}</style></head>
+                        <body><div class="gone"><p>hidden</p></div>
+                        <script>
+                          const host = document.createElement('div');
+                          document.body.appendChild(host);
+                          const root = host.attachShadow({ mode: 'closed' });
+                          const box = document.createElement('input');
+                          box.type = 'checkbox';
+                          root.appendChild(box);
+                          globalThis.__hits = [];
+                          box.addEventListener('click', (e) => {
+                            __hits.push({ trusted: e.isTrusted, checked: box.checked, x: e.clientX });
+                          });
+                        </script></body></html>"#;
+                    let outer = r#"<html><body><div id="wrap"><p>above</p>
+                        <iframe id="w" src="/inner" style="width:300px;height:65px"></iframe>
+                        </div></body></html>"#;
+                    let body = if req.contains("GET /inner") { inner } else { outer };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://127.0.0.1:{}/", addr.port())
+    }
+
+    /// A click has to reach the document that owns the point. Turnstile's checkbox
+    /// lives in an `<iframe>` inside a closed shadow root, so a click that stops at
+    /// the top document reaches nothing at all — which is why the widget sat at
+    /// `before-interactive` forever. The point is hit-tested here, handed down into
+    /// the frame in the frame's own coordinates, and dispatched there.
+    #[tokio::test]
+    async fn a_click_reaches_the_frame_that_owns_the_point() {
+        let _serial = serial().await;
+        let url = frame_server().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 4, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&url).await.unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        let rect = probe(&ctx, r#"(() => {
+            const f = document.getElementById('w');
+            const r = f.getBoundingClientRect();
+            return JSON.stringify({ x: r.x, y: r.y, w: r.width, h: r.height });
+        })()"#).await;
+        let (x, y) = (
+            rect["x"].as_f64().unwrap() + 10.0,
+            rect["y"].as_f64().unwrap() + 5.0,
+        );
+
+        for kind in ["mouseMoved", "mousePressed", "mouseReleased"] {
+            ctx.dispatch_mouse(kind, x, y, "left", 1).await.unwrap();
+        }
+        ctx.run_event_loop().await.unwrap();
+
+        let frame = ctx.frame_list().first().map(|f| f.id).expect("the frame is live");
+        let hits = ctx
+            .evaluate_in_frame(frame, "JSON.stringify(globalThis.__hits || [])")
+            .await
+            .unwrap();
+        let hits: Value = serde_json::from_str(hits.as_str().unwrap_or("[]")).unwrap();
+        let hits = hits.as_array().expect("the frame reports what it was clicked with");
+
+        assert_eq!(hits.len(), 1, "exactly one click landed in the frame: {hits:?}");
+        assert_eq!(hits[0]["trusted"], true, "input from the engine is trusted");
+        assert_eq!(hits[0]["checked"], true, "and the checkbox toggled before the click ran");
+
+        // A page-built event is not: only the engine's own input is trusted, and
+        // claiming otherwise is a tell in its own right.
+        let built = ctx
+            .evaluate("String(new MouseEvent('click').isTrusted)")
+            .await
+            .unwrap();
+        assert_eq!(built, Value::String("false".into()));
     }
 
     /// A one-shot HTTP server that hands out the cookie flavours that matter:
