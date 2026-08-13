@@ -16,16 +16,26 @@
   const VOID = new Set(['area','base','br','col','embed','hr','img','input',
     'link','meta','param','source','track','wbr']);
 
-  // Every `<iframe>` in a subtree, shadow trees included. Frames connect and
-  // disconnect as part of whatever tree they are inserted into or removed with,
-  // and a widget hands the DOM a finished tree rather than a bare iframe.
-  function __eachFrame(node, fn) {
+  // Every node in a subtree, shadow trees included. Frames and scripts come to
+  // life as part of whatever tree they are inserted with — a widget hands the DOM
+  // a finished tree, not a bare element.
+  function __walkTree(node, fn) {
     if (!node) return;
-    if (node.__ptLocal === 'iframe') fn(node);
+    fn(node);
     const kids = node.childNodes;
-    if (kids) for (const c of kids.slice()) __eachFrame(c, fn);
-    if (node.__ptShadow) __eachFrame(node.__ptShadow, fn);
+    if (kids) for (const c of kids.slice()) __walkTree(c, fn);
+    if (node.__ptShadow) __walkTree(node.__ptShadow, fn);
   }
+
+  // What connecting a subtree means for the elements that *do* something: a frame
+  // opens a browsing context, a script runs. Both were inert before — a page that
+  // builds `<script src=…>` and appends it (which is how every tag loader, widget
+  // bootstrap and anti-bot orchestrator works, Cloudflare's interstitial included)
+  // got a DOM node and nothing else: no fetch, no execution, no `onload`.
+  const __connectSubtree = (node) => __walkTree(node, (n) => {
+    if (n.__ptLocal === 'iframe') n.__ptConnectFrame();
+    else if (n.__ptLocal === 'script') n.__ptRunScript();
+  });
 
   // ---- Node -----------------------------------------------------------------
   class Node {
@@ -85,7 +95,7 @@
       // shadow root and then connects the host, so checking only `child` left the
       // iframe sitting there, connected and inert, and the widget waiting forever
       // for a frame that never opened.
-      if (child.isConnected) __eachFrame(child, (f) => f.__ptConnectFrame());
+      if (child.isConnected) __connectSubtree(child);
       return child;
     }
     removeChild(child) {
@@ -98,7 +108,7 @@
       // outlives the element forever — a widget that replaces its iframe on a
       // retry (Turnstile does, repeatedly) would pile them up until the cap. The
       // whole subtree goes, for the same reason it connects as a whole.
-      __eachFrame(child, (f) => { if (f.__ptFrameId) __ptDisconnectFrame(f); });
+      __walkTree(child, (f) => { if (f.__ptFrameId) __ptDisconnectFrame(f); });
       return child;
     }
     replaceChild(nw, old) { this.insertBefore(nw, old); return this.removeChild(old); }
@@ -276,7 +286,11 @@
     get src() { return this.__ptUrlAttr('src'); }
     set src(v) {
       this.setAttribute('src', v);
-      if (this.__ptConnectFrame && this.isConnected) this.__ptConnectFrame();
+      if (!this.isConnected) return;
+      // The src can arrive after the element is in the document, in either order:
+      // `el.src = …; head.appendChild(el)` or `head.appendChild(el); el.src = …`.
+      if (this.__ptConnectFrame) this.__ptConnectFrame();
+      if (this.__ptRunScript) this.__ptRunScript();
     }
     get href() { return this.__ptUrlAttr('href'); }
     set href(v) { this.setAttribute('href', v); }
@@ -349,6 +363,33 @@
       // document lives in another V8 context), so it reports the same.
       return st && st.ready && st.sameOrigin ? st.doc || null : null;
     }
+    // A `<script>` that has just entered the document runs — once. The "already
+    // started" flag is the spec's, and it is what keeps a parser-built script
+    // (the engine runs those itself, in document order) from running twice, and a
+    // re-inserted element from running again.
+    __ptRunScript() {
+      if (this.__ptRan || this.__ptLocal !== 'script') return;
+      const type = String(this.getAttribute('type') || '').toLowerCase().trim();
+      // Anything that is not classic JS — a JSON island, a template, an importmap
+      // — is data the page reads itself, not code to run.
+      if (type && !/^(text|application)\/(java|ecma)script$|^module$/.test(type)) return;
+      const src = this.getAttribute('src');
+      // Nothing to run *yet*: an element appended empty starts when its `src`
+      // arrives, so the flag must not be set until there is something to do.
+      if (!src && !this.textContent) return;
+      Object.defineProperty(this, '__ptRan', { value: true, configurable: true, enumerable: false });
+      if (src) {
+        const id = __nextScriptId++;
+        __scriptEls.set(id, this);
+        __scriptOps.push({ op: 'load', id, src: String(src) });
+        return;
+      }
+      const code = this.textContent;
+      if (!code) return;
+      // Indirect eval: a classic script runs in global scope, not in ours.
+      try { (0, eval)(code); } catch (e) { /* page script threw */ }
+    }
+
     __ptConnectFrame() {
       if (this.__ptFrameId || this.__ptLocal !== 'iframe') return;
       const src = this.getAttribute('src');
@@ -1046,6 +1087,12 @@
     if (spec.k === 't') return doc.createTextNode(spec.v);
     if (spec.k === 'c') return doc.createComment(spec.v);
     const el = doc.createElement(spec.tag);
+    // A parser-built script is "already started": the engine runs the document's
+    // scripts itself, in document order, so connecting the tree must not run them
+    // a second time. Only what a page inserts later goes through `__ptRunScript`.
+    if (spec.tag === 'script') {
+      Object.defineProperty(el, '__ptRan', { value: true, configurable: true, enumerable: false });
+    }
     for (const [name, value] of spec.attrs) el.setAttribute(name, value);
     for (const child of spec.children) el.appendChild(buildNode(doc, child));
     return el;
@@ -1327,6 +1374,27 @@
   };
 
   globalThis.__pt_drainFrameQueue = () => __frameOps.splice(0);
+
+  // --- dynamically inserted <script src> -----------------------------------
+  // The element cannot fetch; the engine can. Each insertion becomes an op the
+  // driver picks up, fetches against the document's own base URL and cookies, and
+  // evaluates in this context — then says how it went, so `onload`/`onerror` fire
+  // where the page expects them.
+  const __scriptEls = new Map();
+  const __scriptOps = [];
+  let __nextScriptId = 1;
+
+  globalThis.__pt_drainScriptQueue = () => __scriptOps.splice(0);
+
+  globalThis.__pt_scriptDone = (id, ok) => {
+    const el = __scriptEls.get(id);
+    if (!el) return;
+    __scriptEls.delete(id);
+    const ev = { type: ok ? 'load' : 'error', target: el, currentTarget: el, isTrusted: true };
+    const handler = ok ? el.onload : el.onerror;
+    try { if (typeof handler === 'function') handler.call(el, ev); } catch (e) {}
+    try { el.dispatchEvent && el.dispatchEvent(ev); } catch (e) {}
+  };
 
   // Tear down a frame whose element left the document, and let the element be
   // connected again later as a fresh one.

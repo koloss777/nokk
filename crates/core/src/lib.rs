@@ -1098,6 +1098,7 @@ impl BrowserContext {
             let reqs: Vec<Value> = queues["fetch"].as_array().cloned().unwrap_or_default();
             let ws_ops: Vec<Value> = queues["ws"].as_array().cloned().unwrap_or_default();
             let frame_ops: Vec<Value> = queues["frames"].as_array().cloned().unwrap_or_default();
+            let script_ops: Vec<Value> = queues["scripts"].as_array().cloned().unwrap_or_default();
             // How long until the page's next timer, straight from the same queue
             // the driver just pumped: -1 for "nothing pending".
             let next_timer_ms = queues["timers"].as_i64().unwrap_or(-1);
@@ -1109,10 +1110,17 @@ impl BrowserContext {
             let delivered = self.deliver_ws_events(index).await?;
 
             // 4. Frames the page just connected get built now — that is cheap, and
-            //    a widget polls `contentWindow` the instant it inserts one.
+            //    a widget polls `contentWindow` the instant it inserts one. Scripts
+            //    it inserted run here too, before the round's fetches: everything
+            //    after them usually depends on what they define.
             self.apply_frame_ops(&base, &frame_ops).await;
+            self.apply_script_ops(index, &base, &script_ops).await;
 
-            let busy = ran > 0 || !reqs.is_empty() || !ws_ops.is_empty() || delivered > 0;
+            let busy = ran > 0
+                || !reqs.is_empty()
+                || !ws_ops.is_empty()
+                || !script_ops.is_empty()
+                || delivered > 0;
 
             // 5. Perform each fetch off the isolate thread, then settle its
             //    Promise back on the worker.
@@ -1422,6 +1430,45 @@ impl BrowserContext {
         }
     }
 
+    /// Fetch and run what the page inserted into itself. A `<script src>` added to
+    /// the document is the standard way to load anything after first paint — a tag
+    /// manager, a widget bootstrap, Cloudflare's challenge orchestrator — and the
+    /// element cannot fetch on its own. Resolved against the document's base URL,
+    /// fetched on this context's client (so cookies and fingerprint are the page's
+    /// own), then evaluated in the context that asked. The element hears back
+    /// either way, so `onload`/`onerror` fire where the page expects them.
+    async fn apply_script_ops(&self, index: usize, base: &str, ops: &[Value]) {
+        const MAX_SCRIPTS: usize = 64;
+        for op in ops.iter().take(MAX_SCRIPTS) {
+            let id = op["id"].as_u64().unwrap_or(0);
+            let raw = op["src"].as_str().unwrap_or("");
+            let done = |ok: bool| format!("__pt_scriptDone({id}, {ok});");
+            let Some(url) = resolve_url(base, raw) else {
+                let _ = self.eval_in(index, &done(false)).await;
+                continue;
+            };
+            if self.engine.block_trackers && nokk_net::is_blocked_url(&url) {
+                self.record("GET", &url, "script", 0, &[]);
+                // A blocked tracker "loaded" as far as the page is concerned;
+                // reporting an error would send it down a retry path instead.
+                let _ = self.eval_in(index, &done(true)).await;
+                continue;
+            }
+            match self.fetch_text(&url, "script").await {
+                Ok((_, code)) => {
+                    if let Err(e) = self.eval_in(index, &code).await {
+                        tracing::debug!(url = %url, error = %e, "inserted script threw");
+                    }
+                    let _ = self.eval_in(index, &done(true)).await;
+                }
+                Err(e) => {
+                    tracing::debug!(url = %url, error = %e, "inserted script failed to load");
+                    let _ = self.eval_in(index, &done(false)).await;
+                }
+            }
+        }
+    }
+
     /// Record when the page's earliest timer comes due (`-1` = none pending), as
     /// the JS queue just reported it.
     fn note_next_timer(&self, delay_ms: i64) {
@@ -1483,6 +1530,14 @@ impl BrowserContext {
                     work += 1;
                     let settle = self.perform_fetch(&base, r).await;
                     let _ = self.eval_in(index, &settle).await;
+                }
+            }
+
+            // A frame loads code into itself the same way a page does.
+            if let Some(ops) = queues["scripts"].as_array() {
+                if !ops.is_empty() {
+                    work += ops.len();
+                    self.apply_script_ops(index, &base, ops).await;
                 }
             }
 
@@ -1863,6 +1918,7 @@ const DRAIN_IO: &str = "JSON.stringify({\
     fetch: typeof __pt_drainFetchQueue === 'function' ? JSON.parse(__pt_drainFetchQueue()) : [],\
     ws: typeof __pt_drainWsQueue === 'function' ? __pt_drainWsQueue() : [],\
     frames: typeof __pt_drainFrameQueue === 'function' ? __pt_drainFrameQueue() : [],\
+    scripts: typeof __pt_drainScriptQueue === 'function' ? __pt_drainScriptQueue() : [],\
     timers: typeof __pt_nextTimerDelay === 'function' ? __pt_nextTimerDelay() : -1})";
 
 /// How long [`BrowserContext::run_event_loop`] may spend *waiting* for timers
