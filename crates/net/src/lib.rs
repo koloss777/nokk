@@ -199,6 +199,58 @@ pub struct Request {
     pub url: String,
     pub headers: BTreeMap<String, String>,
     pub body: Option<Vec<u8>>,
+    /// What the page is fetching this for. A browser does not send one header set
+    /// for everything: a navigation carries `upgrade-insecure-requests` and
+    /// `sec-fetch-user`, a script asks for `*/*` and declares `sec-fetch-dest:
+    /// script`, an image asks for image types. Sending the navigation set for all
+    /// of them — which is what a single emulation profile does — contradicts the
+    /// page's own behaviour on every subresource.
+    pub kind: RequestKind,
+}
+
+/// The destination a request is for, in the sense `Sec-Fetch-Dest` means it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestKind {
+    /// A top-level navigation.
+    #[default]
+    Document,
+    /// A classic `<script src>`.
+    Script,
+    /// `fetch()` / `XMLHttpRequest` from page JS.
+    Xhr,
+    /// An image, a stylesheet, anything else a page pulls in.
+    Subresource,
+}
+
+impl RequestKind {
+    /// The `Accept` a browser sends for this destination.
+    fn accept(self) -> &'static str {
+        match self {
+            RequestKind::Document => "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            RequestKind::Script | RequestKind::Xhr => "*/*",
+            RequestKind::Subresource => "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        }
+    }
+
+    /// `Sec-Fetch-Dest` / `-Mode`, measured from Chrome.
+    fn sec_fetch(self) -> (&'static str, &'static str) {
+        match self {
+            RequestKind::Document => ("document", "navigate"),
+            RequestKind::Script => ("script", "no-cors"),
+            RequestKind::Xhr => ("empty", "cors"),
+            RequestKind::Subresource => ("image", "no-cors"),
+        }
+    }
+
+    /// Chrome's request priority for this destination.
+    fn priority(self) -> &'static str {
+        match self {
+            RequestKind::Document => "u=0, i",
+            RequestKind::Xhr => "u=1, i",
+            RequestKind::Script => "u=1",
+            RequestKind::Subresource => "u=2, i",
+        }
+    }
 }
 
 /// An HTTP response.
@@ -343,6 +395,20 @@ impl FingerprintClient {
     }
 }
 
+
+/// Whether `referer` and `url` are the same origin — the difference between
+/// `sec-fetch-site: same-origin` and `cross-site`.
+fn same_site(referer: &str, url: &str) -> bool {
+    let origin = |s: &str| {
+        let s = s.split("://").nth(1)?;
+        Some(s.split('/').next()?.to_ascii_lowercase())
+    };
+    match (origin(referer), origin(url)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 impl HttpClient for FingerprintClient {
     async fn send(&self, req: Request) -> Result<Response, NetError> {
         // Normalise the method so a lowercase `fetch(url, {method:'get'})` from
@@ -357,11 +423,78 @@ impl HttpClient for FingerprintClient {
             "OPTIONS" => self.inner.request(wreq::Method::OPTIONS, &req.url),
             other => return Err(NetError::Connect(format!("unsupported method {other}"))),
         };
+        // The emulation ships one header set — a navigation's — for every request.
+        // Correct the parts that vary by destination, and put them on the wire in
+        // Chrome's order: `orig_headers` decides that, and without it our added
+        // headers would trail after `priority`, in an order no browser produces.
+        let (dest, mode) = req.kind.sec_fetch();
+        let same_origin = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("referer"))
+            .map(|(_, r)| same_site(r, &req.url))
+            .unwrap_or(false);
+        let site = match req.kind {
+            RequestKind::Document => "none",
+            _ if same_origin => "same-origin",
+            _ => "cross-site",
+        };
+        // `Accept` is the page's to set on `fetch`/XHR — it is not a forbidden
+        // header — so ours is only the default when the caller named none. For a
+        // navigation, a script or an image the page has no say, and the browser's
+        // value is the only correct one.
+        let page_accept = req.headers.keys().any(|k| k.eq_ignore_ascii_case("accept"));
+        let own_accept = !(page_accept && req.kind == RequestKind::Xhr);
+        if own_accept {
+            rb = rb.header("accept", req.kind.accept());
+        }
+        rb = rb
+            .header("sec-fetch-site", site)
+            .header("sec-fetch-mode", mode)
+            .header("sec-fetch-dest", dest)
+            .header("priority", req.kind.priority());
+        let mut order = wreq::header::OrigHeaderMap::new();
+        for name in ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"] {
+            order.insert(name);
+        }
+        if req.kind == RequestKind::Document {
+            // Only a navigation carries these two, and their absence is the
+            // difference between a browser and something replaying its cookies.
+            rb = rb
+                .header("upgrade-insecure-requests", "1")
+                .header("sec-fetch-user", "?1");
+            order.insert("upgrade-insecure-requests");
+        }
+        for name in ["user-agent", "accept", "sec-fetch-site", "sec-fetch-mode"] {
+            order.insert(name);
+        }
+        if req.kind == RequestKind::Document {
+            order.insert("sec-fetch-user");
+        }
+        for name in [
+            "sec-fetch-dest",
+            "referer",
+            "accept-encoding",
+            "accept-language",
+            "priority",
+        ] {
+            order.insert(name);
+        }
+        rb = rb.orig_headers(order);
+
         // Forward only headers the emulation profile does not own, so the Chrome
-        // fingerprint (values + order) is preserved.
+        // fingerprint (values + order) is preserved. The `sec-*` set is ours now,
+        // decided above from the request's destination.
         for (k, v) in &req.headers {
             let lk = k.to_ascii_lowercase();
-            if FP_OWNED_HEADERS.contains(&lk.as_str()) || lk.starts_with("sec-") {
+            // Forbidden header names: a page cannot set these, so a value that
+            // arrived in one is ours to ignore, not to honour.
+            if FP_OWNED_HEADERS.contains(&lk.as_str())
+                || lk.starts_with("sec-")
+                || lk == "priority"
+                || lk == "upgrade-insecure-requests"
+                || (lk == "accept" && own_accept)
+            {
                 continue;
             }
             rb = rb.header(k, v);
@@ -444,6 +577,7 @@ mod tests {
             url: url.into(),
             headers: BTreeMap::new(),
             body: None,
+            kind: RequestKind::default(),
         }
     }
 

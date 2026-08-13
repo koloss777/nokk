@@ -287,6 +287,7 @@ impl EngineInner {
             url: nokk_net::GEO_LOOKUP_URL.to_string(),
             headers,
             body: None,
+            kind: nokk_net::RequestKind::Xhr,
         };
         match client.send(req).await {
             Ok(resp) => nokk_net::parse_geo(&resp.body),
@@ -698,6 +699,7 @@ impl Engine {
             url: url.to_string(),
             headers,
             body: None,
+            kind: nokk_net::RequestKind::Document,
         };
         match self.inner.client.send(req).await {
             Ok(resp) => Ok(resp),
@@ -1764,6 +1766,11 @@ impl BrowserContext {
         let kind = headers
             .remove("x-pt-kind")
             .unwrap_or_else(|| "fetch".to_string());
+        // Page-initiated requests carry the document that made them, which is
+        // also what decides `Sec-Fetch-Site`.
+        if !base.is_empty() && base != "about:blank" && !headers.keys().any(|k| k.eq_ignore_ascii_case("referer")) {
+            headers.insert("Referer".to_string(), base.to_string());
+        }
         // Blocked tracker: never hit the wire; reject like a real ad-blocker
         // (ERR_BLOCKED_BY_CLIENT), and log it so the interception audit is complete.
         if self.engine.block_trackers && nokk_net::is_blocked_url(&url) {
@@ -1780,6 +1787,7 @@ impl BrowserContext {
             url: url.clone(),
             headers,
             body,
+            kind: nokk_net::RequestKind::Xhr,
         };
 
         let method = req.method.clone();
@@ -1842,11 +1850,26 @@ impl BrowserContext {
             "Accept-Language".to_string(),
             self.engine.stealth.languages.join(","),
         );
+        // A subresource carries the document that asked for it. Without a
+        // `Referer` there is no way to tell same-origin from cross-site, and the
+        // request reads as one nobody's page made.
+        if resource_type != "document" {
+            let base = self.base_url.lock().map(|b| b.clone()).unwrap_or_default();
+            if !base.is_empty() && base != "about:blank" {
+                headers.insert("Referer".to_string(), base);
+            }
+        }
         let req = Request {
             method: "GET".into(),
             url: url.to_string(),
             headers,
             body: None,
+            kind: match resource_type {
+                "document" => nokk_net::RequestKind::Document,
+                "script" => nokk_net::RequestKind::Script,
+                "xhr" | "fetch" => nokk_net::RequestKind::Xhr,
+                _ => nokk_net::RequestKind::Subresource,
+            },
         };
         match self.client.send(req).await {
             Ok(resp) => {

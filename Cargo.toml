@@ -38,8 +38,14 @@ url = "2"
 # socket carries the same JA3/JA4 and header order as its fetches (see
 # docs/websockets.md — two fingerprints from one "browser" is a louder tell than
 # no WebSocket at all).
-wreq = { version = "6.0.0-rc.29", features = ["cookies", "ws"] }
-wreq-util = "3.0.0-rc.14"
+# The decompression features must match what the emulation advertises in
+# `accept-encoding`: asking for gzip/br/zstd and then not decoding them hands the
+# page a body of binary noise, which is exactly as broken as it sounds.
+wreq = { version = "6.0.0-rc.29", features = ["cookies", "ws", "gzip", "deflate", "brotli", "zstd"] }
+# `emulation-compression` is not cosmetic: without it the emulation omits
+# `accept-encoding` entirely, and a browser that advertises no encodings is a
+# thing that does not exist.
+wreq-util = { version = "3.0.0-rc.14", features = ["emulation-compression"] }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
