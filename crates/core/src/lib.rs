@@ -618,6 +618,7 @@ impl Engine {
             frames: std::sync::Mutex::new(HashMap::new()),
             bootstrap,
             frame_init_scripts: std::sync::Mutex::new(Vec::new()),
+            next_timer_at: std::sync::Mutex::new(None),
             session,
             _permit: permit,
             _load: load,
@@ -741,6 +742,12 @@ pub struct BrowserContext {
     /// what `Page.addScriptToEvaluateOnNewDocument` means in Chrome — it applies
     /// to the whole frame tree, not just the top document.
     frame_init_scripts: std::sync::Mutex<Vec<String>>,
+    /// When this page's earliest pending timer comes due, as of the last turn of
+    /// the event loop. `None` means nothing is pending. Timers wait out their real
+    /// delays now, so a page only advances while something drives it — this is how
+    /// the driver knows *when* to come back rather than polling a live page twenty
+    /// times a second, or leaving its `setInterval` frozen between commands.
+    next_timer_at: std::sync::Mutex<Option<std::time::Instant>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
     _load: nokk_pool::ContextLoadGuard,
 }
@@ -929,8 +936,9 @@ impl BrowserContext {
         }
         self.load_html_into(self.index, base_url, html).await?;
         // Timers and async continuations scheduled during load (and by the load
-        // handlers) get their turn now.
-        self.run_event_loop().await?;
+        // handlers) get their turn now — with the load-time patience for delays
+        // the page actually asked for.
+        self.run_event_loop_for_load().await?;
         Ok(())
     }
 
@@ -999,12 +1007,35 @@ impl BrowserContext {
     }
 
     /// Drive this context's event loop until it goes idle: alternately pump
-    /// timers (virtual time, on the isolate thread) and service the JS `fetch`
-    /// queue (real network, on the tokio side, off the isolate thread), settling
-    /// each Promise back in the isolate so resolved awaits can schedule more work.
-    /// Returns the number of timer callbacks run. Bounded by a wall-clock deadline
-    /// and a per-load fetch cap.
+    /// timers (on the isolate thread) and service the JS `fetch` queue (real
+    /// network, on the tokio side, off the isolate thread), settling each Promise
+    /// back in the isolate so resolved awaits can schedule more work. Returns the
+    /// number of timer callbacks run. Bounded by a wall-clock deadline and a
+    /// per-load fetch cap.
+    ///
+    /// Timers are due-time based, so "idle" now means *nothing due right now*.
+    /// The loop will wait out a short chain of them (see `IDLE_WAIT_BUDGET`) and
+    /// then return: a page with a long-running `setInterval` is never finished,
+    /// and holding a CDP command hostage to it would be worse than returning and
+    /// letting the server's periodic pump carry the page forward.
     pub async fn run_event_loop(&self) -> Result<u32, EngineError> {
+        self.run_event_loop_waiting(IDLE_WAIT_BUDGET).await
+    }
+
+    /// [`Self::run_event_loop`] with a longer patience for timers, used while a
+    /// document is loading: work deferred by a few hundred milliseconds is still
+    /// part of the load, and a caller that just navigated is waiting anyway.
+    async fn run_event_loop_for_load(&self) -> Result<u32, EngineError> {
+        self.run_event_loop_waiting(LOAD_WAIT_BUDGET).await
+    }
+
+    /// The loop both of the above run. `idle_wait` is the *total* time it may
+    /// spend waiting for timers that are not due yet — time spent doing nothing,
+    /// as opposed to the deadline, which bounds the whole call.
+    async fn run_event_loop_waiting(
+        &self,
+        idle_wait: std::time::Duration,
+    ) -> Result<u32, EngineError> {
         const TIMER_CAP: u32 = 10_000;
         const MAX_FETCHES: usize = 200;
         const MAX_ROUNDS: usize = 2_000;
@@ -1029,6 +1060,10 @@ impl BrowserContext {
 
         let mut total_timers = 0u32;
         let mut fetches_done = 0usize;
+        let mut waited = std::time::Duration::ZERO;
+        // Due on the first round: a frame inserted by the document's own scripts
+        // has been waiting since before this call started.
+        let mut last_frame_pump = std::time::Instant::now() - FRAME_PUMP_EVERY;
 
         for _ in 0..MAX_ROUNDS {
             if std::time::Instant::now() >= deadline {
@@ -1063,6 +1098,10 @@ impl BrowserContext {
             let reqs: Vec<Value> = queues["fetch"].as_array().cloned().unwrap_or_default();
             let ws_ops: Vec<Value> = queues["ws"].as_array().cloned().unwrap_or_default();
             let frame_ops: Vec<Value> = queues["frames"].as_array().cloned().unwrap_or_default();
+            // How long until the page's next timer, straight from the same queue
+            // the driver just pumped: -1 for "nothing pending".
+            let next_timer_ms = queues["timers"].as_i64().unwrap_or(-1);
+            self.note_next_timer(next_timer_ms);
 
             // 3. Sockets: apply what the page asked for, then hand it whatever the
             //    sockets have produced since the last round.
@@ -1090,18 +1129,39 @@ impl BrowserContext {
                     .map_err(EngineError::Js)?;
             }
 
-            if busy || !frame_ops.is_empty() {
+            // 6. Frames get a turn on a clock of their own, whether or not the page
+            //    is busy. Gating this on the page being idle starved them outright:
+            //    a page with any repeating timer is never idle, so a widget in an
+            //    iframe never ran — and a widget that never answers is one its own
+            //    watchdog reports as hung. Throttled because a frame pump costs a
+            //    dispatch and an event-loop slice per frame, and paying that on
+            //    every one of MAX_ROUNDS rounds turned one navigation into ten
+            //    seconds.
+            let mut frames_ran = 0;
+            if self.has_frames()
+                && last_frame_pump.elapsed() >= FRAME_PUMP_EVERY
+                && std::time::Instant::now() < deadline
+            {
+                last_frame_pump = std::time::Instant::now();
+                frames_ran = self.pump_frames().await?;
+            }
+
+            if busy || frames_ran > 0 || !frame_ops.is_empty() {
                 continue;
             }
 
-            // Nothing of the page's own is pending. Frames get their turn *here*,
-            // not on every round: a frame pump costs a dispatch and an event-loop
-            // slice per frame, and paying that on each of up to MAX_ROUNDS rounds
-            // turned one navigation into ten seconds. The deadline is re-checked
-            // first — a frame running something long-lived (an anti-bot challenge
-            // is exactly that) must not stretch the caller's budget.
-            if std::time::Instant::now() < deadline && self.pump_frames().await? > 0 {
-                continue;
+            // Nothing is runnable *right now*. If the page's next timer is close,
+            // serve it — that is the load-critical `setTimeout` chain, and waiting
+            // it out is the whole point of real delays. `idle_wait` is a budget for
+            // the call, not per wait, so a page that keeps scheduling short timers
+            // still returns instead of pinning the caller for the full deadline.
+            if next_timer_ms >= 0 {
+                let d = std::time::Duration::from_millis(next_timer_ms as u64);
+                if waited + d <= idle_wait && std::time::Instant::now() + d < deadline {
+                    waited += d;
+                    tokio::time::sleep(d).await;
+                    continue;
+                }
             }
 
             // Idle — but an open socket means "not finished", only "nothing right
@@ -1360,6 +1420,31 @@ impl BrowserContext {
                 _ => {}
             }
         }
+    }
+
+    /// Record when the page's earliest timer comes due (`-1` = none pending), as
+    /// the JS queue just reported it.
+    fn note_next_timer(&self, delay_ms: i64) {
+        let at = (delay_ms >= 0).then(|| {
+            std::time::Instant::now() + std::time::Duration::from_millis(delay_ms as u64)
+        });
+        if let Ok(mut slot) = self.next_timer_at.lock() {
+            *slot = at;
+        }
+    }
+
+    /// How long until this page has a timer to run: `None` when nothing is
+    /// pending, `Some(ZERO)` when one is due now. A driver that wants to keep a
+    /// page moving (the CDP server's pump, an `awaitPromise`) sleeps this long
+    /// instead of polling.
+    pub fn next_timer_in(&self) -> Option<std::time::Duration> {
+        let at = (*self.next_timer_at.lock().ok()?)?;
+        Some(at.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// Whether a timer is due right now — the page has work waiting for a turn.
+    pub fn timer_due(&self) -> bool {
+        self.next_timer_in() == Some(std::time::Duration::ZERO)
     }
 
     /// Drain what every live frame queued (its `parent.postMessage` calls) and
@@ -1777,7 +1862,21 @@ static REQUEST_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 const DRAIN_IO: &str = "JSON.stringify({\
     fetch: typeof __pt_drainFetchQueue === 'function' ? JSON.parse(__pt_drainFetchQueue()) : [],\
     ws: typeof __pt_drainWsQueue === 'function' ? __pt_drainWsQueue() : [],\
-    frames: typeof __pt_drainFrameQueue === 'function' ? __pt_drainFrameQueue() : []})";
+    frames: typeof __pt_drainFrameQueue === 'function' ? __pt_drainFrameQueue() : [],\
+    timers: typeof __pt_nextTimerDelay === 'function' ? __pt_nextTimerDelay() : -1})";
+
+/// How long [`BrowserContext::run_event_loop`] may spend *waiting* for timers
+/// that are not due yet, in total. Timers run in real time, so a page is
+/// routinely "not idle, just not due"; this buys the short chains that finish a
+/// load without letting a 900 ms watchdog interval hold a CDP command open.
+const IDLE_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// The same budget while a document is loading. Deferred-by-a-moment work is
+/// still load work, and the caller is waiting on the navigation regardless.
+const LOAD_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_000);
+
+/// How often frames are given an event-loop turn while the page runs.
+const FRAME_PUMP_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
 
 fn json_num(v: u32) -> Value {
     Value::Number(serde_json::Number::from(v))
@@ -3045,8 +3144,39 @@ mod tests {
         std::env::remove_var("NOKK_EVAL_TIMEOUT_MS");
     }
 
+    /// Delays are real, and the page can prove it: a timer that fires early is a
+    /// tell (`Date.now()` keeps wall time whatever the timer queue does) and it
+    /// breaks every watchdog written against the clock.
     #[tokio::test]
-    async fn event_loop_runs_timers_in_virtual_time_order() {
+    async fn a_timer_waits_out_its_delay_on_the_wall_clock() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.evaluate(
+            "globalThis.t0 = Date.now(); globalThis.measured = -1;
+             setTimeout(() => { measured = Date.now() - t0; }, 120);",
+        )
+        .await
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        ctx.run_event_loop().await.unwrap();
+        let measured = match ctx.evaluate("measured").await.unwrap() {
+            Value::String(s) => s.parse::<i64>().unwrap_or(-1),
+            v => panic!("expected a number, got {v:?}"),
+        };
+        assert!(
+            measured >= 110,
+            "the page must see the delay it asked for, measured {measured}ms"
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(110),
+            "and the loop must actually have spent that time"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_loop_runs_timers_in_due_order() {
         let _serial = serial().await;
         let engine = engine(1, 2);
         let ctx = engine.new_context().await.unwrap();
@@ -3066,8 +3196,8 @@ mod tests {
 
         let ran = ctx.run_event_loop().await.unwrap();
         assert!(ran >= 2, "expected >=2 timer callbacks, got {ran}");
-        // Virtual time orders 50ms before 100ms; the async continuation (a
-        // microtask off the 50ms timer) runs before the 100ms timer.
+        // 50ms comes due before 100ms; the async continuation (a microtask off the
+        // 50ms timer) runs before the 100ms timer.
         assert_eq!(
             ctx.evaluate("log.join(',')").await.unwrap(),
             Value::String("async50,t100".into())
@@ -3726,6 +3856,220 @@ mod tests {
         } else {
             eprintln!("skip strict check: webgl natives inactive (no EGL here)");
         }
+    }
+
+    /// The page surface an anti-bot loader reads before it will talk to its own
+    /// widget. Cloudflare's `api.js` answers the widget's `requestExtraParams`
+    /// with a report built from exactly these, and a `ReferenceError` anywhere in
+    /// it is invisible: it throws inside a `message` listener, where the exception
+    /// is swallowed, and the widget then waits for a reply that never comes. That
+    /// is what `NodeFilter` being undefined cost — every challenge, silently.
+    #[tokio::test]
+    async fn the_document_report_a_loader_builds_has_no_holes() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        let html = r#"<!DOCTYPE html><html><head><title>t</title>
+            <style>b{color:red}</style><link rel="stylesheet" href="/a.css">
+            </head><body>
+              <img src="/i.png"><a href="/x">x</a><a name="anchor">n</a>
+              <form></form><script>var a = 1;</script>
+            </body></html>"#;
+        ctx.load_html("https://example.com/", html).await.unwrap();
+
+        let probe = r#"(() => {
+            const w = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null);
+            const tags = [];
+            for (let n = w.nextNode(); n; n = w.nextNode()) tags.push(n.tagName);
+            // A filter that keeps only <a>, exercised through the object form.
+            const only = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT,
+              { acceptNode: (n) => n.tagName === 'A' ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP });
+            let links = 0;
+            while (only.nextNode()) links++;
+            const it = document.createNodeIterator(document.body, NodeFilter.SHOW_ELEMENT, null);
+            let iterated = 0;
+            while (it.nextNode()) iterated++;
+            return JSON.stringify({
+              tags, links, iterated,
+              scripts: document.scripts.length, forms: document.forms.length,
+              images: document.images.length, docLinks: document.links.length,
+              anchors: document.anchors.length, sheets: document.styleSheets.length,
+              sheetHref: document.styleSheets.map(s => s.href || 'inline'),
+              referrer: typeof document.referrer,
+              show: [NodeFilter.SHOW_ELEMENT, NodeFilter.SHOW_TEXT, NodeFilter.SHOW_COMMENT],
+              walkerType: typeof document.createTreeWalker,
+            });
+        })()"#;
+        let out = match ctx.evaluate(probe).await.unwrap() {
+            Value::String(s) => serde_json::from_str::<Value>(&s).unwrap(),
+            v => panic!("expected the report, got {v:?}"),
+        };
+
+        assert_eq!(
+            out["tags"].as_array().unwrap().len(),
+            5,
+            "the walker visits every element under body: {}",
+            out["tags"]
+        );
+        assert_eq!(out["links"], 2, "a filter that skips is honoured");
+        // A NodeIterator yields its root as well; a TreeWalker starts *at* it and
+        // only moves forward. Hence six against five over the same tree.
+        assert_eq!(out["iterated"], 6, "createNodeIterator walks the same tree");
+        assert_eq!(out["scripts"], 1);
+        assert_eq!(out["forms"], 1);
+        assert_eq!(out["images"], 1);
+        assert_eq!(out["docLinks"], 1, "document.links is <a href>, not every <a>");
+        assert_eq!(out["anchors"], 1, "and document.anchors is <a name>");
+        assert_eq!(out["sheets"], 2, "a <style> and a stylesheet <link>");
+        assert_eq!(out["referrer"], "string", "never undefined — it is read raw");
+        assert_eq!(
+            out["show"],
+            serde_json::json!([1, 4, 128]),
+            "NodeFilter's constants are the spec's, not invented"
+        );
+    }
+
+    /// `blob:` and `data:` are answered from the page's own memory. A blob URL that
+    /// reaches the network client fails with "invalid authority", and a challenge
+    /// that builds its payload as a Blob and fetches it back stalls there.
+    #[tokio::test]
+    async fn blob_and_data_urls_resolve_without_the_network() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.evaluate(
+            r#"globalThis.out = {};
+               (async () => {
+                 const u = URL.createObjectURL(new Blob(['payload'], { type: 'text/plain' }));
+                 out.url = u.slice(0, 5);
+                 const r = await fetch(u);
+                 out.status = r.status;
+                 out.body = await r.text();
+                 out.type = r.headers.get('content-type');
+                 out.data = await (await fetch('data:text/plain;base64,aGk=')).text();
+                 URL.revokeObjectURL(u);
+                 out.afterRevoke = await fetch(u).then(() => 'resolved', () => 'rejected');
+               })();"#,
+        )
+        .await
+        .unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        let out = match ctx.evaluate("JSON.stringify(out)").await.unwrap() {
+            Value::String(s) => serde_json::from_str::<Value>(&s).unwrap(),
+            v => panic!("expected the result, got {v:?}"),
+        };
+        assert_eq!(out["url"], "blob:", "createObjectURL hands out a blob: URL");
+        assert_eq!(out["status"], 200);
+        assert_eq!(out["body"], "payload", "and it leads back to the object");
+        assert_eq!(out["type"], "text/plain");
+        assert_eq!(out["data"], "hi", "data: URLs decode base64 too");
+        assert_eq!(
+            out["afterRevoke"], "rejected",
+            "a revoked URL stops resolving, as it does in a browser"
+        );
+    }
+
+    /// Serves the two documents the watchdog regression needs: a page that hides
+    /// an iframe in a closed shadow root and pings it on an interval, and the
+    /// frame that answers. This is the shape of a Turnstile widget, down to the
+    /// detail that broke it — the iframe is put inside a *detached* host, and only
+    /// the host is ever inserted into the document.
+    async fn frame_ping_server() -> String {
+        const PARENT: &str = r#"<html><body><script>
+            window.__s = { seq: 0, ack: 0 };
+            addEventListener('message', e => { if (e.data && e.data.ack !== undefined) __s.ack = e.data.ack; });
+            const host = document.createElement('div');
+            const sr = host.attachShadow({ mode: 'closed' });
+            const f = document.createElement('iframe');
+            f.src = '/frame';
+            sr.appendChild(f);
+            document.body.appendChild(host);
+            setInterval(() => {
+              __s.seq++;
+              try { f.contentWindow.postMessage({ ping: __s.seq }, '*'); } catch (e) { __s.err = String(e); }
+            }, 50);
+            </script></body></html>"#;
+        const FRAME: &str = r#"<html><body><script>
+            addEventListener('message', e => {
+              if (e.data && e.data.ping !== undefined) parent.postMessage({ ack: e.data.ping }, '*');
+            });
+            </script></body></html>"#;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let body = if String::from_utf8_lossy(&buf[..n]).contains("GET /frame") {
+                        FRAME
+                    } else {
+                        PARENT
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://127.0.0.1:{}/", addr.port())
+    }
+
+    /// The failure this reproduces cost nothing less than every Cloudflare
+    /// challenge: the widget's iframe never became a browsing context (it was
+    /// inserted as part of a subtree, so nothing connected it), and the page's own
+    /// watchdog interval kept the event loop from ever looking at frames. From
+    /// outside, a widget that answers nothing — which is exactly what Cloudflare's
+    /// watchdog reports, before reloading the widget forever.
+    #[tokio::test]
+    async fn a_frame_answers_the_page_that_keeps_pinging_it() {
+        let _serial = serial().await;
+        let url = frame_ping_server().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 4,
+                max_heap_mb: None,
+            },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&url).await.unwrap();
+        for _ in 0..4 {
+            ctx.run_event_loop().await.unwrap();
+        }
+
+        assert!(
+            !ctx.frame_list().is_empty(),
+            "an iframe inserted inside a subtree — here a closed shadow root — is \
+             still a browsing context"
+        );
+        let state = match ctx.evaluate("JSON.stringify(__s)").await.unwrap() {
+            Value::String(s) => serde_json::from_str::<Value>(&s).unwrap_or_default(),
+            v => panic!("expected the state object, got {v:?}"),
+        };
+        let (seq, ack) = (
+            state["seq"].as_i64().unwrap_or(0),
+            state["ack"].as_i64().unwrap_or(0),
+        );
+        assert!(seq > 0, "the watchdog interval must tick, saw {state}");
+        assert!(
+            ack > 0,
+            "and the frame must answer it — {state}, error {:?}",
+            state["err"]
+        );
+        assert!(
+            seq - ack <= 5,
+            "the answer must keep up with the pings, not fall behind: {state}"
+        );
     }
 
     /// A one-shot HTTP server that hands out the cookie flavours that matter:

@@ -113,8 +113,41 @@ would flag today. Closing them is the top priority — coherence is the whole po
   `timing`/`navigation` milestones, Chrome's `memory`, and the `getEntries*`/`mark`/
   `measure` surface; `requestAnimationFrame` now passes a real high-res timestamp.
   Regression-tested (verified to fail on `timeOrigin === 0`).
-  (Collapsed virtual-time timers still don't advance the shared clock — a page that times
-  its own `setTimeout` sees it fire early; that is inherent to the virtual-time design.)
+- ✅ **Timers wait out their real delays.** They used to collapse: a virtual clock jumped
+  to each due time, so `setTimeout(fn, 4000)` returned instantly while `Date.now()` kept
+  wall time. Measured on the old build: `setTimeout(…, 500)` fired in **0 ms**,
+  `setInterval(…, 900)` ticked **150 times in 2 s**, `requestAnimationFrame` ran at
+  ~4000 fps. Any page that times itself caught us in one line, and watchdogs simply broke
+  — Cloudflare's Turnstile gives its widget 46 ticks of a 900 ms interval to answer, and
+  we burned all 46 in a millisecond, so `api.js` declared the widget hung (error
+  **300030**), reloaded it as `crashed_retry`, and looped: 48 367 errors and 364 iframes
+  in six seconds. Now the queue is due-time based (`__pt_runNextTimer` runs only what is
+  due, `__pt_nextTimerDelay` tells the driver how long to sleep), with Chrome's
+  nested-timer clamp. `NOKK_FAST_TIMERS=1` restores collapsing for bulk scraping of pages
+  that don't watch the clock. Regression-tested.
+- ✅ **A frame gets turns while the page is busy, and connects with its subtree.** Two
+  defects that only showed together. Frames were pumped only once the page went idle, and
+  a page with any `setInterval` never goes idle — so a widget in an iframe never ran. And
+  a frame only became a browsing context if the `<iframe>` itself was the node inserted:
+  Turnstile builds its iframe inside a *detached* closed shadow root and inserts the host,
+  so the frame stayed inert, `contentWindow` unreachable, forever. Frames now pump on a
+  clock of their own (20 ms) and every frame in an inserted subtree connects (shadow trees
+  included). The queued frame ops are capped too — the same widget once drove RSS past
+  **5 GB** and the process was killed. Regression-tested.
+- ✅ **Tree traversal, the document's collections, and `blob:` URLs.** With the above fixed,
+  the Turnstile widget still said nothing — and the reason was a single missing global.
+  Its loader answers the widget's `requestExtraParams` with a page report that walks the
+  document through `createTreeWalker`; `NodeFilter is not defined` threw *inside a `message`
+  listener*, where the exception is swallowed by design, so the reply was never sent and the
+  widget waited forever, answering heartbeats and explaining nothing. Added `NodeFilter`,
+  `TreeWalker`, `NodeIterator`, `createTreeWalker`/`createNodeIterator`, the document
+  collections the same report reads (`scripts`, `forms`, `images`, `links`, `anchors`,
+  `embeds`, `styleSheets`) and a string `document.referrer`. Behind that came the next one:
+  `URL.createObjectURL` handed out a fabricated URL with no registry, so `fetch(blobUrl)`
+  reached the network client and failed with *invalid authority* — and the challenge builds
+  its payload as a Blob and reads it back. `blob:` and `data:` are now answered from the
+  page's own memory. The challenge runs end to end after this: it takes its parameters,
+  starts its VM and opens its POST to the challenge platform. Regression-tested.
 
 ## Architecture: move detectable surfaces to native (Rust)
 
@@ -180,7 +213,7 @@ Move to native (Rust):
   [docs/rendering.md](docs/rendering.md).
 
 Keep in JS (the advantage is real):
-- Environment assembly (navigator/window/screen/timers), the virtual-time event loop,
+- Environment assembly (navigator/window/screen/timers), the event loop,
   and the fetch/XHR queue orchestration — control and iteration speed outweigh a native
   rewrite, and none of it is a `[native code]` tell in the same way.
 
@@ -356,7 +389,7 @@ value-to-effort:
   Remaining: `npm publish` (manual first, then a tag-triggered publish workflow with npm
   provenance/OIDC), and macOS/Windows binaries for those platforms (Linux x64 only today).
 - 🟡 **PyPI** (`pip`) — **published**: [`pip install nokk`](https://pypi.org/project/nokk/)
-  works (name claimed, `0.1.18a1` live). A thin launcher wheel in [`python/`](python/) bundles
+  works (name claimed, seven alphas published, `0.1.25a1` live). A thin launcher wheel in [`python/`](python/) bundles
   the binary (the `ruff`/`uv` pattern), built with `maturin` (`bindings = "bin"`,
   `manifest-path` → `crates/cli`) so each wheel embeds the `nokk` binary — no toolchain, no
   BoringSSL build, no Docker. `nokk.launch(…)` / async `nokk.launch_async(…)` spawn the CDP

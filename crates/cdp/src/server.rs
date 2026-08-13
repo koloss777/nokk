@@ -62,6 +62,16 @@ fn next_id(prefix: &str) -> String {
     format!("{prefix}{:X}", IDS.fetch_add(1, Ordering::Relaxed))
 }
 
+/// How long an `awaitPromise` evaluate will drive the page waiting for its
+/// promise. A promise that never settles is the caller's bug, but hanging a
+/// worker on it forever is ours; Puppeteer's own protocol timeout is longer, so
+/// the client sees a result rather than a dropped command.
+const AWAIT_PROMISE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Longest nap between checks while waiting for that promise — short enough that
+/// one settled by the network is noticed promptly.
+const AWAIT_PROMISE_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// CDP server configuration.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -215,6 +225,10 @@ struct Target {
     /// sockets: the tick only pumps pages holding one, and holding one requires
     /// a pump.
     ran_js: Arc<AtomicBool>,
+    /// Whether a pump spawned by the tick is still running. A turn of the loop can
+    /// now wait out a timer, so it may outlive the tick that started it; without
+    /// this every tick would pile another loop onto the same page.
+    pumping: Arc<AtomicBool>,
     /// The loader id of the navigation in flight. A client ties the document
     /// request to the navigation by *this* id, not by the frame's — Playwright's
     /// `page.goto()` waits for a response whose `loaderId` matches the one
@@ -423,13 +437,21 @@ impl Conn {
     /// loop; pages with neither cost one atomic read.
     async fn pump_live_pages(&mut self, tx: &UnboundedSender<Message>) {
         for t in &mut self.targets {
-            if t.ran_js.swap(false, Ordering::Relaxed)
+            // A page whose timer has come due is doing something, even with no
+            // socket and no frame: delays are real now, so an interval only ticks
+            // while someone drives the loop. Asking the context costs an atomic
+            // read of a deadline it already knows, so an idle page still costs
+            // nothing, and a page with a slow timer is woken when it is due rather
+            // than twenty times a second.
+            let wants_pump = t.ran_js.swap(false, Ordering::Relaxed)
+                || t.ctx.timer_due()
                 || t.ctx.has_frames()
-                || t.ctx.has_open_sockets().await
-            {
-                let ctx = t.ctx.clone();
+                || t.ctx.has_open_sockets().await;
+            if wants_pump && !t.pumping.swap(true, Ordering::Relaxed) {
+                let (ctx, pumping) = (t.ctx.clone(), t.pumping.clone());
                 tokio::spawn(async move {
                     let _ = ctx.run_event_loop().await;
+                    pumping.store(false, Ordering::Relaxed);
                 });
             }
 
@@ -525,6 +547,7 @@ impl Conn {
                     init_scripts: Vec::new(),
                     browser_context_id,
                     ran_js: Arc::new(AtomicBool::new(false)),
+                    pumping: Arc::new(AtomicBool::new(false)),
                     loader_id: Arc::new(std::sync::Mutex::new(String::new())),
                     extra_sessions: Vec::new(),
                     known_frames: std::collections::HashSet::new(),
@@ -1582,18 +1605,41 @@ async fn remote_eval(
         // the same context. A shared global would be clobbered mid-flight (two
         // overlapping evaluates racing on it), so each call gets a unique slot.
         let slot = format!("__cdp_{}", IDS.fetch_add(1, Ordering::Relaxed));
-        let setup = format!("globalThis.{slot} = (0, eval)({src});");
+        let setup = format!(
+            "globalThis.{slot} = {{ done: false, v: undefined }}; \
+             Promise.resolve((0, eval)({src})).then(\
+               v => {{ globalThis.{slot}.v = v; globalThis.{slot}.done = true; }}, \
+               e => {{ globalThis.{slot}.v = String(e); globalThis.{slot}.done = true; }});"
+        );
         if ctx.evaluate(&setup).await.is_err() {
             return json!({ "type": "undefined" });
         }
-        let _ = ctx
-            .evaluate(&format!(
-                "Promise.resolve(globalThis.{slot}).then(v => {{ globalThis.{slot} = v; }}, e => {{ globalThis.{slot} = String(e); }});"
-            ))
-            .await;
-        let _ = ctx.run_event_loop().await;
+        // Drive the loop until the promise settles. One turn used to be enough
+        // because timers collapsed their delays; now `await new Promise(r =>
+        // setTimeout(r, 1000))` — which is what every `waitForTimeout` compiles
+        // down to — really does take a second, and reading the slot after a single
+        // turn would hand the caller back an unsettled promise.
+        let deadline = std::time::Instant::now() + AWAIT_PROMISE_TIMEOUT;
+        loop {
+            let _ = ctx.run_event_loop().await;
+            let settled = matches!(
+                ctx.evaluate(&format!("String(globalThis.{slot}.done)")).await,
+                Ok(Value::String(ref s)) if s == "true"
+            );
+            if settled || std::time::Instant::now() >= deadline {
+                break;
+            }
+            // Nothing runnable this instant: sleep until the page's next timer is
+            // due (capped, so a promise settled by I/O is not missed for long).
+            let nap = ctx
+                .next_timer_in()
+                .unwrap_or(AWAIT_PROMISE_POLL)
+                .clamp(std::time::Duration::from_millis(1), AWAIT_PROMISE_POLL);
+            tokio::time::sleep(nap).await;
+        }
         format!(
-            "(() => {{ const v = globalThis.{slot}; delete globalThis.{slot}; return JSON.stringify(__pt_wrap(v, {by})); }})()"
+            "(() => {{ const s = globalThis.{slot}; delete globalThis.{slot}; \
+               return JSON.stringify(__pt_wrap(s.done ? s.v : undefined, {by})); }})()"
         )
     } else {
         format!(

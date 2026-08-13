@@ -16,6 +16,17 @@
   const VOID = new Set(['area','base','br','col','embed','hr','img','input',
     'link','meta','param','source','track','wbr']);
 
+  // Every `<iframe>` in a subtree, shadow trees included. Frames connect and
+  // disconnect as part of whatever tree they are inserted into or removed with,
+  // and a widget hands the DOM a finished tree rather than a bare iframe.
+  function __eachFrame(node, fn) {
+    if (!node) return;
+    if (node.__ptLocal === 'iframe') fn(node);
+    const kids = node.childNodes;
+    if (kids) for (const c of kids.slice()) __eachFrame(c, fn);
+    if (node.__ptShadow) __eachFrame(node.__ptShadow, fn);
+  }
+
   // ---- Node -----------------------------------------------------------------
   class Node {
     constructor(type) {
@@ -68,8 +79,13 @@
       child.parentNode = this;
       __markDirty();
       __mutation(__childListRecord(this, [child], [], child.previousSibling, child.nextSibling));
-      // A frame only becomes a browsing context once it is in the document.
-      if (child.__ptConnectFrame && child.isConnected) child.__ptConnectFrame();
+      // A frame only becomes a browsing context once it is in the document — and
+      // the frame is rarely the node being inserted. A widget builds its tree
+      // detached and inserts the root of it: Turnstile puts its iframe in a closed
+      // shadow root and then connects the host, so checking only `child` left the
+      // iframe sitting there, connected and inert, and the widget waiting forever
+      // for a frame that never opened.
+      if (child.isConnected) __eachFrame(child, (f) => f.__ptConnectFrame());
       return child;
     }
     removeChild(child) {
@@ -80,8 +96,9 @@
       __mutation(__childListRecord(this, [], [child], prev, next));
       // A removed frame is a closed browsing context. Without this its V8 context
       // outlives the element forever — a widget that replaces its iframe on a
-      // retry (Turnstile does, repeatedly) would pile them up until the cap.
-      if (child.__ptFrameId) __ptDisconnectFrame(child);
+      // retry (Turnstile does, repeatedly) would pile them up until the cap. The
+      // whole subtree goes, for the same reason it connects as a whole.
+      __eachFrame(child, (f) => { if (f.__ptFrameId) __ptDisconnectFrame(f); });
       return child;
     }
     replaceChild(nw, old) { this.insertBefore(nw, old); return this.removeChild(old); }
@@ -484,6 +501,33 @@
       if (!t) { t = this.createElement('title'); (this.head || this.documentElement || this).appendChild(t); }
       t.textContent = String(v);
     }
+    // The document's live element collections. Missing, these are not a cosmetic
+    // gap: Turnstile's loader answers its widget's `requestExtraParams` with a
+    // report that reads `document.scripts.length`, and a `TypeError` there kills
+    // the reply — which the widget waits for forever, silently, because a listener
+    // that throws is swallowed by the event dispatch. `referrer` is read on the
+    // same line and must be a string ('' for a direct load), not `undefined`.
+    get scripts() { return this.getElementsByTagName('script'); }
+    get forms() { return this.getElementsByTagName('form'); }
+    get images() { return this.getElementsByTagName('img'); }
+    get embeds() { return this.getElementsByTagName('embed'); }
+    get plugins() { return this.getElementsByTagName('embed'); }
+    // `links` is `<a>`/`<area>` *with an href*, and `anchors` is `<a>` with a name.
+    get links() {
+      return this.getElementsByTagName('a').concat(this.getElementsByTagName('area'))
+        .filter(e => e.hasAttribute('href'));
+    }
+    get anchors() { return this.getElementsByTagName('a').filter(e => e.hasAttribute('name')); }
+    get styleSheets() {
+      return this.getElementsByTagName('style')
+        .concat(this.getElementsByTagName('link').filter(e => /stylesheet/i.test(e.getAttribute('rel') || '')))
+        .map(owner => ({ ownerNode: owner, href: owner.getAttribute('href') || null,
+                         type: 'text/css', disabled: false, media: owner.getAttribute('media') || '',
+                         title: owner.getAttribute('title') || null, cssRules: [], rules: [] }));
+    }
+    get referrer() { return this.__ptReferrer || ''; }
+    set referrer(v) { this.__ptReferrer = String(v); }
+
     get cookie() { return this.__ptCookie; }
     set cookie(v) {
       const pair = String(v).split(';')[0];
@@ -1271,6 +1315,17 @@
   const __frameOps = [];
   let __nextFrameId = 1;
 
+  // Every op costs an eval on the other side, so an unbounded queue is a way for
+  // a page to spend the engine's memory: a widget that posts into its frame from
+  // an interval, faster than the ops drain, once took RSS past five gigabytes.
+  // Beyond the cap the newest op is dropped — a lost message degrades one widget,
+  // where the alternative loses the process.
+  const __MAX_FRAME_OPS = 4096;
+  const __pushFrameOp = (op, into) => {
+    const q = into || __frameOps;
+    if (q.length < __MAX_FRAME_OPS) q.push(op);
+  };
+
   globalThis.__pt_drainFrameQueue = () => __frameOps.splice(0);
 
   // Tear down a frame whose element left the document, and let the element be
@@ -1291,7 +1346,7 @@
   const __frameWindow = (id, st) => ({
     postMessage: (data, targetOrigin) => {
       const op = { op: 'post', id, data: JSON.stringify(data === undefined ? null : data), toParent: false, targetOrigin: String(targetOrigin || '*') };
-      if (st.ready) __frameOps.push(op); else st.pending.push(op);
+      __pushFrameOp(op, st.ready ? __frameOps : st.pending);
     },
     get closed() { return false; },
     get frames() { return st.win; },
@@ -1308,7 +1363,7 @@
     if (!st) return;
     st.ready = true;
     st.sameOrigin = !!(globalThis.location && origin === location.origin);
-    for (const op of st.pending.splice(0)) __frameOps.push(op);
+    for (const op of st.pending.splice(0)) __pushFrameOp(op);
     const ev = { type: 'load', target: st.el, currentTarget: st.el, isTrusted: true };
     try { if (typeof st.el.onload === 'function') st.el.onload(ev); } catch (e) {}
     try { st.el.dispatchEvent && st.el.dispatchEvent(ev); } catch (e) {}
@@ -1342,7 +1397,7 @@
     globalThis.__pt_frameId = id;
     const up = {
       postMessage: (data) => {
-        __frameOps.push({ op: 'post', data: JSON.stringify(data === undefined ? null : data), toParent: true });
+        __pushFrameOp({ op: 'post', data: JSON.stringify(data === undefined ? null : data), toParent: true });
       },
       get closed() { return false; },
       get frames() { return up; },
@@ -1355,6 +1410,147 @@
       Object.defineProperty(globalThis, 'top', { value: up, configurable: true });
     } catch (e) {}
   };
+
+  // --- tree traversal ------------------------------------------------------
+  // `NodeFilter` + `createTreeWalker`/`createNodeIterator`. Absent, this cost us
+  // every Cloudflare challenge: the Turnstile loader answers its widget's
+  // `requestExtraParams` with a page report that walks the document through a
+  // TreeWalker, so `NodeFilter is not defined` threw inside a `message` listener
+  // — where the exception is swallowed by design — and the reply the widget waits
+  // for was never sent. It sat there answering heartbeats, forever, saying
+  // nothing about why.
+  const FILTER_ACCEPT = 1, FILTER_REJECT = 2, FILTER_SKIP = 3;
+  const NodeFilter = {
+    FILTER_ACCEPT, FILTER_REJECT, FILTER_SKIP,
+    SHOW_ALL: 0xFFFFFFFF, SHOW_ELEMENT: 0x1, SHOW_ATTRIBUTE: 0x2, SHOW_TEXT: 0x4,
+    SHOW_CDATA_SECTION: 0x8, SHOW_ENTITY_REFERENCE: 0x10, SHOW_ENTITY: 0x20,
+    SHOW_PROCESSING_INSTRUCTION: 0x40, SHOW_COMMENT: 0x80, SHOW_DOCUMENT: 0x100,
+    SHOW_DOCUMENT_TYPE: 0x200, SHOW_DOCUMENT_FRAGMENT: 0x400, SHOW_NOTATION: 0x800,
+  };
+
+  // The filter verdict for one node: the `whatToShow` bitmask first (a node it
+  // hides is skipped without ever reaching the callback), then the caller's
+  // filter, which may be a function or an object with `acceptNode`.
+  const __ptVerdict = (walker, node) => {
+    if (!((1 << (node.nodeType - 1)) & walker.__ptShow)) return FILTER_SKIP;
+    const f = walker.__ptFilter;
+    if (!f) return FILTER_ACCEPT;
+    const v = typeof f === 'function' ? f(node) : (f.acceptNode ? f.acceptNode(node) : FILTER_ACCEPT);
+    return v === undefined || v === null ? FILTER_ACCEPT : v;
+  };
+
+  // The node after `node` in document order, without leaving `root`.
+  const __ptFollowing = (node, root, skipChildren) => {
+    if (!skipChildren && node.childNodes && node.childNodes.length) return node.childNodes[0];
+    for (let n = node; n && n !== root; n = n.parentNode) {
+      if (n.nextSibling) return n.nextSibling;
+    }
+    return null;
+  };
+
+  class TreeWalker {
+    constructor(root, whatToShow, filter) {
+      this.__ptRoot = root;
+      this.__ptShow = whatToShow === undefined ? 0xFFFFFFFF : whatToShow >>> 0;
+      this.__ptFilter = filter || null;
+      this.__ptCur = root;
+    }
+    get root() { return this.__ptRoot; }
+    get whatToShow() { return this.__ptShow; }
+    get filter() { return this.__ptFilter; }
+    get currentNode() { return this.__ptCur; }
+    set currentNode(n) { this.__ptCur = n; }
+
+    nextNode() {
+      let node = this.__ptCur, skipKids = false;
+      for (;;) {
+        node = __ptFollowing(node, this.__ptRoot, skipKids);
+        if (!node) return null;
+        const v = __ptVerdict(this, node);
+        if (v === FILTER_ACCEPT) { this.__ptCur = node; return node; }
+        skipKids = v === FILTER_REJECT;
+      }
+    }
+    previousNode() {
+      let node = this.__ptCur;
+      while (node && node !== this.__ptRoot) {
+        let prev = node.previousSibling;
+        if (prev) {
+          while (prev.childNodes && prev.childNodes.length) prev = prev.childNodes[prev.childNodes.length - 1];
+          node = prev;
+        } else {
+          node = node.parentNode;
+          if (!node || node === this.__ptRoot) return null;
+        }
+        if (__ptVerdict(this, node) === FILTER_ACCEPT) { this.__ptCur = node; return node; }
+      }
+      return null;
+    }
+    parentNode() {
+      for (let n = this.__ptCur; n && n !== this.__ptRoot; ) {
+        n = n.parentNode;
+        if (!n) return null;
+        if (__ptVerdict(this, n) === FILTER_ACCEPT) { this.__ptCur = n; return n; }
+        if (n === this.__ptRoot) break;
+      }
+      return null;
+    }
+    firstChild() { return this.__ptChild(0); }
+    lastChild() { return this.__ptChild(-1); }
+    __ptChild(from) {
+      const kids = this.__ptCur.childNodes || [];
+      const list = from === 0 ? kids : kids.slice().reverse();
+      for (const c of list) {
+        if (__ptVerdict(this, c) === FILTER_ACCEPT) { this.__ptCur = c; return c; }
+      }
+      return null;
+    }
+    nextSibling() { return this.__ptSibling('nextSibling'); }
+    previousSibling() { return this.__ptSibling('previousSibling'); }
+    __ptSibling(dir) {
+      for (let n = this.__ptCur[dir]; n; n = n[dir]) {
+        if (__ptVerdict(this, n) === FILTER_ACCEPT) { this.__ptCur = n; return n; }
+      }
+      return null;
+    }
+  }
+
+  class NodeIterator {
+    constructor(root, whatToShow, filter) {
+      this.__ptRoot = root;
+      this.__ptShow = whatToShow === undefined ? 0xFFFFFFFF : whatToShow >>> 0;
+      this.__ptFilter = filter || null;
+      this.__ptRef = root;
+      this.__ptBefore = true;
+    }
+    get root() { return this.__ptRoot; }
+    get whatToShow() { return this.__ptShow; }
+    get filter() { return this.__ptFilter; }
+    get referenceNode() { return this.__ptRef; }
+    get pointerBeforeReferenceNode() { return this.__ptBefore; }
+    nextNode() {
+      let node = this.__ptRef;
+      if (this.__ptBefore) { this.__ptBefore = false; }
+      else { node = __ptFollowing(node, this.__ptRoot, false); }
+      while (node) {
+        if (__ptVerdict(this, node) === FILTER_ACCEPT) { this.__ptRef = node; return node; }
+        node = __ptFollowing(node, this.__ptRoot, false);
+      }
+      return null;
+    }
+    previousNode() { return null; }
+    detach() {}
+  }
+
+  Document.prototype.createTreeWalker = function (root, whatToShow, filter) {
+    return new TreeWalker(root || this, whatToShow, filter);
+  };
+  Document.prototype.createNodeIterator = function (root, whatToShow, filter) {
+    return new NodeIterator(root || this, whatToShow, filter);
+  };
+  globalThis.NodeFilter = NodeFilter;
+  globalThis.TreeWalker = TreeWalker;
+  globalThis.NodeIterator = NodeIterator;
 
   // Assigned here, after the declarations (a class stays in its temporal dead
   // zone until then). These override the stealth layer's inert stubs: with a

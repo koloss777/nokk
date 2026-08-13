@@ -527,7 +527,21 @@ pub fn bootstrap_script(profile: &StealthProfile) -> String {
         .replace("__TZ_NAME_STD__", &quoted(&profile.timezone_name_std))
         .replace("__TZ_NAME_DST__", &quoted(&profile.timezone_name_dst));
 
-    format!("{env}\n{intl}\n{TIMERS_TEMPLATE}\n{PERFORMANCE_TEMPLATE}\n{CRYPTO_TEMPLATE}\n{FETCH_TEMPLATE}")
+    let timers = TIMERS_TEMPLATE.replace("__FAST_TIMERS__", if fast_timers() { "true" } else { "false" });
+
+    format!("{env}\n{intl}\n{timers}\n{PERFORMANCE_TEMPLATE}\n{CRYPTO_TEMPLATE}\n{FETCH_TEMPLATE}")
+}
+
+/// Whether timers collapse their delays instead of waiting them out
+/// (`NOKK_FAST_TIMERS`). Off by default: a page that can measure a `setTimeout`
+/// against `Date.now()` — every anti-bot watchdog does — must see the delay it
+/// asked for. Worth turning on only for bulk scraping of pages that merely
+/// *use* timers rather than time them, where collapsing the waits is the whole
+/// point.
+fn fast_timers() -> bool {
+    std::env::var("NOKK_FAST_TIMERS")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
 }
 
 /// The environment template. Placeholders (`__UA__`, …) are substituted by
@@ -756,21 +770,39 @@ pub fn fingerprint_script(profile: &StealthProfile) -> String {
 
 /// Timer / event-loop APIs. A bare V8 isolate has no `setTimeout` — this defines
 /// `setTimeout`/`setInterval`/`clearTimeout`/`clearInterval`/`queueMicrotask`/
-/// `requestAnimationFrame` plus `performance.now()`, backed by a virtual-time
-/// queue. `__pt_runNextTimer` (called from Rust) runs the earliest pending timer
-/// and advances the virtual clock to it, collapsing real delays so a page that
-/// does `setTimeout(fn, 4000)` completes instantly rather than blocking a worker.
-/// `setInterval` reschedules itself, so the Rust driver caps total callbacks.
+/// `requestAnimationFrame`, backed by a due-time queue the Rust driver pulls
+/// from: `__pt_runNextTimer` runs the earliest timer *that is due*, and
+/// `__pt_nextTimerDelay` says how long until the next one is, so the driver can
+/// wait exactly that long instead of guessing.
+///
+/// Delays are real. They used to collapse — a virtual clock jumped straight to
+/// each due time, so `setTimeout(fn, 4000)` returned instantly and a worker was
+/// never blocked. That is indefensible against anything that *times* the page:
+/// `Date.now()` kept running at wall speed, so a 500 ms timer measured 0 ms, and
+/// Cloudflare's watchdog (a 900 ms interval that gives a widget 46 ticks to
+/// answer) burned its whole patience in a millisecond and declared the widget
+/// hung, forever. `NOKK_FAST_TIMERS` brings the old behaviour back for bulk
+/// scraping, where nothing is watching the clock.
 const TIMERS_TEMPLATE: &str = r#"(() => {
+  const FAST = __FAST_TIMERS__;
   let seq = 1;
-  let clock = 0;
-  const q = new Map(); // id -> {fn, delay, interval, due, cancelled, id}
+  let virt = 0; // fast mode only: the clock that jumps to each due time
+  const q = new Map(); // id -> {fn, delay, interval, due, cancelled, id, depth}
+  const clock = () => (FAST ? virt : Date.now());
+
+  // Chrome clamps a timer nested deeper than five levels to 4 ms. Without the
+  // clamp a `setTimeout(f, 0)` chain spins the driver at CPU speed — which is
+  // both a tell and a way to starve every other context on the worker.
+  let depth = 0;
 
   const add = (fn, delay, interval, args) => {
     if (typeof fn !== 'function') return 0;
+    let d = Number(delay);
+    if (!(d > 0)) d = 0; // negative, NaN and undefined all mean "as soon as possible"
+    if (depth > 5 && d < 4) d = 4;
     const id = seq++;
-    q.set(id, { fn: () => fn.apply(globalThis, args), delay: +delay || 0,
-                interval, due: clock + (+delay || 0), cancelled: false, id });
+    q.set(id, { fn: () => fn.apply(globalThis, args), delay: d, interval,
+                due: clock() + d, cancelled: false, id, depth: depth + 1 });
     return id;
   };
   globalThis.setTimeout = (fn, delay, ...args) => add(fn, delay, false, args);
@@ -779,7 +811,7 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   globalThis.clearInterval = globalThis.clearTimeout;
   globalThis.queueMicrotask = (fn) => { Promise.resolve().then(fn); };
   globalThis.requestAnimationFrame = (fn) =>
-    add(() => fn(globalThis.performance ? globalThis.performance.now() : clock), 16, false, []);
+    add(() => fn(globalThis.performance ? globalThis.performance.now() : clock()), 16, false, []);
   globalThis.cancelAnimationFrame = globalThis.clearTimeout;
   globalThis.setImmediate = (fn, ...args) => add(fn, 0, false, args);
   globalThis.clearImmediate = globalThis.clearTimeout;
@@ -787,20 +819,44 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   // `performance` is defined by PERFORMANCE_TEMPLATE (wall-clock coherent); a
   // frame callback receives the same high-res timestamp a real browser passes.
 
-  // Run the single earliest pending timer, advancing the virtual clock to its
-  // due time. Returns 1 if a timer ran, 0 if the queue is empty. Microtasks
-  // scheduled by the callback drain automatically when this returns to Rust.
-  globalThis.__pt_runNextTimer = () => {
+  const earliest = () => {
     let best = null;
     for (const t of q.values()) {
       if (t.cancelled) continue;
       if (!best || t.due < best.due || (t.due === best.due && t.id < best.id)) best = t;
     }
+    return best;
+  };
+
+  // Run the single earliest *due* timer. Returns 1 if one ran, 0 if the queue is
+  // empty or nothing is due yet — either way the driver stops pumping and asks
+  // `__pt_nextTimerDelay` what to do next. Microtasks scheduled by the callback
+  // drain automatically when this returns to Rust.
+  globalThis.__pt_runNextTimer = () => {
+    const best = earliest();
     if (!best) return 0;
-    clock = Math.max(clock, best.due);
-    if (best.interval) best.due = clock + best.delay; else q.delete(best.id);
+    const now = clock();
+    if (best.due > now) {
+      if (!FAST) return 0;
+      virt = best.due; // fast mode: skip the wait rather than serve it
+    }
+    // An interval that fell behind (a long callback, a busy worker) schedules
+    // its next tick from now, so it never fires a burst to catch up.
+    if (best.interval) best.due = Math.max(clock(), best.due) + best.delay;
+    else q.delete(best.id);
+    const outer = depth;
+    depth = best.depth;
     try { best.fn(); } catch (e) { /* timer callback threw */ }
+    finally { depth = outer; }
     return 1;
+  };
+
+  // Milliseconds until the earliest pending timer: 0 = due now, -1 = nothing
+  // pending. This is what lets the driver sleep for exactly as long as the page
+  // asked for instead of polling.
+  globalThis.__pt_nextTimerDelay = () => {
+    const best = earliest();
+    return best ? Math.max(0, best.due - clock()) : -1;
   };
   globalThis.__pt_pendingTimers = () => q.size;
 })();"#;
@@ -1069,8 +1125,42 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     return out;
   };
 
+  // `blob:` and `data:` never reach the network — they are answered from the
+  // page's own memory. A blob URL handed to the network client fails with
+  // "invalid authority", which is how Turnstile's challenge stalls: its VM builds
+  // its payload as a Blob, takes an object URL, and fetches it back. The registry
+  // lives on `URL.createObjectURL` (see the URL shim); this reads it.
+  const localResponse = (url) => {
+    const s = String(url);
+    if (s.slice(0, 5) === 'blob:') {
+      const b = globalThis.__pt_blobs && globalThis.__pt_blobs.get(s);
+      if (!b) return null;
+      const body = typeof b.text === 'function' ? String(b) : String(b);
+      return { body, type: b.type || '' };
+    }
+    if (s.slice(0, 5) === 'data:') {
+      const comma = s.indexOf(',');
+      if (comma < 0) return null;
+      const meta = s.slice(5, comma), payload = s.slice(comma + 1);
+      try {
+        return { body: /;base64/i.test(meta) ? globalThis.atob(payload) : decodeURIComponent(payload),
+                 type: meta.split(';')[0] || 'text/plain' };
+      } catch (e) { return null; }
+    }
+    return null;
+  };
+
   globalThis.fetch = (url, opts) => {
     opts = opts || {};
+    const local = localResponse(url);
+    if (local) {
+      const id = fid++;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject, url: String(url) });
+        globalThis.queueMicrotask(() => globalThis.__pt_fetchResolve(
+          id, 200, 'OK', { 'content-type': local.type }, local.body, String(url)));
+      });
+    }
     const id = fid++;
     const req = {
       id, url: String(url),
@@ -2866,6 +2956,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   }
   if (!globalThis.URL || !globalThis.URL.prototype || !('searchParams' in (globalThis.URL.prototype || {}))) {
     const parse = (s) => { const m = /^([a-zA-Z][a-zA-Z0-9+.-]*:)?([/][/]([^/?#]*))?([^?#]*)([?][^#]*)?([#].*)?$/.exec(String(s)) || []; return { protocol: m[1] || '', authority: m[3] || '', path: m[4] || '', search: m[5] || '', hash: m[6] || '' }; };
+    let blobSeq = 1;
     globalThis.URL = class URL {
       constructor(url, base) {
         let p = parse(url);
@@ -2881,8 +2972,16 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       get href() { const s = this.searchParams.toString(); return this.protocol + '//' + this.host + this.pathname + (s ? '?' + s : this.search) + this.hash; }
       set href(v) {}
       toString() { return this.href; }
-      static createObjectURL() { return 'blob:' + (globalThis.location ? location.origin : 'null') + '/' + (SEED.toString(36)); }
-      static revokeObjectURL() {}
+      // The URL has to lead back to the object: a page that stores a Blob and
+      // fetches its URL (or runs it as a Worker) expects its own bytes back, and
+      // handing out a URL that resolves to nothing breaks that silently.
+      static createObjectURL(obj) {
+        const u = 'blob:' + (globalThis.location ? location.origin : 'null') + '/'
+          + (SEED.toString(36) + (blobSeq++).toString(36));
+        (globalThis.__pt_blobs || (globalThis.__pt_blobs = new Map())).set(u, obj);
+        return u;
+      }
+      static revokeObjectURL(u) { if (globalThis.__pt_blobs) globalThis.__pt_blobs.delete(String(u)); }
     };
   }
 
