@@ -1377,6 +1377,174 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     };
   }
 
+  // --- streams, storage, channels, files, CSS -----------------------------
+  // The rest of what a page assumes exists. Each is small; each one's absence
+  // stops code dead without a word.
+  if (!globalThis.ReadableStream) {
+    globalThis.ReadableStream = class ReadableStream {
+      constructor(source, strategy) {
+        const st = { chunks: [], closed: false, error: null, locked: false, source: source || {} };
+        Object.defineProperty(this, '__pt', { value: st, enumerable: false });
+        const controller = {
+          enqueue: (c) => st.chunks.push(c),
+          close: () => { st.closed = true; },
+          error: (e) => { st.error = e; st.closed = true; },
+          get desiredSize() { return 1; },
+        };
+        st.controller = controller;
+        try { if (typeof st.source.start === 'function') st.source.start(controller); } catch (e) { st.error = e; }
+      }
+      get locked() { return this.__pt.locked; }
+      getReader() {
+        const st = this.__pt;
+        if (st.locked) throw new TypeError('ReadableStream is locked');
+        st.locked = true;
+        return {
+          read: () => {
+            if (st.error) return Promise.reject(st.error);
+            if (st.chunks.length) return Promise.resolve({ value: st.chunks.shift(), done: false });
+            // Give the source a chance to produce more before reporting the end.
+            const pull = st.source.pull;
+            const more = typeof pull === 'function'
+              ? Promise.resolve(pull.call(st.source, st.controller)) : Promise.resolve();
+            return more.then(() => st.chunks.length
+              ? { value: st.chunks.shift(), done: false }
+              : { value: undefined, done: true });
+          },
+          releaseLock: () => { st.locked = false; },
+          cancel: (r) => { st.closed = true; try { st.source.cancel && st.source.cancel(r); } catch (e) {} return Promise.resolve(); },
+          get closed() { return Promise.resolve(); },
+        };
+      }
+      cancel(r) { const st = this.__pt; st.closed = true; try { st.source.cancel && st.source.cancel(r); } catch (e) {} return Promise.resolve(); }
+      tee() { return [this, this]; }
+    };
+  }
+
+  if (!globalThis.BroadcastChannel) {
+    const __bcRooms = new Map();
+    globalThis.BroadcastChannel = class BroadcastChannel {
+      constructor(name) {
+        this.name = String(name);
+        this.onmessage = null; this.onmessageerror = null;
+        Object.defineProperty(this, '__pt', { value: { closed: false, listeners: [] }, enumerable: false });
+        if (!__bcRooms.has(this.name)) __bcRooms.set(this.name, new Set());
+        __bcRooms.get(this.name).add(this);
+      }
+      postMessage(data) {
+        if (this.__pt.closed) throw new (globalThis.DOMException || Error)('channel is closed', 'InvalidStateError');
+        const peers = __bcRooms.get(this.name);
+        if (!peers) return;
+        for (const p of peers) {
+          if (p === this || p.__pt.closed) continue;   // never echoes to the sender
+          queueMicrotask(() => {
+            const ev = { type: 'message', data, origin: (globalThis.location && location.origin) || '', lastEventId: '', source: null, ports: [], isTrusted: true, target: p, currentTarget: p };
+            try { if (typeof p.onmessage === 'function') p.onmessage(ev); } catch (e) {}
+            for (const fn of p.__pt.listeners.slice()) { try { fn.call(p, ev); } catch (e) {} }
+          });
+        }
+      }
+      addEventListener(t, fn) { if (t === 'message' && typeof fn === 'function') this.__pt.listeners.push(fn); }
+      removeEventListener(t, fn) { const l = this.__pt.listeners, i = l.indexOf(fn); if (i >= 0) l.splice(i, 1); }
+      dispatchEvent() { return true; }
+      close() { this.__pt.closed = true; const r = __bcRooms.get(this.name); if (r) r.delete(this); }
+    };
+  }
+
+  if (!globalThis.CSS) {
+    globalThis.CSS = {
+      escape: (s) => String(s).replace(/[^a-zA-Z0-9_\u00a0-\uffff-]/g, (c) => '\\' + c),
+      // Answering `true` to everything would be its own giveaway; a real engine
+      // rejects nonsense. This accepts a well-formed declaration and no more.
+      supports: (a, b) => {
+        if (b !== undefined) return /^[-a-zA-Z]+$/.test(String(a)) && String(b).length > 0;
+        return /^\s*[-a-zA-Z]+\s*:\s*[^;]+\s*$/.test(String(a));
+      },
+    };
+  }
+
+  // Minimal but genuinely working IndexedDB: pages use it to store and to probe
+  // for storage at all, and `undefined` is the loudest possible answer.
+  if (!globalThis.indexedDB) {
+    const __idbData = new Map();   // dbName -> { version, stores: Map<name, Map> }
+    const req = (run) => {
+      const r = { readyState: 'pending', result: undefined, error: null,
+        onsuccess: null, onerror: null, onupgradeneeded: null, onblocked: null,
+        addEventListener(t, fn) { this['on' + t] = fn; }, removeEventListener() {}, dispatchEvent() { return true; } };
+      queueMicrotask(() => {
+        try {
+          run(r);
+          r.readyState = 'done';
+          const ev = { type: 'success', target: r, currentTarget: r };
+          if (typeof r.onsuccess === 'function') r.onsuccess(ev);
+        } catch (e) {
+          r.error = e; r.readyState = 'done';
+          const ev = { type: 'error', target: r, currentTarget: r };
+          if (typeof r.onerror === 'function') r.onerror(ev);
+        }
+      });
+      return r;
+    };
+    const makeStore = (map, name) => ({
+      name,
+      put(v, k) { return req((r) => { map.set(String(k === undefined ? (v && v.id) : k), v); r.result = k; }); },
+      add(v, k) { return this.put(v, k); },
+      get(k) { return req((r) => { r.result = map.get(String(k)); }); },
+      delete(k) { return req((r) => { map.delete(String(k)); }); },
+      clear() { return req(() => map.clear()); },
+      count() { return req((r) => { r.result = map.size; }); },
+      getAll() { return req((r) => { r.result = [...map.values()]; }); },
+      getAllKeys() { return req((r) => { r.result = [...map.keys()]; }); },
+      createIndex() { return { name: 'idx' }; },
+      deleteIndex() {},
+      index() { return { get: (k) => req((r) => { r.result = map.get(String(k)); }) }; },
+    });
+    globalThis.indexedDB = {
+      open(name, version) {
+        const key = String(name);
+        const fresh = !__idbData.has(key);
+        if (fresh) __idbData.set(key, { version: 0, stores: new Map() });
+        const entry = __idbData.get(key);
+        const wanted = version === undefined ? Math.max(1, entry.version) : (version | 0);
+        const db = {
+          name: key,
+          get version() { return entry.version; },
+          objectStoreNames: { contains: (n) => entry.stores.has(String(n)), get length() { return entry.stores.size; }, item: (i) => [...entry.stores.keys()][i] || null },
+          createObjectStore(n) { const m = new Map(); entry.stores.set(String(n), m); return makeStore(m, String(n)); },
+          deleteObjectStore(n) { entry.stores.delete(String(n)); },
+          transaction(names) {
+            const tx = { objectStore: (n) => makeStore(entry.stores.get(String(n)) || new Map(), String(n)),
+              abort() {}, commit() {}, oncomplete: null, onerror: null, onabort: null,
+              addEventListener(t, fn) { this['on' + t] = fn; }, removeEventListener() {} };
+            queueMicrotask(() => { if (typeof tx.oncomplete === 'function') tx.oncomplete({ type: 'complete', target: tx }); });
+            return tx;
+          },
+          close() {}, onerror: null, onclose: null, onversionchange: null,
+          addEventListener() {}, removeEventListener() {},
+        };
+        const r = { readyState: 'pending', result: undefined, error: null,
+          onsuccess: null, onerror: null, onupgradeneeded: null, onblocked: null,
+          addEventListener(t, fn) { this['on' + t] = fn; }, removeEventListener() {}, dispatchEvent() { return true; } };
+        queueMicrotask(() => {
+          r.result = db;
+          r.readyState = 'done';
+          if (wanted > entry.version) {
+            const old = entry.version;
+            entry.version = wanted;
+            if (typeof r.onupgradeneeded === 'function') {
+              r.onupgradeneeded({ type: 'upgradeneeded', target: r, oldVersion: old, newVersion: wanted, currentTarget: r });
+            }
+          }
+          if (typeof r.onsuccess === 'function') r.onsuccess({ type: 'success', target: r, currentTarget: r });
+        });
+        return r;
+      },
+      deleteDatabase(name) { return req(() => { __idbData.delete(String(name)); }); },
+      databases() { return Promise.resolve([...__idbData.keys()].map((n) => ({ name: n, version: __idbData.get(n).version }))); },
+      cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; },
+    };
+  }
+
   // --- WebSocket ----------------------------------------------------------
   // Same shape as fetch above: JS owns the object and its state machine, Rust
   // owns the socket. Operations pile onto a queue the event loop drains
@@ -2633,6 +2801,47 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   if (!globalThis.Blob) {
     globalThis.Blob = class Blob { constructor(parts, opts) { this._p = (parts || []).map(String); this.type = (opts && opts.type) || ''; this.size = this._p.reduce((n, x) => n + x.length, 0); } text() { return Promise.resolve(this._p.join('')); } arrayBuffer() { return Promise.resolve(new TextEncoder().encode(this._p.join('')).buffer); } slice() { return new Blob([]); } toString() { return this._p.join(''); } };
   }
+  // Here rather than with the other web globals: `File` extends `Blob`, which is
+  // defined just above, and a class body is evaluated where it is written.
+  if (!globalThis.File) {
+    globalThis.File = class File extends Blob {
+      constructor(parts, name, opts) {
+        super(parts, opts);
+        this.name = String(name);
+        this.lastModified = (opts && opts.lastModified) || 0;
+        this.webkitRelativePath = '';
+      }
+    };
+  }
+  if (!globalThis.FileReader) {
+    globalThis.FileReader = class FileReader {
+      constructor() {
+        this.readyState = 0; this.result = null; this.error = null;
+        this.onload = null; this.onloadend = null; this.onerror = null; this.onprogress = null;
+        Object.defineProperty(this, '__ls', { value: {}, enumerable: false });
+      }
+      addEventListener(t, fn) { (this.__ls[t] = this.__ls[t] || []).push(fn); }
+      removeEventListener(t, fn) { const l = this.__ls[t]; if (!l) return; const i = l.indexOf(fn); if (i >= 0) l.splice(i, 1); }
+      dispatchEvent() { return true; }
+      abort() { this.readyState = 2; }
+      __fire(type) {
+        const ev = { type, target: this, currentTarget: this, isTrusted: true };
+        try { if (typeof this['on' + type] === 'function') this['on' + type](ev); } catch (e) {}
+        for (const fn of (this.__ls[type] || []).slice()) { try { fn.call(this, ev); } catch (e) {} }
+      }
+      __read(blob, make) {
+        this.readyState = 1;
+        Promise.resolve(blob && blob.text ? blob.text() : String(blob)).then((t) => {
+          this.result = make(t); this.readyState = 2;
+          this.__fire('load'); this.__fire('loadend');
+        }, (e) => { this.error = e; this.readyState = 2; this.__fire('error'); this.__fire('loadend'); });
+      }
+      readAsText(b) { this.__read(b, (t) => t); }
+      readAsDataURL(b) { this.__read(b, (t) => 'data:' + ((b && b.type) || 'application/octet-stream') + ';base64,' + btoa(t)); }
+      readAsArrayBuffer(b) { this.__read(b, (t) => new TextEncoder().encode(t).buffer); }
+      readAsBinaryString(b) { this.__read(b, (t) => t); }
+    };
+  }
   if (!globalThis.FormData) {
     globalThis.FormData = class FormData { constructor() { this._d = []; } append(k, v) { this._d.push([String(k), v]); } set(k, v) { this.delete(k); this.append(k, v); } get(k) { const e = this._d.find((x) => x[0] === k); return e ? e[1] : null; } getAll(k) { return this._d.filter((x) => x[0] === k).map((x) => x[1]); } has(k) { return this._d.some((x) => x[0] === k); } delete(k) { this._d = this._d.filter((x) => x[0] !== k); } forEach(f) { for (const [k, v] of this._d) f(v, k, this); } entries() { return this._d[Symbol.iterator](); } toString() { return this._d.map(([k, v]) => k + '=' + v).join('&'); } };
   }
@@ -2687,7 +2896,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     [globalThis, 'WebSocket'], [globalThis, 'DOMException'], [globalThis, 'MessageChannel'],
     [globalThis, 'MessagePort'], [globalThis, 'Headers'], [globalThis, 'Request'],
     [globalThis, 'Response'], [globalThis, 'atob'], [globalThis, 'btoa'],
-    [globalThis, 'structuredClone'], [globalThis, 'AbortController'], [globalThis, 'AbortSignal']]) {
+    [globalThis, 'structuredClone'], [globalThis, 'AbortController'], [globalThis, 'AbortSignal'],
+    [globalThis, 'ReadableStream'], [globalThis, 'BroadcastChannel'], [globalThis, 'File'],
+    [globalThis, 'FileReader']]) {
     if (obj[key]) mask(obj[key], key);
   }
   // `send`/`close`/`addEventListener` on a socket must read native too — the
