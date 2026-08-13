@@ -362,6 +362,18 @@ impl FingerprintClient {
             .profile(profile_for_major(config.chrome_major))
             .platform(config.emulation_os.to_platform())
             .build();
+        // The emulation's Chrome profile sends its HEADERS frame with a priority
+        // weight of 220; Chrome 148 sends 256. The Akamai hash does not cover it,
+        // the wire does, and a fingerprint that matches everywhere except one
+        // number is still a fingerprint that does not match.
+        let mut emulation = <wreq_util::Emulation as wreq::IntoEmulation>::into_emulation(emulation);
+        if let Some(h2) = emulation.http2_options.as_mut() {
+            h2.headers_stream_dependency = Some(wreq::http2::StreamDependency::new(
+                wreq::http2::StreamId::zero(),
+                255,
+                true,
+            ));
+        }
         let mut builder = wreq::Client::builder().emulation(emulation);
         // Named session or not, the jar is ours: a named one is shared (and
         // serializable) across contexts of the same identity, an anonymous one is

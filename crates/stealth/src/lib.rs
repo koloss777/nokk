@@ -608,10 +608,33 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   // --- location (getters read a backing store the Rust driver updates) --
   const LocationProto = defClass("Location");
   const locState = { href: "about:blank", protocol: "about:", host: "", hostname: "", port: "", pathname: "blank", search: "", hash: "", origin: "null" };
-  for (const k of Object.keys(locState)) accessor(LocationProto, k, () => locState[k], (v) => { locState[k] = String(v); });
-  protoMethod(LocationProto, "assign", function assign(){});
-  protoMethod(LocationProto, "replace", function replace(){});
-  protoMethod(LocationProto, "reload", function reload(){});
+  // A page navigating itself is not a detail: `location.href = …`,
+  // `location.replace(…)` and `location.reload()` are how a form handoff, an
+  // OAuth bounce and — the reason this exists — a Cloudflare challenge finish.
+  // Ours only rewrote the address bar, so the last step of those flows silently
+  // never happened. The request goes to the driver, which performs a real
+  // navigation of this context.
+  const navQueue = [];
+  const askNav = (raw, replace) => {
+    const url = String(raw);
+    if (!url) return;
+    let abs = url;
+    try { abs = new URL(url, locState.href).href; } catch (e) {}
+    navQueue.push({ url: abs, replace: !!replace });
+  };
+  globalThis.__pt_drainNavQueue = () => navQueue.splice(0);
+
+  for (const k of Object.keys(locState)) {
+    accessor(LocationProto, k, () => locState[k], (v) => {
+      // Assigning `href` navigates; the other parts navigate to the URL they
+      // produce, which is what a browser does with `location.hash = …` too.
+      if (k === 'href') { askNav(v, false); return; }
+      locState[k] = String(v);
+    });
+  }
+  protoMethod(LocationProto, "assign", function assign(u){ askNav(u, false); });
+  protoMethod(LocationProto, "replace", function replace(u){ askNav(u, true); });
+  protoMethod(LocationProto, "reload", function reload(){ askNav(locState.href, true); });
   protoMethod(LocationProto, "toString", function toString(){ return locState.href; });
   win.location = Object.create(LocationProto);
   // Rust calls this on navigation to populate `location` from the real URL —

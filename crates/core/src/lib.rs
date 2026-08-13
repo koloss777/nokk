@@ -1123,6 +1123,7 @@ impl BrowserContext {
             let ws_ops: Vec<Value> = queues["ws"].as_array().cloned().unwrap_or_default();
             let frame_ops: Vec<Value> = queues["frames"].as_array().cloned().unwrap_or_default();
             let script_ops: Vec<Value> = queues["scripts"].as_array().cloned().unwrap_or_default();
+            let nav_ops: Vec<Value> = queues["nav"].as_array().cloned().unwrap_or_default();
             // How long until the page's next timer, straight from the same queue
             // the driver just pumped: -1 for "nothing pending".
             let next_timer_ms = queues["timers"].as_i64().unwrap_or(-1);
@@ -1139,6 +1140,26 @@ impl BrowserContext {
             //    after them usually depends on what they define.
             self.apply_frame_ops(&base, &frame_ops).await;
             self.apply_script_ops(index, &base, &script_ops).await;
+
+            // 5. The page asked to go somewhere. Only the last request counts —
+            //    a script that assigns `location.href` twice in a turn ends up at
+            //    the second address, as it would in a browser — and the loop stops
+            //    here: everything below belongs to a document that no longer
+            //    exists. The caller's next pump drives the new one.
+            if let Some(op) = nav_ops.last() {
+                if let Some(url) = op["url"].as_str() {
+                    if index == self.index {
+                        let to = url.to_string();
+                        tracing::debug!(url = %to, "page navigated itself");
+                        // Boxed: the loop is reached *from* `navigate`, so this
+                        // is a recursive async call and needs an indirection.
+                        if let Err(e) = Box::pin(self.navigate(&to)).await {
+                            tracing::debug!(url = %to, error = %e, "self-navigation failed");
+                        }
+                        return Ok(total_timers);
+                    }
+                }
+            }
 
             let busy = ran > 0
                 || !reqs.is_empty()
@@ -1974,6 +1995,7 @@ const DRAIN_IO: &str = "JSON.stringify({\
     ws: typeof __pt_drainWsQueue === 'function' ? __pt_drainWsQueue() : [],\
     frames: typeof __pt_drainFrameQueue === 'function' ? __pt_drainFrameQueue() : [],\
     scripts: typeof __pt_drainScriptQueue === 'function' ? __pt_drainScriptQueue() : [],\
+    nav: typeof __pt_drainNavQueue === 'function' ? __pt_drainNavQueue() : [],\
     timers: typeof __pt_nextTimerDelay === 'function' ? __pt_nextTimerDelay() : -1})";
 
 /// How long [`BrowserContext::run_event_loop`] may spend *waiting* for timers
@@ -4038,6 +4060,68 @@ mod tests {
             serde_json::json!([1, 4, 128]),
             "NodeFilter's constants are the spec's, not invented"
         );
+    }
+
+    /// A page that assigns `location.href` goes there. Ours only rewrote the
+    /// address and stayed on the same document, so the last step of a form
+    /// handoff, an OAuth bounce or a challenge — all of which end by navigating
+    /// themselves — silently never happened.
+    #[tokio::test]
+    async fn a_page_can_navigate_itself() {
+        let _serial = serial().await;
+        let url = redirect_server().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 4,
+                max_heap_mb: None,
+            },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+
+        for (start, how) in [("/href", "location.href"), ("/replace", "location.replace")] {
+            let ctx = engine.new_context().await.unwrap();
+            ctx.navigate(&format!("{}{}", url.trim_end_matches('/'), start))
+                .await
+                .unwrap();
+            assert_eq!(
+                ctx.evaluate("document.title").await.unwrap(),
+                Value::String("arrived".into()),
+                "{how} must land on the new document, not just change the address"
+            );
+        }
+    }
+
+    /// Two documents: one that sends itself to the other, and the other.
+    async fn redirect_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let body = if req.contains("GET /replace") {
+                        "<html><body><script>location.replace('/there')</script></body></html>"
+                    } else if req.contains("GET /href") {
+                        "<html><body><script>location.href = '/there'</script></body></html>"
+                    } else {
+                        "<html><head><title>arrived</title></head><body>ok</body></html>"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://127.0.0.1:{}/", addr.port())
     }
 
     /// A blank same-origin `<iframe>` is a window with its own realm, reachable
