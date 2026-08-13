@@ -27,8 +27,13 @@ type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
+/// The context bootstrap, parked on the isolate so [`make_realm`] can build a
+/// second window from it without handing the source to the page.
+pub struct RealmBootstrap(pub String);
+
 /// Install every native binding on the current context's global object.
 pub fn install(scope: &mut v8::HandleScope) {
+    bind(scope, "__pt_makeRealm", make_realm);
     bind(scope, "__pt_randomBytes", random_bytes);
     bind(scope, "__pt_digest", digest);
     bind(scope, "__pt_hmac", hmac_sign);
@@ -1085,6 +1090,55 @@ fn set_bytes(scope: &mut v8::HandleScope, rv: &mut v8::ReturnValue, bytes: &[u8]
 /// `__pt_randomBytes(n)` — cryptographically secure bytes from the OS. The old JS
 /// shim used a seeded xorshift, which is neither random enough for real page
 /// crypto nor plausible for `crypto.getRandomValues`.
+/// `__pt_makeRealm()` → the global object of a brand-new realm.
+///
+/// A same-origin `<iframe>` is a second window with its own untouched natives,
+/// and a page reaches into it synchronously: `iframe.contentWindow.eval(…)`,
+/// `contentWindow.Function`, `contentWindow.navigator`. Anti-bot code does this
+/// deliberately — a fresh realm is where you compare a possibly-patched function
+/// against a clean one — and Cloudflare's challenge VM dies on the spot when
+/// `contentWindow` is null.
+///
+/// Our frames each live in their own V8 context bridged by evaluating strings,
+/// which cannot answer a synchronous property read from the parent. This can: the
+/// new context is created *in the same isolate*, so its global is an ordinary
+/// object the caller may hold and use directly. It gets the same native bindings
+/// and the same bootstrap as any other context, so it looks like the window it
+/// claims to be rather than a bare V8 global.
+fn make_realm(
+    scope: &mut v8::HandleScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let bootstrap = match scope.get_slot::<RealmBootstrap>() {
+        Some(b) => b.0.clone(),
+        None => {
+            rv.set_null();
+            return;
+        }
+    };
+    let context = v8::Context::new(scope, v8::ContextOptions::default());
+    // Same origin, in V8's own terms: without a shared security token every
+    // property read across the boundary answers "no access", which is exactly
+    // what a *cross*-origin frame should do and precisely wrong for this one.
+    let token = scope.get_current_context().get_security_token(scope);
+    context.set_security_token(token);
+    let global = context.global(scope);
+    {
+        let inner = &mut v8::ContextScope::new(scope, context);
+        install(inner);
+        let inner = &mut v8::TryCatch::new(inner);
+        if let Some(src) = v8::String::new(inner, &bootstrap) {
+            if let Some(script) = v8::Script::compile(inner, src, None) {
+                // A realm whose bootstrap threw is still a realm; the page gets
+                // what did get built rather than a null it cannot use.
+                let _ = script.run(inner);
+            }
+        }
+    }
+    rv.set(global.into());
+}
+
 fn random_bytes(
     scope: &mut v8::HandleScope,
     args: v8::FunctionCallbackArguments,

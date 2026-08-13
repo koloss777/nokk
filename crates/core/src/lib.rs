@@ -4017,6 +4017,59 @@ mod tests {
         );
     }
 
+    /// A blank same-origin `<iframe>` is a window with its own realm, reachable
+    /// synchronously. Anti-bot code opens one on purpose — a fresh realm is where
+    /// a patched function is compared against a clean one — and reads
+    /// `contentWindow.eval` straight away. Against `null` it stops dead, which is
+    /// exactly where Cloudflare's full-page challenge ended.
+    #[tokio::test]
+    async fn a_blank_iframe_is_a_window_with_its_own_realm() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let probe = r#"(() => {
+            const f = document.createElement('iframe');
+            document.body.appendChild(f);
+            const w = f.contentWindow;
+            if (!w) return JSON.stringify({ ok: false });
+            return JSON.stringify({
+              ok: true,
+              evaluated: w.eval('1 + 1'),
+              ownRealm: w.Object !== Object && w.Function !== Function,
+              hasDocument: typeof w.document,
+              parentIsUs: w.parent === globalThis,
+              frameElement: w.frameElement === f,
+              sameWindowTwice: f.contentWindow === w,
+              document: f.contentDocument === w.document,
+              // A frame with a real src is a networked browsing context instead,
+              // and must not quietly become a local realm.
+              networked: (() => {
+                const g = document.createElement('iframe');
+                g.src = 'https://elsewhere.test/';
+                document.body.appendChild(g);
+                return !g.__ptRealm;
+              })(),
+            });
+        })()"#;
+        let out = match ctx.evaluate(probe).await.unwrap() {
+            Value::String(s) => serde_json::from_str::<Value>(&s).unwrap(),
+            v => panic!("expected the probe result, got {v:?}"),
+        };
+        assert_eq!(out["ok"], true, "a blank iframe has a contentWindow at once");
+        assert_eq!(out["evaluated"], 2, "and its `eval` runs, synchronously");
+        assert_eq!(out["ownRealm"], true, "with natives of its own, not ours");
+        assert_eq!(out["hasDocument"], "object");
+        assert_eq!(out["parentIsUs"], true);
+        assert_eq!(out["frameElement"], true);
+        assert_eq!(out["sameWindowTwice"], true, "the same window every read");
+        assert_eq!(out["document"], true, "contentDocument is that realm's");
+        assert_eq!(out["networked"], true);
+    }
+
     /// "On new document" has to mean *before* the document's own scripts. Ours ran
     /// after the page had already executed, which is useless for the thing the API
     /// exists for — putting a hook in place before the page can look. Every stealth

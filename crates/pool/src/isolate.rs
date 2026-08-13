@@ -174,6 +174,16 @@ impl Isolate {
     /// `navigator`/`window`/`screen`…), and return its index. If the bootstrap
     /// script throws, the context is discarded and the error is returned.
     pub fn create_context(&mut self, bootstrap: &str) -> Result<usize, String> {
+        // Keep the bootstrap on the isolate so a *realm* can be built from it
+        // later without the page ever seeing the source. A same-origin `<iframe>`
+        // with no `src` is a real window in a browser, and anti-bot code reaches
+        // into one for pristine natives (`contentWindow.eval`); building that
+        // realm has to happen synchronously, inside the property access, which is
+        // why it is a native binding rather than a round trip through the driver.
+        if self.isolate.get_slot::<crate::natives::RealmBootstrap>().is_none() {
+            self.isolate
+                .set_slot(crate::natives::RealmBootstrap(bootstrap.to_string()));
+        }
         let global = {
             let scope = &mut v8::HandleScope::new(&mut self.isolate);
             let context = v8::Context::new(scope, v8::ContextOptions::default());

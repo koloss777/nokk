@@ -390,14 +390,42 @@
       // at first, and navigates afterwards). Waiting for the load was enough to
       // make widgets that poll this synchronously give up and start over.
       const st = __frames.get(this.__ptFrameId);
-      return st ? st.win : null;
+      if (st) return st.win;
+      return this.__ptRealmWindow();
     }
     get contentDocument() {
       const st = __frames.get(this.__ptFrameId);
-      // Cross-origin frames expose no document at all — that is the rule, not a
-      // limitation. A same-origin one is not reachable from here either (its
-      // document lives in another V8 context), so it reports the same.
-      return st && st.ready && st.sameOrigin ? st.doc || null : null;
+      // A cross-origin frame exposes no document at all — that is the rule, not a
+      // limitation, and a networked frame's document lives in another context we
+      // cannot hand back. A blank same-origin frame is a different matter: it has
+      // a real realm of its own (below), and its document comes with it.
+      if (st) return st.ready && st.sameOrigin ? st.doc || null : null;
+      const w = this.__ptRealmWindow();
+      return w ? w.document || null : null;
+    }
+
+    // A same-origin `<iframe>` with no `src` is a *window*, immediately — with its
+    // own untouched natives. Code reaches into one synchronously
+    // (`contentWindow.eval`, `contentWindow.Function`) precisely because a fresh
+    // realm is where a patched function can be compared against a clean one; an
+    // anti-bot VM that finds `null` there stops dead. The realm is a second V8
+    // context in this same isolate, so its global is an ordinary object we can
+    // hand back and the page can use directly.
+    __ptRealmWindow() {
+      if (this.__ptLocal !== 'iframe' || !this.isConnected) return null;
+      if (this.__ptRealm) return this.__ptRealm;
+      const src = this.getAttribute('src');
+      if (src && src !== 'about:blank') return null;
+      if (typeof globalThis.__pt_makeRealm !== 'function') return null;
+      const w = globalThis.__pt_makeRealm();
+      if (!w) return null;
+      // It is a child: it sees us as its parent, and knows the element it is in.
+      for (const [k, v] of [['parent', globalThis], ['top', globalThis.top || globalThis],
+        ['frameElement', this], ['self', w], ['window', w]]) {
+        try { Object.defineProperty(w, k, { value: v, configurable: true }); } catch (e) {}
+      }
+      Object.defineProperty(this, '__ptRealm', { value: w, configurable: true, enumerable: false });
+      return w;
     }
     // A `<script>` that has just entered the document runs — once. The "already
     // started" flag is the spec's, and it is what keeps a parser-built script
