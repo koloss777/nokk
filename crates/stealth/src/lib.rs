@@ -1050,6 +1050,88 @@ pub fn probe_tracer_script() -> String {
     }
   };
 
+  // Перечисление — главный инструмент сборщика отпечатков: он идёт по
+  // `Object.keys` вверх по цепочке прототипов и по именам решает, что перед ним.
+  // Записываем, что именно перечисляли и сколько имён отдали.
+  const nameOf = (o) => {
+    try {
+      if (o === globalThis) return 'window';
+      if (o === null || o === undefined) return String(o);
+      const tag = Object.prototype.toString.call(o).slice(8, -1);
+      if (tag !== 'Object') return tag;
+      const c = o.constructor && o.constructor.name;
+      return c && c !== 'Object' ? c + '.prototype?' : 'Object';
+    } catch (e) { return '?'; }
+  };
+  for (const [holder, key] of [[Object, 'keys'], [Object, 'getOwnPropertyNames'],
+    [Object, 'getOwnPropertyDescriptors'], [Object, 'entries'], [Object, 'values'],
+    [Object, 'getPrototypeOf'], [Reflect, 'ownKeys'], [Reflect, 'getPrototypeOf']]) {
+    const orig = holder[key];
+    if (typeof orig !== 'function') continue;
+    try {
+      Object.defineProperty(holder, key, {
+        value: rename(function (target, ...rest) {
+          const out = orig.call(this, target, ...rest);
+          note('walk:' + key + '(' + nameOf(target) + ')', Array.isArray(out) ? out.length + ' имён' : out);
+          return out;
+        }, key),
+        writable: true, configurable: true,
+      });
+    } catch (e) {}
+  }
+
+  // Код, который страница сочиняет на ходу, и потоки, в которых она прячет
+  // сборку: и то и другое стоит видеть по имени.
+  const origFunction = globalThis.Function;
+  for (const name of ['Worker', 'SharedWorker', 'ServiceWorker']) {
+    const C = globalThis[name];
+    if (typeof C !== 'function') continue;
+    try {
+      globalThis[name] = new Proxy(C, {
+        construct(t, args) { note('new ' + name + '(' + show(args[0]) + ')', 'создан'); return Reflect.construct(t, args); },
+      });
+    } catch (e) {}
+  }
+  try {
+    const createURL = globalThis.URL && URL.createObjectURL;
+    if (createURL) URL.createObjectURL = rename(function (o) {
+      const url = createURL.call(this, o);
+      note('URL.createObjectURL(' + nameOf(o) + ')', url);
+      return url;
+    }, 'createObjectURL');
+  } catch (e) {}
+  try {
+    globalThis.Function = new Proxy(origFunction, {
+      construct(t, args) {
+        note('new Function(' + String(args[args.length - 1] || '').slice(0, 50) + ')', 'скомпилировано');
+        return Reflect.construct(t, args);
+      },
+      apply(t, self, args) {
+        note('Function(' + String(args[args.length - 1] || '').slice(0, 50) + ')', 'скомпилировано');
+        return Reflect.apply(t, self, args);
+      },
+    });
+  } catch (e) {}
+
+  // Данные-свойства корней: обёртка геттеров их не видит, а сборщик читает.
+  const traceData = (obj, prefix) => {
+    if (!obj) return;
+    for (const key of Object.getOwnPropertyNames(obj)) {
+      if (key.lastIndexOf('__pt', 0) === 0) continue;
+      let d;
+      try { d = Object.getOwnPropertyDescriptor(obj, key); } catch (e) { continue; }
+      if (!d || !d.configurable || d.get || typeof d.value === 'function') continue;
+      const value = d.value;
+      try {
+        Object.defineProperty(obj, key, {
+          get: rename(function () { return note(prefix + key, value); }, 'get ' + key),
+          set: rename(function (v) { Object.defineProperty(obj, key, { value: v, writable: true, configurable: true, enumerable: d.enumerable }); }, 'set ' + key),
+          enumerable: d.enumerable, configurable: true,
+        });
+      } catch (e) {}
+    }
+  };
+
   // Каждый корень отпечатка и каждая поверхность, по которой обычно судят:
   // рисование, звук, шрифты, время, устройство.
   const proto = (name) => globalThis[name] && globalThis[name].prototype;
@@ -1069,8 +1151,9 @@ pub fn probe_tracer_script() -> String {
     trace(proto(name), tag);
   }
   for (const [name, tag] of [['navigator', 'n.'], ['screen', 's.'], ['performance', 'perf.']]) {
-    if (globalThis[name]) trace(globalThis[name], tag + 'own.');
+    if (globalThis[name]) { trace(globalThis[name], tag + 'own.'); traceData(globalThis[name], tag); }
   }
+  traceData(globalThis, 'win.');
 })();"##
         .to_string()
 }

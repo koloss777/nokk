@@ -5121,6 +5121,58 @@ mod tests {
         format!("http://127.0.0.1:{}/", addr.port())
     }
 
+    /// Inside a worker the world is different, and collectors know it: there is
+    /// no `document`, no `window`, no `localStorage`, and `navigator` is a
+    /// `WorkerNavigator` with no plugins and no `webdriver`. Ours ran in the
+    /// page's own scope, so barewords reached the window's globals — a
+    /// fingerprint taken there described a window, which is as loud a mismatch
+    /// as there is. A live Cloudflare challenge spawns two workers; this is
+    /// where it looks.
+    #[tokio::test]
+    async fn a_worker_lives_in_a_worker_scope() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        ctx.evaluate(r#"(() => {
+            const src = `postMessage({
+              self: Object.prototype.toString.call(self),
+              nav: Object.prototype.toString.call(navigator),
+              loc: Object.prototype.toString.call(location),
+              ua: navigator.userAgent === undefined ? 'missing' : 'present',
+              plugins: typeof navigator.plugins,
+              webdriver: typeof navigator.webdriver,
+              document: typeof document,
+              window: typeof window,
+              localStorage: typeof localStorage,
+              screen: typeof screen,
+              fetch: typeof fetch,
+              json: typeof JSON.parse,
+            });`;
+            const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+            globalThis.__fromWorker = null;
+            w.onmessage = (e) => { globalThis.__fromWorker = e.data; };
+            return 1;
+        })()"#).await.unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        let out = probe(&ctx, "JSON.stringify(globalThis.__fromWorker || {})").await;
+        assert_eq!(out["self"], "[object DedicatedWorkerGlobalScope]", "got: {out}");
+        assert_eq!(out["nav"], "[object WorkerNavigator]");
+        assert_eq!(out["loc"], "[object WorkerLocation]");
+        assert_eq!(out["ua"], "present", "a worker still has a user agent");
+        assert_eq!(out["plugins"], "undefined", "but no plugins");
+        assert_eq!(out["webdriver"], "undefined", "and no webdriver");
+        for absent in ["document", "window", "localStorage", "screen"] {
+            assert_eq!(out[absent], "undefined", "{absent} does not exist in a worker");
+        }
+        assert_eq!(out["fetch"], "function", "what a worker does have, it has");
+        assert_eq!(out["json"], "function", "the language comes along");
+    }
+
     /// Three things anti-bot code reads that we answered wrongly, each found by
     /// tracing what a real challenge asked for rather than by guessing.
     ///

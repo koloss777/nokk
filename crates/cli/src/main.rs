@@ -400,6 +400,26 @@ async fn main() -> Result<()> {
             if let Ok(v) = ctx.evaluate("__pt_probeLog()").await {
                 dump("page".into(), v);
             }
+            // Workers are where a challenge does its collecting; whether they ran
+            // at all, and what they threw, is the first thing to know.
+            for (label, where_) in [("page", None), ("frames", Some(()))] {
+                let ids: Vec<Option<u32>> = match where_ {
+                    None => vec![None],
+                    Some(_) => ctx.frame_list().iter().map(|f| Some(f.id)).collect(),
+                };
+                for id in ids {
+                    let js = "JSON.stringify(globalThis.__ptWorkerLog || [])";
+                    let out = match id {
+                        None => ctx.evaluate(js).await,
+                        Some(f) => ctx.evaluate_in_frame(f, js).await,
+                    };
+                    if let Ok(serde_json::Value::String(text)) = out {
+                        if text.len() > 2 {
+                            eprintln!("# workers ({label}{}): {text}", id.map(|f| format!(" {f}")).unwrap_or_default());
+                        }
+                    }
+                }
+            }
             for f in ctx.frame_list() {
                 if let Ok(v) = ctx
                     .evaluate_in_frame(f.id, "typeof __pt_probeLog === 'function' ? __pt_probeLog() : ''")
