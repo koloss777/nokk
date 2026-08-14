@@ -629,6 +629,7 @@ impl Engine {
             sockets: tokio::sync::Mutex::new(PageSockets::new()),
             network_tx: std::sync::Mutex::new(None),
             frames: std::sync::Mutex::new(HashMap::new()),
+            workers: std::sync::Mutex::new(HashMap::new()),
             bootstrap,
             frame_init_scripts: std::sync::Mutex::new(Vec::new()),
             init_scripts: std::sync::Mutex::new(Vec::new()),
@@ -756,6 +757,10 @@ pub struct BrowserContext {
     /// V8 context of its own on this same worker — a real browsing context, which
     /// is what a widget means when it polls `iframe.contentWindow`.
     frames: std::sync::Mutex<HashMap<u32, FrameState>>,
+    /// Live workers, by the id the page's DOM assigned. A worker is a context of
+    /// its own — a different global object, not a window with pieces removed —
+    /// which is exactly what code that fingerprints inside one is checking.
+    workers: std::sync::Mutex<HashMap<(usize, u32), WorkerState>>,
     /// This context's bootstrap, kept so a child frame is built with the same
     /// stealth profile — an iframe of this browser is the same machine.
     bootstrap: String,
@@ -798,6 +803,17 @@ struct FrameState {
     origin: String,
 }
 
+/// A live worker: its own V8 context on the page's worker thread, and the URL its
+/// own requests resolve against. A worker built from a blob has no document to
+/// resolve against, so it keeps the page's base — which is what a browser does
+/// with the blob's origin.
+#[derive(Debug, Clone)]
+struct WorkerState {
+    index: usize,
+    url: String,
+    fetch_base: String,
+}
+
 /// One page's open sockets, plus the single queue everything they produce lands
 /// on. Sharing one queue (rather than a receiver per socket) is what lets the
 /// event loop drain every socket in arrival order, and wait on *any* of them.
@@ -831,10 +847,21 @@ impl Drop for BrowserContext {
         // Without this, create/close churn (every Puppeteer newPage/close) grows
         // the isolate's context table unbounded — a slow leak on a busy server.
         // Fire-and-forget: there's no caller to return to from Drop.
-        let index = self.index;
-        self.engine
-            .pool
-            .dispatch_detached(self.worker, move |iso| iso.dispose_context(index));
+        // The page's frames and workers are contexts on the same isolate, and
+        // nothing else will ever reach them once the page is gone — a page that
+        // opened either would otherwise leak them on every close.
+        let mut indices = vec![self.index];
+        if let Ok(frames) = self.frames.lock() {
+            indices.extend(frames.values().map(|s| s.index));
+        }
+        if let Ok(workers) = self.workers.lock() {
+            indices.extend(workers.values().map(|s| s.index));
+        }
+        for index in indices {
+            self.engine
+                .pool
+                .dispatch_detached(self.worker, move |iso| iso.dispose_context(index));
+        }
     }
 }
 
@@ -982,6 +1009,8 @@ impl BrowserContext {
     /// `src`s. Page scripts that throw are logged and skipped — a broken page
     /// script must not fail the load, matching browser behaviour.
     pub async fn load_html(&self, base_url: &str, html: &str) -> Result<(), EngineError> {
+        // The outgoing document takes its workers with it.
+        self.terminate_workers_of(None).await;
         if let Ok(mut b) = self.base_url.lock() {
             *b = base_url.to_string();
         }
@@ -1205,6 +1234,7 @@ impl BrowserContext {
             let frame_ops: Vec<Value> = queues["frames"].as_array().cloned().unwrap_or_default();
             let script_ops: Vec<Value> = queues["scripts"].as_array().cloned().unwrap_or_default();
             let nav_ops: Vec<Value> = queues["nav"].as_array().cloned().unwrap_or_default();
+            let worker_ops: Vec<Value> = queues["workers"].as_array().cloned().unwrap_or_default();
             // How long until the page's next timer, straight from the same queue
             // the driver just pumped: -1 for "nothing pending".
             let next_timer_ms = queues["timers"].as_i64().unwrap_or(-1);
@@ -1220,6 +1250,7 @@ impl BrowserContext {
             //    it inserted run here too, before the round's fetches: everything
             //    after them usually depends on what they define.
             self.apply_frame_ops(&base, &frame_ops).await;
+            self.apply_worker_ops(index, &base, &worker_ops).await;
             self.apply_script_ops(index, &base, &script_ops).await;
 
             // 5. The page asked to go somewhere. Only the last request counts —
@@ -1248,7 +1279,11 @@ impl BrowserContext {
                 self.flush_resource_timings(index).await;
             }
 
+            let pumped_workers = self.pump_workers().await?;
+
             let busy = ran > 0
+                || pumped_workers > 0
+                || !worker_ops.is_empty()
                 || !reqs.is_empty()
                 || !ws_ops.is_empty()
                 || !script_ops.is_empty()
@@ -1448,8 +1483,12 @@ impl BrowserContext {
                 None => self.evaluate(&probe).await?,
                 Some(id) => self.evaluate_in_frame(id, &probe).await?,
             };
-            let Some(text) = hit.as_str().filter(|s| !s.is_empty()) else { break };
-            let Ok(v) = serde_json::from_str::<Value>(text) else { break };
+            let Some(text) = hit.as_str().filter(|s| !s.is_empty()) else {
+                break;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(text) else {
+                break;
+            };
             let (Some(id), Some(nx), Some(ny)) =
                 (v["frame"].as_u64(), v["x"].as_f64(), v["y"].as_f64())
             else {
@@ -1556,7 +1595,9 @@ impl BrowserContext {
             else {
                 continue;
             };
-            let Some(c) = list.into_iter().next() else { continue };
+            let Some(c) = list.into_iter().next() else {
+                continue;
+            };
             let (x, y) = (
                 c["x"].as_f64().unwrap_or(0.0),
                 c["y"].as_f64().unwrap_or(0.0),
@@ -1584,6 +1625,321 @@ impl BrowserContext {
             return Ok(Some(what));
         }
         Ok(None)
+    }
+
+    /// Build, feed and tear down the workers `index` started — the page's, or a
+    /// frame's, which is where a challenge does its collecting. A worker gets a
+    /// context of its own, shaped into a worker global (see
+    /// `worker_scope_script`) before a line of its code runs: `self` is a
+    /// `DedicatedWorkerGlobalScope`, there is no document and no window, and its
+    /// realm is its own. Anything short of that is a shim, and a fingerprint
+    /// collected in a shim describes the page.
+    ///
+    /// Ids are handed out by each document's own DOM, so the page's worker 1 and
+    /// a frame's worker 1 are different workers — the owning context is half the
+    /// key, and messages go home to that context under its own id.
+    async fn apply_worker_ops(&self, index: usize, base: &str, ops: &[Value]) {
+        /// A page that spawns workers without bound would pin contexts forever.
+        const MAX_WORKERS: usize = 16;
+        for op in ops.iter().take(64) {
+            let id = op["id"].as_u64().unwrap_or(0) as u32;
+            let key = (index, id);
+            match op["op"].as_str().unwrap_or("") {
+                "open" => {
+                    if self.workers.lock().map(|w| w.len()).unwrap_or(0) >= MAX_WORKERS {
+                        continue;
+                    }
+                    let raw = op["src"].as_str().unwrap_or("");
+                    // A worker is almost always built from a blob the page just
+                    // made; its bytes are in the page's own memory, not on the
+                    // network. Cloudflare's collectors are built exactly this way
+                    // — and revoke the URL on the very next line, which is why the
+                    // DOM reads the blob inside `new Worker` and sends the bytes
+                    // along. Looking them up here would find nothing.
+                    let source = if raw.starts_with("blob:") || raw.starts_with("data:") {
+                        match op["body"].as_str() {
+                            Some(body) if !body.is_empty() => body.to_string(),
+                            _ => self
+                                .eval_in(
+                                    index,
+                                    &format!(
+                                        "(() => {{ const s = globalThis.__pt_localSource && __pt_localSource({}); \
+                                           return typeof s === 'string' ? s : ''; }})()",
+                                        js_str(raw)
+                                    ),
+                                )
+                                .await
+                                .ok()
+                                .and_then(|v| v.as_str().map(str::to_string))
+                                .unwrap_or_default(),
+                        }
+                    } else {
+                        match resolve_url(base, raw) {
+                            Some(url) => match self.fetch_text(&url, "script").await {
+                                Ok((_, code)) => code,
+                                Err(e) => {
+                                    tracing::debug!(url = %url, error = %e, "worker script failed to load");
+                                    String::new()
+                                }
+                            },
+                            None => String::new(),
+                        }
+                    };
+                    if source.is_empty() {
+                        // Silence here cost an evening: a worker whose script
+                        // never arrived looked exactly like a worker that was
+                        // never asked for. Say which of the two it was — the URL
+                        // is unknown to the document, or its bytes came back
+                        // empty — since only the failing case pays for it.
+                        let why = self
+                            .eval_in(
+                                index,
+                                &format!(
+                                    "(() => {{ const m = globalThis.__pt_blobs; const b = m && m.get({}); \
+                                       return JSON.stringify({{ known: !!b, blobs: m ? m.size : -1, \
+                                         kind: b && b.constructor && b.constructor.name, \
+                                         size: b && b.size }}); }})()",
+                                    js_str(raw)
+                                ),
+                            )
+                            .await
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_string))
+                            .unwrap_or_default();
+                        tracing::debug!(src = %raw, %why, "worker script is empty, nothing to run");
+                        let _ = self
+                            .eval_in(
+                                index,
+                                &format!("__pt_workerFailed({id}, \"script not loaded\")"),
+                            )
+                            .await;
+                        continue;
+                    }
+                    let boot = self.bootstrap.clone();
+                    let Ok(Ok(child)) = self
+                        .engine
+                        .pool
+                        .dispatch(self.worker, move |iso| iso.create_context(&boot))
+                        .await
+                    else {
+                        continue;
+                    };
+                    let name = op["name"].as_str().unwrap_or("");
+                    // A blob's address is its own — resolving it against the
+                    // document turns `blob:http://host/uuid` into nonsense, and
+                    // that address is what the worker reads as `location.href`.
+                    let local = raw.starts_with("blob:") || raw.starts_with("data:");
+                    let url = if local {
+                        raw.to_string()
+                    } else {
+                        resolve_url(base, raw).unwrap_or_else(|| raw.to_string())
+                    };
+                    let _ = self
+                        .eval_in(child, &nokk_stealth::worker_scope_script(name, &url))
+                        .await;
+                    if let Ok(mut w) = self.workers.lock() {
+                        w.insert(
+                            key,
+                            WorkerState {
+                                index: child,
+                                url: url.clone(),
+                                // A worker resolves its relative requests against
+                                // its own script — unless it came from a blob,
+                                // which has no path of its own to resolve against.
+                                fetch_base: if local { base.to_string() } else { url.clone() },
+                            },
+                        );
+                    }
+                    tracing::debug!(url = %url, bytes = source.len(),
+                                    head = %&source[..source.len().min(64)], "worker started");
+                    let code = format!("{source}\n//# sourceURL={url}");
+                    if let Err(e) = self.eval_in(child, &code).await {
+                        tracing::debug!(error = %e, "worker script threw");
+                        let _ = self
+                            .eval_in(
+                                index,
+                                &format!("__pt_workerFailed({id}, {})", js_str(&e.to_string())),
+                            )
+                            .await;
+                    }
+                }
+                "post" => {
+                    let child = self
+                        .workers
+                        .lock()
+                        .ok()
+                        .and_then(|w| w.get(&key).map(|s| s.index));
+                    if let Some(child) = child {
+                        let data = op["data"].as_str().unwrap_or("null");
+                        let _ = self
+                            .eval_in(child, &format!("__pt_workerDeliver({})", js_str(data)))
+                            .await;
+                    }
+                }
+                "close" => {
+                    let gone = self.workers.lock().ok().and_then(|mut w| w.remove(&key));
+                    if let Some(state) = gone {
+                        self.dispose_worker(index, &state).await;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Give each worker its turn: its own timers and fetches, and whatever it
+    /// posted home delivered into the document that started it — the page, or the
+    /// frame, under the id that document knows it by.
+    async fn pump_workers(&self) -> Result<usize, EngineError> {
+        let workers: Vec<((usize, u32), WorkerState)> = self
+            .workers
+            .lock()
+            .map(|w| w.iter().map(|(k, s)| (*k, s.clone())).collect())
+            .unwrap_or_default();
+        let mut work = 0usize;
+        for (key, state) in workers {
+            let (owner, id) = key;
+            let child = state.index;
+            let ran = self
+                .engine
+                .pool
+                .dispatch(self.worker, move |iso| {
+                    iso.run_event_loop(child, 200, std::time::Duration::from_millis(50))
+                })
+                .await?
+                .unwrap_or(0);
+            work += ran as usize;
+
+            let qjson = self.eval_in(child, DRAIN_IO).await?;
+            let queues: Value = match qjson {
+                Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
+                _ => Value::Null,
+            };
+            if let Some(reqs) = queues["fetch"].as_array() {
+                for r in reqs.iter().take(32) {
+                    work += 1;
+                    let settle = self.perform_fetch(&state.fetch_base, r).await;
+                    let _ = self.eval_in(child, &settle).await;
+                }
+            }
+
+            // What it posted home, and whether it hung up: `close()` inside a
+            // worker ends it, and a context nobody will ever pump again should
+            // not stay on the isolate.
+            let out = self
+                .eval_in(
+                    child,
+                    "JSON.stringify({out: __pt_drainWorkerOut(), closed: !!globalThis.__ptClosed})",
+                )
+                .await?;
+            let drained: Value = out
+                .as_str()
+                .and_then(|t| serde_json::from_str(t).ok())
+                .unwrap_or(Value::Null);
+            let messages: Vec<String> = drained["out"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for m in messages {
+                work += 1;
+                let _ = self
+                    .eval_in(owner, &format!("__pt_workerMessage({id}, {})", js_str(&m)))
+                    .await;
+            }
+            if drained["closed"].as_bool().unwrap_or(false) {
+                work += 1;
+                if let Ok(mut w) = self.workers.lock() {
+                    w.remove(&key);
+                }
+                self.dispose_worker(owner, &state).await;
+            }
+        }
+        Ok(work)
+    }
+
+    /// Ask every live worker the same question, paired with the script each one
+    /// runs. A worker's context is reachable from nothing on the page — this is
+    /// the only way to read what one saw, which is what the probe tracer needs to
+    /// report a collection that happens in there.
+    pub async fn evaluate_in_workers(&self, js: &str) -> Vec<(String, Value)> {
+        let workers: Vec<WorkerState> = self
+            .workers
+            .lock()
+            .map(|w| w.values().cloned().collect())
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for state in workers {
+            if let Ok(v) = self.eval_in(state.index, js).await {
+                out.push((state.url, v));
+            }
+        }
+        out
+    }
+
+    /// Hand a worker's context back to the isolate. A worker usually ends before
+    /// anyone asks it anything — a collector posts its result and hangs up — so
+    /// with the probe tracer on, what it was asked is carried into the document
+    /// that started it before the context goes.
+    async fn dispose_worker(&self, owner: usize, state: &WorkerState) {
+        if std::env::var("NOKK_TRACE_PROBES").is_ok() {
+            let log = self
+                .eval_in(
+                    state.index,
+                    "typeof __pt_probeLog === 'function' ? __pt_probeLog() : ''",
+                )
+                .await;
+            if let Ok(Value::String(log)) = log {
+                if log.len() > 2 {
+                    let _ = self
+                        .eval_in(
+                            owner,
+                            &format!(
+                                "(globalThis.__pt_workerTrace = globalThis.__pt_workerTrace || [])\
+                                 .push([{}, {}])",
+                                js_str(&state.url),
+                                js_str(&log)
+                            ),
+                        )
+                        .await;
+                }
+            }
+        }
+        let child = state.index;
+        let _ = self
+            .engine
+            .pool
+            .dispatch(self.worker, move |iso| iso.dispose_context(child))
+            .await;
+    }
+
+    /// End the workers a document started — one document's (`Some(index)`), or
+    /// every one of this page's. A browser does exactly this when the document
+    /// goes: its workers' timers, requests and contexts go with it. Without it,
+    /// each navigation leaves a worker behind, still pumped, still fetching, for
+    /// a document that no longer exists.
+    async fn terminate_workers_of(&self, owner: Option<usize>) {
+        let gone: Vec<(usize, WorkerState)> = self
+            .workers
+            .lock()
+            .map(|mut w| {
+                let doomed: Vec<(usize, u32)> = w
+                    .keys()
+                    .filter(|(o, _)| owner.map_or(true, |idx| *o == idx))
+                    .copied()
+                    .collect();
+                doomed
+                    .iter()
+                    .filter_map(|k| w.remove(k).map(|s| (k.0, s)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (owner, state) in gone {
+            self.dispose_worker(owner, &state).await;
+        }
     }
 
     /// Whether this page has a live `<iframe>`. Same reasoning as a socket: the
@@ -1692,6 +2048,9 @@ impl BrowserContext {
                     let gone = self.frames.lock().ok().and_then(|mut f| f.remove(&id));
                     if let Some(f) = gone {
                         let idx = f.index;
+                        // A removed frame is a document that ended: its workers
+                        // end with it, exactly as they do when the page navigates.
+                        self.terminate_workers_of(Some(idx)).await;
                         let _ = self
                             .engine
                             .pool
@@ -1751,12 +2110,7 @@ impl BrowserContext {
     /// ask what it imports, fetch that, repeat — and only then instantiate. A
     /// modern site is one `<script type="module">` and nothing else, so without
     /// this the page stays blank and says nothing about why.
-    async fn run_module(
-        &self,
-        index: usize,
-        url: &str,
-        source: String,
-    ) -> Result<(), EngineError> {
+    async fn run_module(&self, index: usize, url: &str, source: String) -> Result<(), EngineError> {
         /// A page's own graph, not a package tree — this is a guard, not a budget.
         const MAX_MODULES: usize = 256;
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1775,7 +2129,9 @@ impl BrowserContext {
             for spec in requests {
                 // A bare specifier ("react") needs an import map to mean anything;
                 // a bundled page never has one, and guessing would be worse.
-                let Some(target) = resolve_url(&at, &spec) else { continue };
+                let Some(target) = resolve_url(&at, &spec) else {
+                    continue;
+                };
                 let (i, from, sp, to) = (index, at.clone(), spec.clone(), target.clone());
                 self.engine
                     .pool
@@ -1880,9 +2236,8 @@ impl BrowserContext {
     /// Record when the page's earliest timer comes due (`-1` = none pending), as
     /// the JS queue just reported it.
     fn note_next_timer(&self, delay_ms: i64) {
-        let at = (delay_ms >= 0).then(|| {
-            std::time::Instant::now() + std::time::Duration::from_millis(delay_ms as u64)
-        });
+        let at = (delay_ms >= 0)
+            .then(|| std::time::Instant::now() + std::time::Duration::from_millis(delay_ms as u64));
         if let Ok(mut slot) = self.next_timer_at.lock() {
             *slot = at;
         }
@@ -1946,6 +2301,17 @@ impl BrowserContext {
                 if !ops.is_empty() {
                     work += ops.len();
                     self.apply_script_ops(index, &base, ops).await;
+                }
+            }
+
+            // A widget's collection runs in workers *it* started, not the page's:
+            // the frame builds the blob, the frame spawns the worker, and the
+            // fingerprint is taken in there. Draining only the page's queue left
+            // those workers unborn on every real challenge.
+            if let Some(ops) = queues["workers"].as_array() {
+                if !ops.is_empty() {
+                    work += ops.len();
+                    self.apply_worker_ops(index, &base, ops).await;
                 }
             }
 
@@ -2383,6 +2749,7 @@ const DRAIN_IO: &str = "JSON.stringify({\
     frames: typeof __pt_drainFrameQueue === 'function' ? __pt_drainFrameQueue() : [],\
     scripts: typeof __pt_drainScriptQueue === 'function' ? __pt_drainScriptQueue() : [],\
     nav: typeof __pt_drainNavQueue === 'function' ? __pt_drainNavQueue() : [],\
+    workers: typeof __pt_drainWorkerQueue === 'function' ? __pt_drainWorkerQueue() : [],\
     timers: typeof __pt_nextTimerDelay === 'function' ? __pt_nextTimerDelay() : -1})";
 
 /// How long [`BrowserContext::run_event_loop`] may spend *waiting* for timers
@@ -4606,7 +4973,11 @@ mod tests {
         let _serial = serial().await;
         let url = cookie_server().await;
         let engine = Engine::new(EngineConfig {
-            pool: PoolConfig { workers: 1, max_live_contexts: 4, max_heap_mb: None },
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 4,
+                max_heap_mb: None,
+            },
             use_real_network: true,
             ..Default::default()
         })
@@ -4941,7 +5312,10 @@ mod tests {
 
     /// Serves a module graph and records the headers of every request, so a test
     /// can assert both what ran and what went on the wire.
-    async fn module_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+    async fn module_server() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    ) {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -5004,7 +5378,11 @@ mod tests {
         let _serial = serial().await;
         let (url, _log) = module_server().await;
         let engine = Engine::new(EngineConfig {
-            pool: PoolConfig { workers: 1, max_live_contexts: 4, max_heap_mb: None },
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 4,
+                max_heap_mb: None,
+            },
             use_real_network: true,
             ..Default::default()
         })
@@ -5018,7 +5396,9 @@ mod tests {
             meta: String(globalThis.__meta || '').split('/').pop(),
             // A page-built event stays untrusted even here.
             trusted: new MouseEvent('click').isTrusted,
-        })"#).await;
+        })"#,
+        )
+        .await;
 
         assert_eq!(out["text"], "built by a module", "the import chain ran: {out}");
         assert_eq!(out["defined"], "function", "and defined its element");
@@ -5037,7 +5417,11 @@ mod tests {
         let _serial = serial().await;
         let (url, log) = module_server().await;
         let engine = Engine::new(EngineConfig {
-            pool: PoolConfig { workers: 1, max_live_contexts: 4, max_heap_mb: None },
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 4,
+                max_heap_mb: None,
+            },
             use_real_network: true,
             ..Default::default()
         })
@@ -5051,7 +5435,9 @@ mod tests {
             where: location.pathname,
             text: document.body.textContent.trim(),
             isObject: typeof location === 'object' && typeof location.href === 'string',
-        })"#).await;
+        })"#,
+        )
+        .await;
         assert_eq!(out["where"], "/second", "the assignment navigated");
         assert_eq!(out["text"], "second");
         assert_eq!(out["isObject"], true, "and location is still Location, not a string");
@@ -5151,6 +5537,10 @@ mod tests {
               screen: typeof screen,
               fetch: typeof fetch,
               json: typeof JSON.parse,
+              own: Object.getOwnPropertyNames(self).length,
+              keys: Object.keys(self).length,
+              scope: Object.getOwnPropertyNames(Object.getPrototypeOf(Object.getPrototypeOf(self))).length,
+              navProto: Object.getOwnPropertyNames(Object.getPrototypeOf(navigator)).length - 1,
             });`;
             const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
             globalThis.__fromWorker = null;
@@ -5171,6 +5561,209 @@ mod tests {
         }
         assert_eq!(out["fetch"], "function", "what a worker does have, it has");
         assert_eq!(out["json"], "function", "the language comes along");
+        // Measured against Chrome 148, level by level: the shape of the realm is
+        // the first thing a collector inside a worker enumerates.
+        assert_eq!(out["own"], 334, "own names on the scope: {out}");
+        assert_eq!(out["keys"], 12, "and twelve of them enumerable");
+        assert_eq!(out["scope"], 30, "WorkerGlobalScope carries the rest");
+        // Chrome carries 23; a context with no network reports one fewer (no
+        // `connection`), so the floor is what matters — the window's Navigator
+        // has more than a hundred.
+        assert!(
+            (22..=23).contains(&out["navProto"].as_u64().unwrap_or(0)),
+            "WorkerNavigator's own members: {out}"
+        );
+    }
+
+    /// The port between a page and its worker, and the end of one. Three things a
+    /// browser does that a shim gets wrong: a worker built from a blob reads that
+    /// blob's address as its own (`blob:<origin>/<uuid>`, opaque path, no host,
+    /// the page's origin), a posted message runs the handler exactly once, and
+    /// `close()` ends the worker — which has to reach the engine, or a context
+    /// nobody will ever pump again stays on the isolate.
+    #[tokio::test]
+    async fn a_worker_is_a_port_with_one_delivery_and_a_hang_up() {
+        let _serial = serial().await;
+        let engine = engine(1, 3);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/app/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        ctx.evaluate(r#"(() => {
+            const src = `let n = 0;
+              self.onmessage = (e) => {
+                n += 1;
+                postMessage({
+                  n, echo: e.data && e.data.ping,
+                  href: String(location.href), origin: location.origin,
+                  host: location.host, path: String(location.pathname),
+                  native: Function.prototype.toString.call(postMessage).indexOf('[native code]') >= 0,
+                });
+                close();
+              };`;
+            const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+            globalThis.__seen = [];
+            globalThis.__tag = Object.prototype.toString.call(w);
+            w.onmessage = (e) => { globalThis.__seen.push(e.data); };
+            w.postMessage({ ping: 1 });
+            return 1;
+        })()"#).await.unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        let tag = probe(&ctx, "JSON.stringify({t: globalThis.__tag})").await;
+        assert_eq!(tag["t"], "[object Worker]", "a Worker says what it is");
+        let seen = probe(&ctx, "JSON.stringify(globalThis.__seen || [])").await;
+        let msgs = seen.as_array().cloned().unwrap_or_default();
+        assert_eq!(msgs.len(), 1, "one message posted, one delivered: {seen}");
+        let m = &msgs[0];
+        assert_eq!(m["n"], 1, "and the handler ran once, not twice: {seen}");
+        assert_eq!(m["echo"], 1, "carrying what the page sent");
+        assert_eq!(m["native"], true, "the port's own methods read native");
+        // The blob's address, as a browser reports it inside the worker.
+        let href = m["href"].as_str().unwrap_or_default();
+        assert!(
+            href.starts_with("blob:https://example.com/") && href.len() == 61,
+            "blob: URL is `blob:<origin>/<uuid>`, got {href}"
+        );
+        assert_eq!(m["origin"], "https://example.com", "the page's origin");
+        assert_eq!(m["host"], "", "an opaque path has no host");
+        assert_eq!(
+            m["path"],
+            href.trim_start_matches("blob:"),
+            "all of it is path"
+        );
+        // `close()` was called, so the worker is gone — with its context.
+        assert!(
+            ctx.workers.lock().unwrap().is_empty(),
+            "a worker that hung up is not still on the isolate"
+        );
+    }
+
+    /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`
+    /// is the idiom every collector uses, Cloudflare's included — the URL is dead
+    /// one line after the worker starts. Reading the blob when the engine got
+    /// round to the op found nothing, and the worker silently never ran; a
+    /// browser takes the bytes inside `new Worker`, so the DOM does too. The
+    /// bytes may also *be* bytes: a `Blob` over a `Uint8Array` is a script, not
+    /// the string "104,105".
+    #[tokio::test]
+    async fn a_worker_survives_the_url_being_revoked() {
+        let _serial = serial().await;
+        let engine = engine(1, 3);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        ctx.evaluate(r#"(() => {
+            const bytes = new TextEncoder().encode('postMessage({ ran: true });');
+            const u = URL.createObjectURL(new Blob([bytes], { type: 'text/javascript' }));
+            const w = new Worker(u);
+            URL.revokeObjectURL(u);
+            globalThis.__ran = null;
+            w.onmessage = (e) => { globalThis.__ran = e.data; };
+            return 1;
+        })()"#).await.unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        let out = probe(&ctx, "JSON.stringify(globalThis.__ran || {})").await;
+        assert_eq!(out["ran"], true, "the worker ran from a revoked URL: {out}");
+    }
+
+    /// A widget collects from inside its own frame: the frame builds the blob,
+    /// the frame spawns the worker, and the fingerprint is taken in there. Only
+    /// the page's queue used to be drained, so on a real challenge those workers
+    /// were never born — and ids are per-document, so a frame's worker 1 must not
+    /// be the page's worker 1.
+    #[tokio::test]
+    async fn a_frame_starts_workers_of_its_own() {
+        let _serial = serial().await;
+        let url = frame_ping_server().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 5,
+                max_heap_mb: None,
+            },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&url).await.unwrap();
+        for _ in 0..3 {
+            ctx.run_event_loop().await.unwrap();
+        }
+        let frame = ctx.frame_list().first().map(|f| f.id).expect("a frame");
+
+        // Both documents start a worker, and each one's id is 1.
+        let spawn = r#"(() => {
+            const src = `postMessage({ where: Object.prototype.toString.call(self), href: location.href });`;
+            const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+            globalThis.__from = null;
+            w.onmessage = (e) => { globalThis.__from = e.data; };
+            return 1;
+        })()"#;
+        ctx.evaluate(spawn).await.unwrap();
+        ctx.evaluate_in_frame(frame, spawn).await.unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        assert_eq!(
+            ctx.workers.lock().unwrap().len(),
+            2,
+            "the page's worker and the frame's are two workers, not one"
+        );
+        let from_page = probe(&ctx, "JSON.stringify(globalThis.__from || {})").await;
+        assert_eq!(
+            from_page["where"], "[object DedicatedWorkerGlobalScope]",
+            "the page heard back from its own: {from_page}"
+        );
+        let out = ctx
+            .evaluate_in_frame(frame, "JSON.stringify(globalThis.__from || {})")
+            .await
+            .unwrap();
+        let from_frame: Value = out
+            .as_str()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        assert_eq!(
+            from_frame["where"], "[object DedicatedWorkerGlobalScope]",
+            "and the frame from its own: {from_frame}"
+        );
+    }
+
+    /// A document that goes away takes its workers with it. Without this each
+    /// navigation left one behind — still pumped, still fetching, on a page it no
+    /// longer belongs to.
+    #[tokio::test]
+    async fn navigating_away_ends_the_page_workers() {
+        let _serial = serial().await;
+        let engine = engine(1, 3);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+        ctx.evaluate(
+            "new Worker(URL.createObjectURL(new Blob(['setInterval(() => {}, 5)'], \
+             { type: 'text/javascript' })))",
+        )
+        .await
+        .unwrap();
+        ctx.run_event_loop().await.unwrap();
+        assert_eq!(
+            ctx.workers.lock().unwrap().len(),
+            1,
+            "the worker is running"
+        );
+
+        ctx.load_html("https://example.com/next", "<html><body>next</body></html>")
+            .await
+            .unwrap();
+        assert!(
+            ctx.workers.lock().unwrap().is_empty(),
+            "the previous document's worker did not survive the navigation"
+        );
     }
 
     /// Three things anti-bot code reads that we answered wrongly, each found by
@@ -5186,7 +5779,11 @@ mod tests {
         let _serial = serial().await;
         let url = frame_server().await;
         let engine = Engine::new(EngineConfig {
-            pool: PoolConfig { workers: 1, max_live_contexts: 4, max_heap_mb: None },
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 4,
+                max_heap_mb: None,
+            },
             use_real_network: true,
             ..Default::default()
         })
@@ -5200,7 +5797,9 @@ mod tests {
             return JSON.stringify([named(window), named(navigator), named(screen), named(location),
               named(history), named(document), named(document.body),
               named(document.createElement('canvas')), named(document.createTextNode('x'))]);
-        })()"#).await;
+        })()"#,
+        )
+        .await;
         assert_eq!(
             names,
             serde_json::json!([
@@ -5244,8 +5843,13 @@ mod tests {
             state: __pc.iceGatheringState,
             sdp: /a=ice-ufrag:.+/.test(__pc.localDescription.sdp)
                  && /a=fingerprint:sha-256 /.test(__pc.localDescription.sdp),
-        })"#).await;
-        assert!(ice["candidates"].as_u64().unwrap_or(0) >= 1, "ICE gathers: {ice}");
+        })"#,
+        )
+        .await;
+        assert!(
+            ice["candidates"].as_u64().unwrap_or(0) >= 1,
+            "ICE gathers: {ice}"
+        );
         assert_eq!(ice["ended"], true, "and says when it is done");
         assert_eq!(ice["mdns"], true, "behind an mDNS name, as Chrome has since 2019");
         assert_eq!(ice["state"], "complete");
@@ -5264,7 +5868,11 @@ mod tests {
         let _serial = serial().await;
         let url = frame_server().await;
         let engine = Engine::new(EngineConfig {
-            pool: PoolConfig { workers: 1, max_live_contexts: 4, max_heap_mb: None },
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 4,
+                max_heap_mb: None,
+            },
             use_real_network: true,
             ..Default::default()
         })
@@ -5305,7 +5913,11 @@ mod tests {
         let _serial = serial().await;
         let url = frame_server().await;
         let engine = Engine::new(EngineConfig {
-            pool: PoolConfig { workers: 1, max_live_contexts: 4, max_heap_mb: None },
+            pool: PoolConfig {
+                workers: 1,
+                max_live_contexts: 4,
+                max_heap_mb: None,
+            },
             use_real_network: true,
             ..Default::default()
         })
@@ -5318,7 +5930,9 @@ mod tests {
             const f = document.getElementById('w');
             const r = f.getBoundingClientRect();
             return JSON.stringify({ x: r.x, y: r.y, w: r.width, h: r.height });
-        })()"#).await;
+        })()"#,
+        )
+        .await;
         let (x, y) = (
             rect["x"].as_f64().unwrap() + 10.0,
             rect["y"].as_f64().unwrap() + 5.0,

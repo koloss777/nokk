@@ -527,7 +527,10 @@ pub fn bootstrap_script(profile: &StealthProfile) -> String {
         .replace("__TZ_NAME_STD__", &quoted(&profile.timezone_name_std))
         .replace("__TZ_NAME_DST__", &quoted(&profile.timezone_name_dst));
 
-    let timers = TIMERS_TEMPLATE.replace("__FAST_TIMERS__", if fast_timers() { "true" } else { "false" });
+    let timers = TIMERS_TEMPLATE.replace(
+        "__FAST_TIMERS__",
+        if fast_timers() { "true" } else { "false" },
+    );
 
     format!("{env}\n{intl}\n{timers}\n{PERFORMANCE_TEMPLATE}\n{CRYPTO_TEMPLATE}\n{FETCH_TEMPLATE}")
 }
@@ -1156,6 +1159,211 @@ pub fn probe_tracer_script() -> String {
   traceData(globalThis, 'win.');
 })();"##
         .to_string()
+}
+
+/// Turn a freshly created context into a worker's global scope. A worker is not
+/// a window with things missing — it is a different global object, and code that
+/// collects a fingerprint inside one knows exactly what belongs there. Running it
+/// in the page's realm, however carefully shimmed, gets the realm wrong; this
+/// runs in a context of its own, and only reshapes what that context exposes.
+/// Имена воркерной области, снятые с Chrome 148 (см. `worker_scope_script`).
+const WORKER_OWN: &str = r#"["AbortController", "AbortSignal", "AggregateError", "Array", "ArrayBuffer", "AsyncDisposableStack", "Atomics", "AudioData", "AudioDecoder", "AudioEncoder", "BackgroundFetchManager", "BackgroundFetchRecord", "BackgroundFetchRegistration", "BigInt", "BigInt64Array", "BigUint64Array", "Blob", "Boolean", "BroadcastChannel", "ByteLengthQueuingStrategy", "CSSSkewX", "CSSSkewY", "Cache", "CacheStorage", "CanvasGradient", "CanvasPattern", "CloseEvent", "CompressionStream", "CountQueuingStrategy", "CreateMonitor", "CropTarget", "Crypto", "CryptoKey", "CustomEvent", "DOMException", "DOMMatrix", "DOMMatrixReadOnly", "DOMPoint", "DOMPointReadOnly", "DOMQuad", "DOMRect", "DOMRectReadOnly", "DOMStringList", "DataView", "Date", "DecompressionStream", "DedicatedWorkerGlobalScope", "DisposableStack", "EncodedAudioChunk", "EncodedVideoChunk", "Error", "ErrorEvent", "EvalError", "Event", "EventSource", "EventTarget", "File", "FileList", "FileReader", "FileReaderSync", "FileSystemDirectoryHandle", "FileSystemFileHandle", "FileSystemHandle", "FileSystemObserver", "FileSystemSyncAccessHandle", "FileSystemWritableFileStream", "FinalizationRegistry", "Float16Array", "Float32Array", "Float64Array", "FontFace", "FormData", "Function", "GPU", "GPUAdapter", "GPUAdapterInfo", "GPUBindGroup", "GPUBindGroupLayout", "GPUBuffer", "GPUBufferUsage", "GPUCanvasContext", "GPUColorWrite", "GPUCommandBuffer", "GPUCommandEncoder", "GPUCompilationInfo", "GPUCompilationMessage", "GPUComputePassEncoder", "GPUComputePipeline", "GPUDevice", "GPUDeviceLostInfo", "GPUError", "GPUExternalTexture", "GPUInternalError", "GPUMapMode", "GPUOutOfMemoryError", "GPUPipelineError", "GPUPipelineLayout", "GPUQuerySet", "GPUQueue", "GPURenderBundle", "GPURenderBundleEncoder", "GPURenderPassEncoder", "GPURenderPipeline", "GPUSampler", "GPUShaderModule", "GPUShaderStage", "GPUSupportedFeatures", "GPUSupportedLimits", "GPUTexture", "GPUTextureUsage", "GPUTextureView", "GPUUncapturedErrorEvent", "GPUValidationError", "HID", "HIDConnectionEvent", "HIDDevice", "HIDInputReportEvent", "Headers", "IDBCursor", "IDBCursorWithValue", "IDBDatabase", "IDBFactory", "IDBIndex", "IDBKeyRange", "IDBObjectStore", "IDBOpenDBRequest", "IDBRecord", "IDBRequest", "IDBTransaction", "IDBVersionChangeEvent", "IdleDetector", "ImageBitmap", "ImageBitmapRenderingContext", "ImageData", "ImageDecoder", "ImageTrack", "ImageTrackList", "Infinity", "Int16Array", "Int32Array", "Int8Array", "Intl", "Iterator", "JSON", "Lock", "LockManager", "Map", "Math", "MediaCapabilities", "MediaSource", "MediaSourceHandle", "MessageChannel", "MessageEvent", "MessagePort", "NaN", "NavigationPreloadManager", "NavigatorUAData", "NetworkInformation", "Notification", "Number", "Object", "Observable", "OffscreenCanvas", "OffscreenCanvasRenderingContext2D", "Origin", "Path2D", "Performance", "PerformanceEntry", "PerformanceMark", "PerformanceMeasure", "PerformanceObserver", "PerformanceObserverEntryList", "PerformanceResourceTiming", "PerformanceServerTiming", "PeriodicSyncManager", "PermissionStatus", "Permissions", "PressureObserver", "PressureRecord", "ProgressEvent", "Promise", "PromiseRejectionEvent", "Proxy", "PushManager", "PushSubscription", "PushSubscriptionOptions", "QuotaExceededError", "RTCDataChannel", "RTCEncodedAudioFrame", "RTCEncodedVideoFrame", "RTCRtpScriptTransformer", "RTCTransformEvent", "RangeError", "ReadableByteStreamController", "ReadableStream", "ReadableStreamBYOBReader", "ReadableStreamBYOBRequest", "ReadableStreamDefaultController", "ReadableStreamDefaultReader", "ReferenceError", "Reflect", "RegExp", "ReportBody", "ReportingObserver", "Request", "Response", "RestrictionTarget", "Scheduler", "SecurityPolicyViolationEvent", "Serial", "SerialPort", "ServiceWorkerRegistration", "Set", "SourceBuffer", "SourceBufferList", "StorageBucket", "StorageBucketManager", "StorageManager", "String", "Subscriber", "SubtleCrypto", "SuppressedError", "Symbol", "SyncManager", "SyntaxError", "TaskController", "TaskPriorityChangeEvent", "TaskSignal", "Temporal", "TextDecoder", "TextDecoderStream", "TextEncoder", "TextEncoderStream", "TextMetrics", "TransformStream", "TransformStreamDefaultController", "TrustedHTML", "TrustedScript", "TrustedScriptURL", "TrustedTypePolicy", "TrustedTypePolicyFactory", "TypeError", "URIError", "URL", "URLPattern", "URLSearchParams", "USB", "USBAlternateInterface", "USBConfiguration", "USBConnectionEvent", "USBDevice", "USBEndpoint", "USBInTransferResult", "USBInterface", "USBIsochronousInTransferPacket", "USBIsochronousInTransferResult", "USBIsochronousOutTransferPacket", "USBIsochronousOutTransferResult", "USBOutTransferResult", "Uint16Array", "Uint32Array", "Uint8Array", "Uint8ClampedArray", "UserActivation", "VideoColorSpace", "VideoDecoder", "VideoEncoder", "VideoFrame", "WGSLLanguageFeatures", "WeakMap", "WeakRef", "WeakSet", "WebAssembly", "WebGL2RenderingContext", "WebGLActiveInfo", "WebGLBuffer", "WebGLContextEvent", "WebGLFramebuffer", "WebGLObject", "WebGLProgram", "WebGLQuery", "WebGLRenderbuffer", "WebGLRenderingContext", "WebGLSampler", "WebGLShader", "WebGLShaderPrecisionFormat", "WebGLSync", "WebGLTexture", "WebGLTransformFeedback", "WebGLUniformLocation", "WebGLVertexArrayObject", "WebSocket", "WebSocketError", "WebSocketStream", "WebTransport", "WebTransportBidirectionalStream", "WebTransportDatagramDuplexStream", "WebTransportError", "Worker", "WorkerGlobalScope", "WorkerLocation", "WorkerNavigator", "WritableStream", "WritableStreamDefaultController", "WritableStreamDefaultWriter", "XMLHttpRequest", "XMLHttpRequestEventTarget", "XMLHttpRequestUpload", "cancelAnimationFrame", "close", "console", "decodeURI", "decodeURIComponent", "encodeURI", "encodeURIComponent", "escape", "eval", "globalThis", "isFinite", "isNaN", "name", "onmessage", "onmessageerror", "onrtctransform", "parseFloat", "parseInt", "postMessage", "requestAnimationFrame", "undefined", "unescape", "webkitRequestFileSystem", "webkitRequestFileSystemSync", "webkitResolveLocalFileSystemSyncURL", "webkitResolveLocalFileSystemURL"]"#;
+const WORKER_ENUMERABLE: &str = r#"["cancelAnimationFrame", "close", "name", "onmessage", "onmessageerror", "onrtctransform", "postMessage", "requestAnimationFrame", "webkitRequestFileSystem", "webkitRequestFileSystemSync", "webkitResolveLocalFileSystemSyncURL", "webkitResolveLocalFileSystemURL"]"#;
+const WORKER_NAVIGATOR: &str = r#"["appCodeName", "appName", "appVersion", "connection", "deviceMemory", "gpu", "hardwareConcurrency", "hid", "language", "languages", "locks", "mediaCapabilities", "onLine", "permissions", "platform", "product", "serial", "storage", "storageBuckets", "usb", "userAgent", "userAgentData"]"#;
+
+/// Имена воркерной области, снятые с Chrome 148 (см. `worker_scope_script`).
+const WORKER_SCOPE: &str = r#"["atob", "btoa", "caches", "clearInterval", "clearTimeout", "createImageBitmap", "crossOriginIsolated", "crypto", "fetch", "fonts", "importScripts", "indexedDB", "isSecureContext", "location", "navigator", "onerror", "onlanguagechange", "onrejectionhandled", "onunhandledrejection", "origin", "performance", "queueMicrotask", "reportError", "scheduler", "self", "setInterval", "setTimeout", "structuredClone", "trustedTypes"]"#;
+const WORKER_SCOPE_ENUMERABLE: &str = r#"["atob", "btoa", "caches", "clearInterval", "clearTimeout", "createImageBitmap", "crossOriginIsolated", "crypto", "fetch", "fonts", "importScripts", "indexedDB", "isSecureContext", "location", "navigator", "onerror", "onlanguagechange", "onrejectionhandled", "onunhandledrejection", "origin", "performance", "queueMicrotask", "reportError", "scheduler", "self", "setInterval", "setTimeout", "structuredClone", "trustedTypes"]"#;
+
+pub fn worker_scope_script(name: &str, url: &str) -> String {
+    format!(
+        r##"(() => {{
+  const NAME = {name};
+  const URL_ = {url};
+  // Форма снята с настоящего воркера Chrome 148, уровень за уровнем: у самой
+  // области 334 собственных имени (12 перечислимых), у WorkerGlobalScope — 30,
+  // у DedicatedWorkerGlobalScope — TEMPORARY и PERSISTENT. Оконный контекст
+  // отдаёт больше тысячи имён на первом же уровне, и перечисление `self` —
+  // первое, что делает сборщик отпечатков внутри воркера.
+  const OWN = new Set(__WORKER_OWN__);
+  const OWN_ENUM = new Set(__WORKER_ENUM__);
+  const SCOPE = __WORKER_SCOPE__;
+  const SCOPE_ENUM = new Set(__WORKER_SCOPE_ENUM__);
+  const NAV_KEYS = __WORKER_NAV__;
+
+  // 1. Уровень WorkerGlobalScope: то, что в браузере лежит на прототипе, туда и
+  //    переезжает вместе со своей реализацией.
+  const EventTargetProto = (globalThis.EventTarget && EventTarget.prototype) || Object.prototype;
+  const wgsProto = Object.create(EventTargetProto);
+  for (const k of SCOPE) {{
+    let d;
+    try {{ d = Object.getOwnPropertyDescriptor(globalThis, k); }} catch (e) {{ continue; }}
+    if (d) {{
+      try {{ Object.defineProperty(wgsProto, k, Object.assign({{}}, d, {{ enumerable: SCOPE_ENUM.has(k) }})); }} catch (e) {{}}
+      try {{ delete globalThis[k]; }} catch (e) {{}}
+    }}
+  }}
+
+  // 2. Всё, чего в воркере нет вовсе — прочь. Интерфейсы DOM в том числе.
+  for (const k of Object.getOwnPropertyNames(globalThis)) {{
+    if (OWN.has(k) || k.lastIndexOf('__pt', 0) === 0 || k === '__out') continue;
+    try {{ delete globalThis[k]; }} catch (e) {{}}
+  }}
+  for (const k of Object.getOwnPropertyNames(globalThis)) {{
+    if (k.lastIndexOf('__pt', 0) === 0 || k === '__out') continue;
+    try {{
+      const d = Object.getOwnPropertyDescriptor(globalThis, k);
+      if (d && d.configurable && !!d.enumerable !== OWN_ENUM.has(k)) {{
+        Object.defineProperty(globalThis, k, Object.assign({{}}, d, {{ enumerable: OWN_ENUM.has(k) }}));
+      }}
+    }} catch (e) {{}}
+  }}
+
+  // 3. WorkerNavigator: то же устройство, обрезанный интерфейс.
+  // Оконный navigator уже переехал на прототип на шаге 1 — значения берём оттуда.
+  let win = null;
+  try {{ win = wgsProto.navigator; }} catch (e) {{}}
+  const navProto = {{}};
+  for (const k of NAV_KEYS) {{
+    let value;
+    try {{ value = win && win[k]; }} catch (e) {{ continue; }}
+    if (value === undefined) continue;
+    Object.defineProperty(navProto, k, {{ get: () => value, enumerable: true, configurable: true }});
+  }}
+  try {{ Object.defineProperty(navProto, Symbol.toStringTag, {{ value: 'WorkerNavigator', configurable: true }}); }} catch (e) {{}}
+  const WorkerNavigator = function WorkerNavigator() {{ throw new TypeError('Illegal constructor'); }};
+  WorkerNavigator.prototype = navProto;
+  Object.defineProperty(navProto, 'constructor', {{ value: WorkerNavigator, writable: true, configurable: true }});
+  globalThis.WorkerNavigator = WorkerNavigator;
+  const workerNavigator = Object.create(navProto);
+  Object.defineProperty(wgsProto, 'navigator', {{ get: () => workerNavigator, enumerable: true, configurable: true }});
+
+  // 4. WorkerLocation — адрес самого скрипта. У воркера из блоба схема
+  //    непрозрачная: `href` — это `blob:<внутренний адрес>` целиком, `pathname`
+  //    — весь остаток, хоста и порта нет вовсе, а `origin` берётся у страницы,
+  //    которая блоб создала. Разбирать такой адрес как обычный `http:` — значит
+  //    выдать `blob://http://…`, чего браузер не печатал никогда.
+  const locProto = {{}};
+  const opaque = URL_.lastIndexOf('blob:', 0) === 0 || URL_.lastIndexOf('data:', 0) === 0;
+  let parts = null;
+  if (opaque) {{
+    const rest = URL_.slice(URL_.indexOf(':') + 1);
+    let inner = '';
+    try {{ inner = URL_.lastIndexOf('blob:', 0) === 0 ? new URL(rest).origin : 'null'; }} catch (e) {{ inner = 'null'; }}
+    parts = {{
+      href: URL_, origin: inner, protocol: URL_.slice(0, URL_.indexOf(':') + 1),
+      host: '', hostname: '', port: '', pathname: rest, search: '', hash: '',
+    }};
+  }} else {{
+    try {{ parts = new URL(URL_); }} catch (e) {{}}
+  }}
+  for (const k of ['href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash']) {{
+    const v = parts ? String(parts[k] || '') : (k === 'href' ? URL_ : '');
+    Object.defineProperty(locProto, k, {{ get: () => v, enumerable: true, configurable: true }});
+  }}
+  Object.defineProperty(locProto, 'toString', {{ value: function toString() {{ return this.href; }}, writable: true, configurable: true }});
+  try {{ Object.defineProperty(locProto, Symbol.toStringTag, {{ value: 'WorkerLocation', configurable: true }}); }} catch (e) {{}}
+  const WorkerLocation = function WorkerLocation() {{ throw new TypeError('Illegal constructor'); }};
+  WorkerLocation.prototype = locProto;
+  Object.defineProperty(locProto, 'constructor', {{ value: WorkerLocation, writable: true, configurable: true }});
+  globalThis.WorkerLocation = WorkerLocation;
+  const workerLocation = Object.create(locProto);
+  Object.defineProperty(wgsProto, 'location', {{ get: () => workerLocation, enumerable: true, configurable: true }});
+
+  // 5. Сама цепочка: globalThis → DedicatedWorkerGlobalScope → WorkerGlobalScope
+  //    → EventTarget → Object, как в браузере.
+  const WorkerGlobalScope = function WorkerGlobalScope() {{ throw new TypeError('Illegal constructor'); }};
+  WorkerGlobalScope.prototype = wgsProto;
+  Object.defineProperty(wgsProto, 'constructor', {{ value: WorkerGlobalScope, writable: true, configurable: true }});
+  try {{ Object.defineProperty(wgsProto, Symbol.toStringTag, {{ value: 'WorkerGlobalScope', configurable: true }}); }} catch (e) {{}}
+  Object.defineProperty(wgsProto, 'self', {{ get: () => globalThis, enumerable: true, configurable: true }});
+
+  const dwgsProto = Object.create(wgsProto);
+  const DedicatedWorkerGlobalScope = function DedicatedWorkerGlobalScope() {{ throw new TypeError('Illegal constructor'); }};
+  DedicatedWorkerGlobalScope.prototype = dwgsProto;
+  Object.defineProperty(dwgsProto, 'constructor', {{ value: DedicatedWorkerGlobalScope, writable: true, configurable: true }});
+  Object.defineProperty(dwgsProto, 'TEMPORARY', {{ value: 0, enumerable: true, configurable: true }});
+  Object.defineProperty(dwgsProto, 'PERSISTENT', {{ value: 1, enumerable: true, configurable: true }});
+  try {{ Object.defineProperty(dwgsProto, Symbol.toStringTag, {{ value: 'DedicatedWorkerGlobalScope', configurable: true }}); }} catch (e) {{}}
+  globalThis.WorkerGlobalScope = WorkerGlobalScope;
+  globalThis.DedicatedWorkerGlobalScope = DedicatedWorkerGlobalScope;
+  try {{ Object.setPrototypeOf(globalThis, dwgsProto); }} catch (e) {{}}
+  // Окно называло себя окном — здесь это имя принадлежит прототипу области.
+  try {{ delete globalThis[Symbol.toStringTag]; }} catch (e) {{}}
+
+  // 6. Чего у нас не было вовсе — доставляем заглушками той же категории, что и
+  //    в браузере: воркерные синхронные API и трансформы RTC.
+  for (const [k, kind] of [['FileReaderSync', 'N'], ['FileSystemSyncAccessHandle', 'N'],
+    ['RTCRtpScriptTransformer', 'N'], ['RTCTransformEvent', 'N'],
+    ['webkitRequestFileSystemSync', 'N'], ['webkitResolveLocalFileSystemSyncURL', 'N'],
+    ['onrtctransform', 'x']]) {{
+    if (k in globalThis) continue;
+    const value = kind === 'N' ? (() => {{
+      const f = function () {{ throw new TypeError('Illegal constructor'); }};
+      try {{ Object.defineProperty(f, 'name', {{ value: k, configurable: true }}); }} catch (e) {{}}
+      return globalThis.__pt_native ? __pt_native(f) : f;
+    }})() : null;
+    try {{
+      Object.defineProperty(globalThis, k, {{
+        value, writable: true, configurable: true, enumerable: OWN_ENUM.has(k),
+      }});
+    }} catch (e) {{}}
+  }}
+  for (const k of ['importScripts']) {{
+    if (k in wgsProto) continue;
+    const f = function importScripts() {{}};
+    try {{ Object.defineProperty(wgsProto, k, {{ value: globalThis.__pt_native ? __pt_native(f) : f, writable: true, configurable: true, enumerable: true }}); }} catch (e) {{}}
+  }}
+  if (!('fonts' in wgsProto)) {{
+    const fonts = {{ ready: Promise.resolve(), check: () => true, load: () => Promise.resolve([]), size: 0 }};
+    try {{ Object.defineProperty(wgsProto, 'fonts', {{ get: () => fonts, enumerable: true, configurable: true }}); }} catch (e) {{}}
+  }}
+  // Интерфейсы воркерной области перечислимыми не бывают.
+  for (const k of ['WorkerGlobalScope', 'DedicatedWorkerGlobalScope', 'WorkerNavigator', 'WorkerLocation']) {{
+    try {{
+      const d = Object.getOwnPropertyDescriptor(globalThis, k);
+      if (d) Object.defineProperty(globalThis, k, Object.assign({{}}, d, {{ enumerable: false }}));
+    }} catch (e) {{}}
+  }}
+
+  // 7. Порт наружу. Обе стороны порта — родные методы области, и `toString`
+  //    у них такой же, как у остальных: воркер, чей `postMessage` показывает
+  //    исходник, — не воркер.
+  globalThis.name = NAME;
+  const native = (f) => (globalThis.__pt_native ? __pt_native(f) : f);
+  const outbox = [];
+  globalThis.__pt_drainWorkerOut = () => outbox.splice(0);
+  globalThis.postMessage = native(function postMessage(data) {{
+    try {{ outbox.push(JSON.stringify(data === undefined ? null : data)); }} catch (e) {{ outbox.push('null'); }}
+  }});
+  globalThis.close = native(function close() {{ globalThis.__ptClosed = true; }});
+  globalThis.__pt_workerDeliver = (json) => {{
+    let data = null;
+    try {{ data = JSON.parse(json); }} catch (e) {{}}
+    // У выделенного воркера `origin` пустой, а `source` — null: сообщение
+    // пришло по порту, а не от окна.
+    let ev;
+    try {{ ev = new MessageEvent('message', {{ data, origin: '', lastEventId: '', source: null, ports: [] }}); }} catch (e) {{
+      ev = {{ type: 'message', data, origin: '', lastEventId: '', source: null, ports: [] }};
+    }}
+    try {{ ev.target = globalThis; ev.currentTarget = globalThis; }} catch (e) {{}}
+    // Одна доставка, а не две: `dispatchEvent` сам зовёт и слушателей, и
+    // `onmessage`. Звать обоих — значит выполнить обработчик дважды, чего в
+    // браузере не бывает и что ломает любой счётчик внутри воркера.
+    if (typeof globalThis.dispatchEvent === 'function') {{
+      try {{ globalThis.dispatchEvent(ev); return; }} catch (e) {{}}
+    }}
+    try {{ if (typeof globalThis.onmessage === 'function') globalThis.onmessage(ev); }} catch (e) {{}}
+  }};
+}})();"##,
+        name = quoted(name),
+        url = quoted(url),
+    )
+    .replace("__WORKER_OWN__", WORKER_OWN)
+    .replace("__WORKER_ENUM__", WORKER_ENUMERABLE)
+    .replace("__WORKER_SCOPE_ENUM__", WORKER_SCOPE_ENUMERABLE)
+    .replace("__WORKER_SCOPE__", WORKER_SCOPE)
+    .replace("__WORKER_NAV__", WORKER_NAVIGATOR)
 }
 
 pub fn web_surface_script() -> String {
@@ -3631,7 +3839,16 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     globalThis.TextDecoder = class TextDecoder { constructor() { this.encoding = 'utf-8'; } decode(buf) { if (!buf) return ''; const a = buf instanceof Uint8Array ? buf : new Uint8Array(buf.buffer || buf); let s = ''; for (let i = 0; i < a.length; i++) s += String.fromCharCode(a[i]); return s; } };
   }
   if (!globalThis.Blob) {
-    globalThis.Blob = class Blob { constructor(parts, opts) { this._p = (parts || []).map(String); this.type = (opts && opts.type) || ''; this.size = this._p.reduce((n, x) => n + x.length, 0); } text() { return Promise.resolve(this._p.join('')); } arrayBuffer() { return Promise.resolve(new TextEncoder().encode(this._p.join('')).buffer); } slice() { return new Blob([]); } toString() { return this._p.join(''); } };
+    // Части блоба — не только строки: браузер принимает буферы и их представления,
+    // и склеивает байты. `String(new Uint8Array([104,105]))` даёт «104,105», а не
+    // «hi», — и воркер, собранный из байтов, получал бы вместо кода список чисел.
+    const blobPart = (x) => {
+      try {
+        if (x instanceof ArrayBuffer || ArrayBuffer.isView(x)) return new TextDecoder().decode(x);
+      } catch (e) {}
+      return String(x);
+    };
+    globalThis.Blob = class Blob { constructor(parts, opts) { this._p = (parts || []).map(blobPart); this.type = (opts && opts.type) || ''; this.size = this._p.reduce((n, x) => n + x.length, 0); } text() { return Promise.resolve(this._p.join('')); } arrayBuffer() { return Promise.resolve(new TextEncoder().encode(this._p.join('')).buffer); } slice() { return new Blob([]); } toString() { return this._p.join(''); } };
   }
   // Here rather than with the other web globals: `File` extends `Blob`, which is
   // defined just above, and a class body is evaluated where it is written.
@@ -3699,6 +3916,20 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   if (!globalThis.URL || !globalThis.URL.prototype || !('searchParams' in (globalThis.URL.prototype || {}))) {
     const parse = (s) => { const m = /^([a-zA-Z][a-zA-Z0-9+.-]*:)?([/][/]([^/?#]*))?([^?#]*)([?][^#]*)?([#].*)?$/.exec(String(s)) || []; return { protocol: m[1] || '', authority: m[3] || '', path: m[4] || '', search: m[5] || '', hash: m[6] || '' }; };
     let blobSeq = 1;
+    // UUID той же формы, что печатает браузер (версия 4, вариант 8..b), но
+    // выведенный из семени профиля: один и тот же профиль — один и тот же ряд.
+    const uuid4 = (n) => {
+      let x = (SEED ^ (n * 0x9e3779b1)) >>> 0;
+      const hex = [];
+      for (let i = 0; i < 32; i++) {
+        x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0;
+        hex.push((x & 15).toString(16));
+      }
+      hex[12] = '4';
+      hex[16] = ((parseInt(hex[16], 16) & 3) | 8).toString(16);
+      const s = hex.join('');
+      return s.slice(0, 8) + '-' + s.slice(8, 12) + '-' + s.slice(12, 16) + '-' + s.slice(16, 20) + '-' + s.slice(20);
+    };
     globalThis.URL = class URL {
       constructor(url, base) {
         let p = parse(url);
@@ -3718,8 +3949,10 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       // fetches its URL (or runs it as a Worker) expects its own bytes back, and
       // handing out a URL that resolves to nothing breaks that silently.
       static createObjectURL(obj) {
-        const u = 'blob:' + (globalThis.location ? location.origin : 'null') + '/'
-          + (SEED.toString(36) + (blobSeq++).toString(36));
+        // Форма адреса — часть отпечатка: в браузере это `blob:<origin>/<uuid>`,
+        // а не короткий счётчик. Воркер видит этот адрес своим `location.href`,
+        // и страница отправляет его сборщику вместе с остальным.
+        const u = 'blob:' + (globalThis.location ? location.origin : 'null') + '/' + uuid4(blobSeq++);
         (globalThis.__pt_blobs || (globalThis.__pt_blobs = new Map())).set(u, obj);
         return u;
       }

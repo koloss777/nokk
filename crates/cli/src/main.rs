@@ -382,7 +382,7 @@ async fn main() -> Result<()> {
         // With the probe tracer on, say what the page asked us — in the page and
         // in every frame, since a widget interrogates from inside its own.
         if std::env::var("NOKK_TRACE_PROBES").is_ok() {
-            let mut dump = |where_: String, v: serde_json::Value| {
+            let dump = |where_: String, v: serde_json::Value| {
                 if let Some(text) = v.as_str() {
                     if let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(text) {
                         eprintln!("# probes {where_}: {} distinct", rows.len());
@@ -400,29 +400,37 @@ async fn main() -> Result<()> {
             if let Ok(v) = ctx.evaluate("__pt_probeLog()").await {
                 dump("page".into(), v);
             }
-            // Workers are where a challenge does its collecting; whether they ran
-            // at all, and what they threw, is the first thing to know.
-            for (label, where_) in [("page", None), ("frames", Some(()))] {
-                let ids: Vec<Option<u32>> = match where_ {
-                    None => vec![None],
-                    Some(_) => ctx.frame_list().iter().map(|f| Some(f.id)).collect(),
-                };
-                for id in ids {
-                    let js = "JSON.stringify(globalThis.__ptWorkerLog || [])";
-                    let out = match id {
-                        None => ctx.evaluate(js).await,
-                        Some(f) => ctx.evaluate_in_frame(f, js).await,
-                    };
-                    if let Ok(serde_json::Value::String(text)) = out {
-                        if text.len() > 2 {
-                            eprintln!("# workers ({label}{}): {text}", id.map(|f| format!(" {f}")).unwrap_or_default());
-                        }
-                    }
+            // Workers are where a challenge does its collecting, and a worker's
+            // context is reachable from nothing on the page — so ask each live one
+            // directly. A collector usually posts its result and hangs up long
+            // before this runs; the engine leaves what it was asked with the
+            // document that started it, so read that too.
+            for (url, v) in ctx
+                .evaluate_in_workers("typeof __pt_probeLog === 'function' ? __pt_probeLog() : ''")
+                .await
+            {
+                dump(format!("worker {url}"), v);
+            }
+            let trace = "JSON.stringify(globalThis.__pt_workerTrace || [])";
+            let mut traces = vec![ctx.evaluate(trace).await];
+            for f in ctx.frame_list() {
+                traces.push(ctx.evaluate_in_frame(f.id, trace).await);
+            }
+            for v in traces.into_iter().flatten() {
+                let rows: Vec<(String, String)> = v
+                    .as_str()
+                    .and_then(|t| serde_json::from_str(t).ok())
+                    .unwrap_or_default();
+                for (url, log) in rows {
+                    dump(format!("worker {url} (ended)"), serde_json::Value::String(log));
                 }
             }
             for f in ctx.frame_list() {
                 if let Ok(v) = ctx
-                    .evaluate_in_frame(f.id, "typeof __pt_probeLog === 'function' ? __pt_probeLog() : ''")
+                    .evaluate_in_frame(
+                        f.id,
+                        "typeof __pt_probeLog === 'function' ? __pt_probeLog() : ''",
+                    )
                     .await
                 {
                     dump(format!("frame {} {}", f.id, f.url), v);

@@ -1064,164 +1064,62 @@
   // Worker === "function"` holds and compute-style workers (message in → work →
   // postMessage back) function. Not real parallelism, and blob: scripts need
   // URL.createObjectURL support to load.
-  // Внутри воркера мир другой, и сборщики отпечатков это знают: там нет ни
-  // `document`, ни `window`, ни `localStorage`, а `navigator` — это
-  // WorkerNavigator, обрезанный интерфейс. Наш воркер жил в контексте страницы,
-  // и барворды через `with(self)` доставали оконные глобальные. Отпечаток,
-  // снятый в таком «воркере», описывает окно — нестыковка, заметнее которой
-  // трудно придумать.
-  //
-  // Прокси с `has: () => true` перехватывает *любой* барворд: наружу не уходит
-  // ничего, чего в воркере быть не должно.
-  const __WORKER_GLOBALS = new Set([
-    // Язык — целиком: он в воркере тот же.
-    'Object', 'Function', 'Array', 'Number', 'Boolean', 'String', 'Symbol', 'Date',
-    'Promise', 'RegExp', 'Error', 'EvalError', 'RangeError', 'ReferenceError',
-    'SyntaxError', 'TypeError', 'URIError', 'AggregateError', 'globalThis', 'JSON',
-    'Math', 'Intl', 'Reflect', 'Proxy', 'Map', 'Set', 'WeakMap', 'WeakSet', 'WeakRef',
-    'FinalizationRegistry', 'ArrayBuffer', 'SharedArrayBuffer', 'DataView', 'Atomics',
-    'Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array',
-    'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array', 'BigInt64Array',
-    'BigUint64Array', 'BigInt', 'WebAssembly', 'escape', 'unescape', 'eval',
-    'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'NaN', 'Infinity', 'undefined',
-    'decodeURI', 'decodeURIComponent', 'encodeURI', 'encodeURIComponent',
-    'structuredClone', 'queueMicrotask', 'reportError',
-    // Платформа, которая в воркере есть.
-    'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'fetch', 'crypto',
-    'console', 'performance', 'atob', 'btoa', 'URL', 'URLSearchParams', 'Blob',
-    'File', 'FileReader', 'FormData', 'Headers', 'Request', 'Response', 'AbortController',
-    'AbortSignal', 'TextEncoder', 'TextDecoder', 'TextEncoderStream', 'TextDecoderStream',
-    'ReadableStream', 'WritableStream', 'TransformStream', 'CompressionStream',
-    'DecompressionStream', 'MessageChannel', 'MessagePort', 'BroadcastChannel',
-    'EventTarget', 'Event', 'MessageEvent', 'ErrorEvent', 'ProgressEvent', 'CustomEvent',
-    'CloseEvent', 'DOMException', 'WebSocket', 'XMLHttpRequest', 'ImageData',
-    'OffscreenCanvas', 'createImageBitmap', 'ImageBitmap', 'indexedDB', 'IDBFactory',
-    'IDBDatabase', 'IDBRequest', 'IDBTransaction', 'IDBObjectStore', 'IDBIndex',
-    'IDBKeyRange', 'IDBCursor', 'IDBVersionChangeEvent', 'caches', 'CacheStorage',
-    'Cache', 'isSecureContext', 'origin', 'crossOriginIsolated', 'Worker',
-    'SubtleCrypto', 'CryptoKey', 'Crypto', 'Notification', 'PushManager',
-  ]);
+  // Воркер — отдельный контекст V8, который строит движок: своя область, свои
+  // прототипы, свой `self`. Здесь остаётся только порт: очередь операций наружу
+  // и доставка сообщений обратно.
+  const __workerOps = [];
+  const __workers = new Map();
+  let __nextWorkerId = 1;
+  globalThis.__pt_drainWorkerQueue = () => __workerOps.splice(0);
+  globalThis.__pt_workerMessage = (id, json) => {
+    const W = __workers.get(id);
+    if (!W || W.closed) return;
+    let data = null;
+    try { data = JSON.parse(json); } catch (e) {}
+    const ev = new MessageEvent('message', { data });
+    try { if (typeof W.onmessage === 'function') W.onmessage.call(W.worker, ev); } catch (e) {}
+    for (const h of (W.listeners.message || [])) { try { h.call(W.worker, ev); } catch (e) {} }
+  };
+  globalThis.__pt_workerFailed = (id, message) => {
+    const W = __workers.get(id);
+    if (!W) return;
+    const ev = new MessageEvent('error', {});
+    ev.__ptE.message = String(message || 'worker failed');
+    try { if (typeof W.onerror === 'function') W.onerror.call(W.worker, ev); } catch (e) {}
+    for (const h of (W.listeners.error || [])) { try { h.call(W.worker, ev); } catch (e) {} }
+  };
 
-  function __workerNavigator() {
-    // WorkerNavigator — не тот же объект, что оконный: в нём нет ни plugins, ни
-    // mimeTypes, ни webdriver, и он называет себя иначе.
-    const proto = {};
-    const win = globalThis.navigator || {};
-    const KEYS = ['appCodeName', 'appName', 'appVersion', 'platform', 'product',
-      'userAgent', 'language', 'languages', 'onLine', 'hardwareConcurrency',
-      'deviceMemory', 'userAgentData', 'storage', 'permissions', 'locks',
-      'mediaCapabilities', 'connection', 'serviceWorker', 'gpu'];
-    for (const k of KEYS) {
-      let value;
-      try { value = win[k]; } catch (e) { value = undefined; }
-      if (value === undefined) continue;
-      Object.defineProperty(proto, k, {
-        get: function () { return value; }, enumerable: true, configurable: true,
-      });
-    }
-    try { Object.defineProperty(proto, Symbol.toStringTag, { value: 'WorkerNavigator', configurable: true }); } catch (e) {}
-    return Object.create(proto);
-  }
-
-  function __workerScope(scriptURL, options) {
-    const here = (globalThis.location && globalThis.location.href) || 'about:blank';
-    let href = String(scriptURL);
-    try { href = new URL(String(scriptURL), here).href; } catch (e) {}
-    const locProto = {};
-    const parts = (() => { try { return new URL(href); } catch (e) { return null; } })();
-    for (const k of ['href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash']) {
-      const v = parts ? String(parts[k] || '') : (k === 'href' ? href : '');
-      Object.defineProperty(locProto, k, { get: () => v, enumerable: true, configurable: true });
-    }
-    try { Object.defineProperty(locProto, Symbol.toStringTag, { value: 'WorkerLocation', configurable: true }); } catch (e) {}
-
-    const own = Object.create(null);
-    const listeners = Object.create(null);
-    own.name = (options && options.name) || '';
-    own.onmessage = null; own.onerror = null; own.onmessageerror = null;
-    own.location = Object.create(locProto);
-    own.navigator = __workerNavigator();
-    own.addEventListener = (t, h) => { (listeners[t] = listeners[t] || []).push(h); };
-    own.removeEventListener = (t, h) => { if (listeners[t]) listeners[t] = listeners[t].filter((x) => x !== h); };
-    own.dispatchEvent = (ev) => { (listeners[ev.type] || []).forEach((h) => { try { h.call(own, ev); } catch (e) {} }); return true; };
-    own.importScripts = () => {};
-    own.__ptListeners = listeners;
-
-    const proxy = new Proxy(own, {
-      // Ни один барворд не должен утечь в окно: `with` спрашивает `has` первым.
-      has() { return true; },
-      get(target, key) {
-        if (key === Symbol.unscopables) return undefined;
-        if (key === 'self' || key === 'globalThis') return proxy;
-        if (key in target) return target[key];
-        if (typeof key === 'string' && __WORKER_GLOBALS.has(key)) return globalThis[key];
-        if (key === Symbol.toStringTag) return 'DedicatedWorkerGlobalScope';
-        return undefined;
-      },
-      set(target, key, value) { target[key] = value; return true; },
-      getPrototypeOf() { return __workerProto; },
-    });
-    own.__ptProxy = proxy;
-    return proxy;
-  }
-  // Прототип области видимости воркера: по нему и `instanceof`, и имя интерфейса.
-  const __workerProto = (() => {
-    const p = {};
-    try { Object.defineProperty(p, Symbol.toStringTag, { value: 'DedicatedWorkerGlobalScope', configurable: true }); } catch (e) {}
-    return p;
-  })();
-
-  class Worker {
+  class Worker extends EventTarget {
     constructor(scriptURL, options) {
-      const W = { onmessage: null, onmessageerror: null, onerror: null, closed: false, listeners: {} };
-      Object.defineProperty(this, '__ptW', { value: W });
-      const worker = this;
-      const scope = __workerScope(scriptURL, options);
-      scope.close = () => { W.closed = true; };
-      // worker → main
-      scope.postMessage = (data) => globalThis.queueMicrotask(() => {
-        if (W.closed) return;
-        const ev = new MessageEvent('message', { data });
-        try { if (typeof W.onmessage === 'function') W.onmessage.call(worker, ev); } catch (e) {}
-        (W.listeners.message || []).forEach(h => { try { h.call(worker, ev); } catch (e) {} });
-      });
-      // main → worker
-      W.deliver = (data) => {
-        const ev = new MessageEvent('message', { data });
-        try { if (typeof scope.onmessage === 'function') scope.onmessage.call(scope, ev); } catch (e) {}
-        for (const h of (scope.__ptListeners.message || [])) { try { h.call(scope, ev); } catch (e) {} }
-      };
-      const run = (src) => {
-        // Журнал воркеров: сколько кода приехало и чем кончилось. Имя __pt-скрыто
-        // из перечислений, страница его не видит.
-        const log = (globalThis.__ptWorkerLog = globalThis.__ptWorkerLog || []);
-        log.push({ url: String(scriptURL).slice(0, 60), len: String(src || '').length, error: null });
-        const entry = log[log.length - 1];
-        try {
-          // `with(self)` so a worker's bareword globals (postMessage, self,
-          // onmessage, addEventListener…) resolve to the emulated scope.
-          const fn = new Function('self', 'with(self){\n' + String(src) + '\n}\n//# sourceURL=' + String(scriptURL));
-          fn.call(scope, scope);
-        } catch (e) {
-          entry.error = String((e && e.stack) || (e && e.message) || e).slice(0, 200);
-          const ev = new MessageEvent('error', {}); ev.__ptE.message = String((e && e.message) || e);
-          try { if (typeof W.onerror === 'function') W.onerror.call(worker, ev); } catch (_) {}
-          (W.listeners.error || []).forEach(h => { try { h.call(worker, ev); } catch (_) {} });
-        }
-      };
-      const u = String(scriptURL);
-      if (u.slice(0, 5) === 'data:') {
-        try {
-          const i = u.indexOf(','); let s = u.slice(i + 1);
-          s = u.slice(0, i).indexOf('base64') >= 0 ? globalThis.atob(s) : decodeURIComponent(s);
-          run(s);
-        } catch (e) { run(''); }
-      } else {
-        globalThis.fetch(u).then((r) => r.text()).then(run).catch(() => run(''));
+      super();
+      const id = __nextWorkerId++;
+      const W = { id, onmessage: null, onmessageerror: null, onerror: null, closed: false, listeners: {}, worker: this };
+      Object.defineProperty(this, '__ptW', { value: W, enumerable: false });
+      __workers.set(id, W);
+      // The bytes are taken now, not when the engine gets round to the op: a
+      // browser starts fetching the script inside `new Worker`, and the common
+      // idiom is `const u = URL.createObjectURL(b); new Worker(u);
+      // URL.revokeObjectURL(u)` — read it a round later and the blob is gone.
+      const src = String(scriptURL);
+      let body = null;
+      if (src.slice(0, 5) === 'blob:' || src.slice(0, 5) === 'data:') {
+        try { body = globalThis.__pt_localSource ? __pt_localSource(src) : null; } catch (e) {}
       }
+      __workerOps.push({ op: 'open', id, src, body, name: (options && options.name) || '' });
     }
-    postMessage(data) { const W = this.__ptW; if (!W.closed) globalThis.queueMicrotask(() => W.deliver(data)); }
-    terminate() { this.__ptW.closed = true; }
+    postMessage(data) {
+      const W = this.__ptW;
+      if (W.closed) return;
+      let json = 'null';
+      try { json = JSON.stringify(data === undefined ? null : data); } catch (e) {}
+      __workerOps.push({ op: 'post', id: W.id, data: json });
+    }
+    terminate() {
+      const W = this.__ptW;
+      W.closed = true;
+      __workers.delete(W.id);
+      __workerOps.push({ op: 'close', id: W.id });
+    }
     addEventListener(t, h) { const L = this.__ptW.listeners; (L[t] = L[t] || []).push(h); }
     removeEventListener(t, h) { const L = this.__ptW.listeners; if (L[t]) L[t] = L[t].filter((x) => x !== h); }
     dispatchEvent(ev) { (this.__ptW.listeners[ev.type] || []).forEach((h) => { try { h.call(this, ev); } catch (e) {} }); return true; }
@@ -1233,6 +1131,9 @@
       set(v) { this.__ptW[p] = v; },
     });
   }
+  // `Object.prototype.toString.call(new Worker(...))` — «[object Worker]», как у
+  // всякого интерфейса; без тега объект называет себя простым Object.
+  try { Object.defineProperty(Worker.prototype, Symbol.toStringTag, { value: 'Worker', configurable: true }); } catch (e) {}
 
   class SharedWorker {
     constructor(scriptURL, options) {

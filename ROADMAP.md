@@ -175,14 +175,18 @@ Move to native (Rust):
   `[native code]` for `getContext`/`querySelector`/`getParameter` and survives the
   self-reference bypass (`Function.prototype.toString.call(toString)`), so moving them to
   native Rust is marginal. The measured real tell was missing Web Workers — now **fixed**.
-- ✅ **Web Worker / OffscreenCanvas / SharedWorker shims.** `typeof Worker === "undefined"`
-  was the one real remaining passive tell (real Chrome has them; any fingerprinter checks it).
-  Added single-threaded shims: `Worker` runs the worker script in an emulated global scope
-  (`with(self)`) with the message channel wired both ways via microtasks — a data: worker
-  doubling 21→42 round-trips (not real parallelism; blob: scripts need `createObjectURL`).
-  `OffscreenCanvas` maps to a detached `<canvas>`, reusing its 2D/WebGL contexts; `MessageEvent`
-  added; `SharedWorker` present. All native-masked (`toString` → `[native code]`) and instances
-  carry no own properties.
+- ✅ **A worker is a context, not a shim.** `typeof Worker === "undefined"` was the
+  one real remaining passive tell, and the shim that answered it was worse than the
+  gap: it ran the worker's code in the page's own realm under `with(self)`, so a
+  fingerprint collected in there found `document`, `window`, `localStorage` and the
+  page's `Navigator` — a "worker" no browser has ever produced. A worker now gets a
+  V8 context of its own, shaped into a worker global before a line of its code runs
+  (334 own names, `DedicatedWorkerGlobalScope` → `WorkerGlobalScope` → `EventTarget`,
+  `WorkerNavigator`, `WorkerLocation`), with its own timers, its own `fetch`, and a
+  port that delivers each message exactly once. Frames start workers of their own —
+  which is where a challenge collects — and a worker ends when it calls `close()`,
+  when its frame goes, or when the page navigates. `OffscreenCanvas` maps to a
+  detached `<canvas>`, reusing its 2D/WebGL contexts; `SharedWorker` is still a shim.
 - ✅ **`WebSocket` in the page.** Was the top gap in both senses: a socket-driven
   app loaded, executed and then silently did nothing, while `typeof WebSocket ===
   'undefined'` separated us from every browser since 2011 in one line. Now real, per
