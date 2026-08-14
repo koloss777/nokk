@@ -379,6 +379,37 @@ async fn main() -> Result<()> {
             }
         }
 
+        // With the probe tracer on, say what the page asked us — in the page and
+        // in every frame, since a widget interrogates from inside its own.
+        if std::env::var("NOKK_TRACE_PROBES").is_ok() {
+            let mut dump = |where_: String, v: serde_json::Value| {
+                if let Some(text) = v.as_str() {
+                    if let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(text) {
+                        eprintln!("# probes {where_}: {} distinct", rows.len());
+                        for row in rows.iter().take(3000) {
+                            eprintln!(
+                                "#   {:>5}x {} -> {}",
+                                row[1].as_u64().unwrap_or(0),
+                                row[0].as_str().unwrap_or(""),
+                                row[2].as_str().unwrap_or("")
+                            );
+                        }
+                    }
+                }
+            };
+            if let Ok(v) = ctx.evaluate("__pt_probeLog()").await {
+                dump("page".into(), v);
+            }
+            for f in ctx.frame_list() {
+                if let Ok(v) = ctx
+                    .evaluate_in_frame(f.id, "typeof __pt_probeLog === 'function' ? __pt_probeLog() : ''")
+                    .await
+                {
+                    dump(format!("frame {} {}", f.id, f.url), v);
+                }
+            }
+        }
+
         // Run `--eval` first — it may trigger further requests (fetch/beacon/img)
         // that should then appear in the interception log.
         if let Some(js) = &cli.eval {

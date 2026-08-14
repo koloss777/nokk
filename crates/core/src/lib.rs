@@ -428,13 +428,19 @@ fn emulation_os_for(profile: &StealthProfile) -> nokk_net::EmulationOs {
 /// and last the remaining platform surface — it only fills names nothing else
 /// defined, so everything real has to exist before it looks.
 fn build_bootstrap(profile: &StealthProfile) -> String {
-    format!(
+    let base = format!(
         "{}\n{}\n{}\n{}",
         nokk_stealth::bootstrap_script(profile),
         nokk_dom::runtime_js(),
         nokk_stealth::fingerprint_script(profile),
         nokk_stealth::web_surface_script(),
-    )
+    );
+    // Diagnostic only, and last so it wraps a finished surface. Reading
+    // `__pt_probeLog()` afterwards says what the page asked us and what we said.
+    match std::env::var("NOKK_TRACE_PROBES").ok().as_deref() {
+        Some("1") | Some("true") => format!("{base}\n{}", nokk_stealth::probe_tracer_script()),
+        _ => base,
+    }
 }
 
 /// A stable 64-bit seed (FNV-1a) for a context identity, so a given browser
@@ -618,6 +624,8 @@ impl Engine {
             index,
             base_url: std::sync::Mutex::new("about:blank".to_string()),
             requests: std::sync::Mutex::new(Vec::new()),
+            started: std::time::Instant::now(),
+            timings_sent: std::sync::Mutex::new(0),
             sockets: tokio::sync::Mutex::new(PageSockets::new()),
             network_tx: std::sync::Mutex::new(None),
             frames: std::sync::Mutex::new(HashMap::new()),
@@ -732,6 +740,10 @@ pub struct BrowserContext {
     /// Every network request the engine made for this context, in order — the
     /// built-in interception log (document + external scripts + page fetch/XHR).
     requests: std::sync::Mutex<Vec<NetworkRecord>>,
+    /// When this context started, and how many of its requests have been handed
+    /// to the page as Resource Timing entries.
+    started: std::time::Instant,
+    timings_sent: std::sync::Mutex<usize>,
     /// Name of the persistent session this context belongs to, if any. On drop
     /// its cookie jar is flushed to the session store.
     session: Option<String>,
@@ -849,6 +861,11 @@ pub struct NetworkRecord {
     /// invisible: every driver reads `postData`, and so does anyone trying to
     /// find out why an answer was rejected.
     pub request_body: Vec<u8>,
+    /// Milliseconds from this context's start to the moment the request went
+    /// out, and how long it took. Resource Timing is built from these, and a
+    /// page that reports no timings is a page that never loaded anything.
+    pub started_ms: f64,
+    pub duration_ms: f64,
 }
 
 impl BrowserContext {
@@ -1083,6 +1100,13 @@ impl BrowserContext {
         // job: for the top-level page that is `load_html` below, and for a frame
         // it is `pump_frames`, which gives it turns of its own. Pumping here would
         // mean a frame's load re-entering the parent's whole event loop.
+        // Перед событиями загрузки: страница, читающая тайминги в `load`,
+        // обязана увидеть уже полный список. Только своя страница: журнал
+        // запросов один на контекст, и отдать его фрейму — значит и фрейму
+        // солгать, и странице ничего не оставить.
+        if index == self.index {
+            self.flush_resource_timings(index).await;
+        }
         self.eval_in(index, "__pt_finishLoad();").await?;
         Ok(())
     }
@@ -1218,6 +1242,10 @@ impl BrowserContext {
                         return Ok(total_timers);
                     }
                 }
+            }
+
+            if index == self.index {
+                self.flush_resource_timings(index).await;
             }
 
             let busy = ran > 0
@@ -1441,6 +1469,60 @@ impl BrowserContext {
             Some(id) => self.evaluate_in_frame(id, &js).await?,
         };
         Ok(out.as_bool().unwrap_or(false))
+    }
+
+    /// Hand the page the Resource Timing entries for whatever it has fetched
+    /// since last time. A browser fills this list as it loads; ours was empty,
+    /// and `performance.getEntriesByType('resource').length === 0` after a real
+    /// page load is not a browser at all — anti-bot code asks exactly that.
+    async fn flush_resource_timings(&self, index: usize) {
+        let (from, records) = {
+            let sent = self.timings_sent.lock().map(|c| *c).unwrap_or(0);
+            let all = self.requests.lock().map(|r| r.clone()).unwrap_or_default();
+            (sent, all)
+        };
+        if records.len() <= from {
+            return;
+        }
+        let fresh: Vec<Value> = records[from..]
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                // Only the page's own document is a navigation. A frame's is a
+                // resource of the page that embedded it, which is where a browser
+                // lists it too.
+                let top_document = from + i == 0 && r.resource_type == "document";
+                let kind = if top_document { "navigation" } else { "resource" };
+                let initiator = match r.resource_type.as_str() {
+                    "script" => "script",
+                    "xhr" | "fetch" => "fetch",
+                    "document" if top_document => "navigation",
+                    "document" => "iframe",
+                    "websocket" => "other",
+                    _ => "img",
+                };
+                serde_json::json!({
+                    "name": r.url,
+                    "entryType": kind,
+                    "initiatorType": initiator,
+                    "start": r.started_ms,
+                    "duration": r.duration_ms,
+                    "size": r.body.len() + 300,
+                    "decoded": r.body.len(),
+                    "status": r.status,
+                    "protocol": "h2",
+                    "contentType": r.headers.get("content-type").cloned().unwrap_or_default(),
+                })
+            })
+            .collect();
+        if let Ok(mut c) = self.timings_sent.lock() {
+            *c = records.len();
+        }
+        let js = format!(
+            "globalThis.__pt_noteResources && __pt_noteResources({})",
+            js_str(&Value::Array(fresh).to_string())
+        );
+        let _ = self.eval_in(index, &js).await;
     }
 
     /// Press the first control a widget offers, wherever it lives — this page or
@@ -2240,6 +2322,11 @@ impl BrowserContext {
         headers: std::collections::BTreeMap<String, String>,
         request_body: &[u8],
     ) {
+        let now = self.started.elapsed().as_secs_f64() * 1000.0;
+        // Without a measured duration, say what a fast local hop looks like
+        // rather than zero: a resource that took no time at all is not one.
+        let duration_ms = 12.0;
+        let started_ms = now - duration_ms;
         let rec = NetworkRecord {
             request_id: format!(
                 "nokk-{}",
@@ -2252,6 +2339,8 @@ impl BrowserContext {
             resource_type: resource_type.to_string(),
             body: body.to_vec(),
             request_body: request_body.to_vec(),
+            started_ms: started_ms.max(0.0),
+            duration_ms: duration_ms.max(0.0),
         };
         if let Ok(mut log) = self.requests.lock() {
             log.push(rec.clone());
@@ -2714,7 +2803,8 @@ mod tests {
     /// Evaluate a JS expression that yields a JSON string, and parse it.
     async fn probe(ctx: &BrowserContext, js: &str) -> Value {
         match ctx.evaluate(js).await.expect("probe evaluated") {
-            Value::String(s) => serde_json::from_str(&s).expect("probe returned JSON"),
+            Value::String(s) => serde_json::from_str(&s)
+                .unwrap_or_else(|e| panic!("probe returned JSON ({e}): {s}")),
             other => panic!("probe did not return a JSON string: {other:?}"),
         }
     }
@@ -5029,6 +5119,85 @@ mod tests {
             }
         });
         format!("http://127.0.0.1:{}/", addr.port())
+    }
+
+    /// Three things anti-bot code reads that we answered wrongly, each found by
+    /// tracing what a real challenge asked for rather than by guessing.
+    ///
+    /// `Object.prototype.toString.call(navigator)` is the cheapest impostor test
+    /// there is, and ours said `[object Object]` where every browser says
+    /// `[object Navigator]`. WebRTC was a stub that gathered no candidates — a
+    /// browser with no network. And Resource Timing was empty after a page load,
+    /// which no browser that loaded anything can report.
+    #[tokio::test]
+    async fn the_surfaces_a_challenge_reads_answer_like_a_browser() {
+        let _serial = serial().await;
+        let url = frame_server().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 4, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&url).await.unwrap();
+        ctx.run_event_loop().await.unwrap();
+
+        let names = probe(&ctx, r#"(() => {
+            const named = (o) => Object.prototype.toString.call(o);
+            return JSON.stringify([named(window), named(navigator), named(screen), named(location),
+              named(history), named(document), named(document.body),
+              named(document.createElement('canvas')), named(document.createTextNode('x'))]);
+        })()"#).await;
+        assert_eq!(
+            names,
+            serde_json::json!([
+                "[object Window]", "[object Navigator]", "[object Screen]", "[object Location]",
+                "[object History]", "[object HTMLDocument]", "[object HTMLBodyElement]",
+                "[object HTMLCanvasElement]", "[object Text]"
+            ]),
+            "every interface names itself"
+        );
+
+        let timing = probe(&ctx, r#"JSON.stringify({
+            navigation: performance.getEntriesByType('navigation').length,
+            resources: performance.getEntriesByType('resource').length,
+            named: Object.prototype.toString.call(performance.getEntries()[0]),
+            sized: performance.getEntries().every(e => e.duration >= 0 && e.responseEnd >= e.startTime),
+        })"#).await;
+        assert_eq!(timing["navigation"], 1, "the document is a navigation entry");
+        assert!(
+            timing["resources"].as_u64().unwrap_or(0) >= 1,
+            "and what it fetched is listed: {timing}"
+        );
+        assert_eq!(timing["named"], "[object PerformanceNavigationTiming]");
+        assert_eq!(timing["sized"], true, "with timings that make sense");
+
+        // ICE gathering takes event-loop turns, as it does in a browser: start it,
+        // let the loop run, then read what arrived.
+        ctx.evaluate(r#"(() => {
+            const pc = new RTCPeerConnection();
+            globalThis.__ice = [];
+            pc.addEventListener('icecandidate', (e) => __ice.push(e.candidate ? e.candidate.candidate : null));
+            pc.createDataChannel('probe');
+            pc.createOffer().then((o) => pc.setLocalDescription(o));
+            globalThis.__pc = pc;
+            return 1;
+        })()"#).await.unwrap();
+        ctx.run_event_loop().await.unwrap();
+        let ice = probe(&ctx, r#"JSON.stringify({
+            candidates: __ice.filter(Boolean).length,
+            ended: __ice.includes(null),
+            mdns: __ice.filter(Boolean).every(c => /\.local /.test(c)),
+            state: __pc.iceGatheringState,
+            sdp: /a=ice-ufrag:.+/.test(__pc.localDescription.sdp)
+                 && /a=fingerprint:sha-256 /.test(__pc.localDescription.sdp),
+        })"#).await;
+        assert!(ice["candidates"].as_u64().unwrap_or(0) >= 1, "ICE gathers: {ice}");
+        assert_eq!(ice["ended"], true, "and says when it is done");
+        assert_eq!(ice["mdns"], true, "behind an mDNS name, as Chrome has since 2019");
+        assert_eq!(ice["state"], "complete");
+        assert_eq!(ice["sdp"], true, "the offer carries a ufrag and a DTLS fingerprint");
     }
 
     /// The engine can press what a widget puts up, wherever it keeps it — this

@@ -1956,6 +1956,51 @@
   globalThis.MutationObserver = MutationObserver;
   globalThis.ResizeObserver = ResizeObserver;
 
+  // Каждый элемент называет свой интерфейс: в браузере `<canvas>` — это
+  // `[object HTMLCanvasElement]`, а не `[object Object]`. Классов на тег у нас
+  // нет, поэтому имя выводится из тега — этого хватает и для toString, и для
+  // проверок, которые на нём построены.
+  const __IFACE = {
+    a: 'HTMLAnchorElement', area: 'HTMLAreaElement', audio: 'HTMLAudioElement',
+    base: 'HTMLBaseElement', body: 'HTMLBodyElement', br: 'HTMLBRElement',
+    button: 'HTMLButtonElement', canvas: 'HTMLCanvasElement', data: 'HTMLDataElement',
+    datalist: 'HTMLDataListElement', dialog: 'HTMLDialogElement', div: 'HTMLDivElement',
+    dl: 'HTMLDListElement', embed: 'HTMLEmbedElement', fieldset: 'HTMLFieldSetElement',
+    form: 'HTMLFormElement', head: 'HTMLHeadElement', hr: 'HTMLHRElement',
+    html: 'HTMLHtmlElement', iframe: 'HTMLIFrameElement', img: 'HTMLImageElement',
+    input: 'HTMLInputElement', label: 'HTMLLabelElement', legend: 'HTMLLegendElement',
+    li: 'HTMLLIElement', link: 'HTMLLinkElement', map: 'HTMLMapElement',
+    menu: 'HTMLMenuElement', meta: 'HTMLMetaElement', meter: 'HTMLMeterElement',
+    object: 'HTMLObjectElement', ol: 'HTMLOListElement', optgroup: 'HTMLOptGroupElement',
+    option: 'HTMLOptionElement', output: 'HTMLOutputElement', p: 'HTMLParagraphElement',
+    picture: 'HTMLPictureElement', pre: 'HTMLPreElement', progress: 'HTMLProgressElement',
+    q: 'HTMLQuoteElement', script: 'HTMLScriptElement', select: 'HTMLSelectElement',
+    slot: 'HTMLSlotElement', source: 'HTMLSourceElement', span: 'HTMLSpanElement',
+    style: 'HTMLStyleElement', table: 'HTMLTableElement', tbody: 'HTMLTableSectionElement',
+    td: 'HTMLTableCellElement', template: 'HTMLTemplateElement', textarea: 'HTMLTextAreaElement',
+    tfoot: 'HTMLTableSectionElement', th: 'HTMLTableCellElement', thead: 'HTMLTableSectionElement',
+    title: 'HTMLTitleElement', tr: 'HTMLTableRowElement', track: 'HTMLTrackElement',
+    ul: 'HTMLUListElement', video: 'HTMLVideoElement',
+  };
+  const __tagFor = (el) => {
+    const local = el.__ptLocal || '';
+    if (__IFACE[local]) return __IFACE[local];
+    // Имя с дефисом — пользовательский элемент (HTMLElement); неизвестный
+    // одиночный тег браузер считает HTMLUnknownElement.
+    if (local.indexOf('-') > 0) return 'HTMLElement';
+    return /^(abbr|address|article|aside|b|bdi|bdo|cite|code|dd|dfn|dt|em|figcaption|figure|footer|h1|h2|h3|h4|h5|h6|header|hgroup|i|ins|del|kbd|main|mark|nav|noscript|rp|rt|ruby|s|samp|section|small|strong|sub|summary|sup|time|u|var|wbr|details|blockquote|caption|colgroup|col)$/.test(local)
+      ? 'HTMLElement' : 'HTMLUnknownElement';
+  };
+  for (const [C, name] of [[Node, null], [Element, null], [Text, 'Text'], [Comment, 'Comment'],
+    [Document, 'HTMLDocument'], [DocumentFragment, 'DocumentFragment']]) {
+    if (!C) continue;
+    try {
+      Object.defineProperty(C.prototype, Symbol.toStringTag, name
+        ? { value: name, configurable: true }
+        : { get: function () { return this.nodeType === ELEMENT_NODE ? __tagFor(this) : 'Node'; }, configurable: true });
+    } catch (e) {}
+  }
+
   for (const C of [Element, Text, Comment]) {
     Object.defineProperty(C.prototype, 'remove', { value: __removeSelf, writable: true, configurable: true });
   }

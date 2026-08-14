@@ -558,6 +558,12 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   const defClass = (name) => {
     const Ctor = function () { throw new TypeError("Illegal constructor"); };
     try { Object.defineProperty(Ctor, "name", { value: name, configurable: true }); } catch (e) {}
+    // Без этого `Object.prototype.toString.call(navigator)` отвечает
+    // `[object Object]` вместо `[object Navigator]` — самая дешёвая проверка на
+    // подделку из всех, и мы её не проходили.
+    try {
+      Object.defineProperty(Ctor.prototype, Symbol.toStringTag, { value: name, configurable: true });
+    } catch (e) {}
     win[name] = Ctor;
     return Ctor.prototype;
   };
@@ -653,6 +659,12 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   staticProps(HistoryProto, { length: 1, scrollRestoration: "auto", state: null });
   for (const m of ["back", "forward", "go", "pushState", "replaceState"]) protoMethod(HistoryProto, m, function(){});
   win.history = Object.create(HistoryProto);
+
+  // Окно называет себя окном: тег ставим собственным свойством, а не на
+  // прототипе — прототип у глобального объекта общий с обычными объектами.
+  try {
+    Object.defineProperty(win, Symbol.toStringTag, { value: 'Window', configurable: true });
+  } catch (e) {}
 
   const noop = () => {};
   win.console = {
@@ -962,6 +974,107 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
 /// The platform surface fill-in — see [`WEB_SURFACE_TEMPLATE`]. Runs last in the
 /// bootstrap, after the DOM runtime and the fingerprint layer, so it only ever
 /// adds what nothing else defined.
+/// Diagnostic mode, off unless `NOKK_TRACE_PROBES=1`: record every read of the
+/// fingerprint surface and what we answered with. Anti-bot code decides on the
+/// *values* it collects, and until now we could only guess which ones it looked
+/// at — this makes the interrogation itself readable, and a difference from a
+/// real browser findable rather than theorised.
+///
+/// Never on by default: it wraps accessors, which is a change to the surface it
+/// is measuring.
+pub fn probe_tracer_script() -> String {
+    r##"(() => {
+  const log = new Map();
+  const show = (v) => {
+    try {
+      if (typeof v === 'function') return 'fn ' + (v.name || '');
+      if (v === null) return 'null';
+      if (typeof v === 'object') {
+        const tag = Object.prototype.toString.call(v);
+        if (Array.isArray(v)) return 'array(' + v.length + ')';
+        return tag;
+      }
+      const s = String(v);
+      return s.length > 90 ? s.slice(0, 90) + '…' : s;
+    } catch (e) { return '<threw>'; }
+  };
+  const note = (name, v) => {
+    const e = log.get(name) || { n: 0, last: '' };
+    e.n++; e.last = show(v);
+    log.set(name, e);
+    return v;
+  };
+  globalThis.__pt_probeLog = () => JSON.stringify([...log]
+    .sort((a, b) => b[1].n - a[1].n)
+    .map(([k, v]) => [k, v.n, v.last]));
+
+  const native = globalThis.__pt_native || ((f) => f);
+  const rename = (f, name) => {
+    try { Object.defineProperty(f, 'name', { value: name, configurable: true }); } catch (e) {}
+    return native(f);
+  };
+
+  // Конструктор оборачивать нельзя: обёртка теряет и статические методы, и
+  // прототип, а `Object` в обёртке ломает вообще всё. Трогаем методы и геттеры.
+  // Признак конструктора — заглавная буква в имени: `Proxy` и `Symbol` прототипа
+  // в обычном смысле не имеют, а обёртку над ними страница не переживёт.
+  const isConstructor = (v) => typeof v === 'function'
+    && (/^[A-Z]/.test(v.name || '') || !!v.prototype);
+
+  const trace = (obj, prefix) => {
+    if (!obj) return;
+    for (const key of Object.getOwnPropertyNames(obj)) {
+      if (key === 'constructor' || key.lastIndexOf('__pt', 0) === 0) continue;
+      if (key === 'eval' || key === 'Function' || key === 'Object' || key === 'Reflect') continue;
+      let d;
+      try { d = Object.getOwnPropertyDescriptor(obj, key); } catch (e) { continue; }
+      if (!d || !d.configurable) continue;
+      if (d.get) {
+        const get = d.get;
+        try {
+          Object.defineProperty(obj, key, Object.assign({}, d, {
+            get: rename(function () { return note(prefix + key, get.call(this)); }, 'get ' + key),
+          }));
+        } catch (e) {}
+      } else if (typeof d.value === 'function' && !isConstructor(d.value)) {
+        const fn = d.value;
+        try {
+          Object.defineProperty(obj, key, Object.assign({}, d, {
+            value: rename(function (...args) {
+              const out = fn.apply(this, args);
+              return note(prefix + key + '(' + args.map(show).join(',').slice(0, 40) + ')', out);
+            }, key),
+          }));
+        } catch (e) {}
+      }
+    }
+  };
+
+  // Каждый корень отпечатка и каждая поверхность, по которой обычно судят:
+  // рисование, звук, шрифты, время, устройство.
+  const proto = (name) => globalThis[name] && globalThis[name].prototype;
+  trace(globalThis, '');
+  trace(Object.getPrototypeOf(globalThis) || {}, 'Window.');
+  for (const [name, tag] of [
+    ['Navigator', 'n.'], ['Screen', 's.'], ['Location', 'l.'], ['History', 'h.'],
+    ['Document', 'd.'], ['Element', 'el.'], ['HTMLElement', 'html.'],
+    ['HTMLCanvasElement', 'canvas.'], ['CanvasRenderingContext2D', 'ctx2d.'],
+    ['WebGLRenderingContext', 'gl.'], ['WebGL2RenderingContext', 'gl2.'],
+    ['AudioContext', 'audio.'], ['OfflineAudioContext', 'offlineAudio.'],
+    ['AnalyserNode', 'analyser.'], ['Performance', 'perf.'],
+    ['CSSStyleDeclaration', 'style.'], ['MediaQueryList', 'mql.'],
+    ['Storage', 'storage.'], ['Crypto', 'crypto.'], ['Date', 'date.'],
+    ['Intl', 'intl.'], ['RTCPeerConnection', 'rtc.'], ['SpeechSynthesis', 'speech.'],
+  ]) {
+    trace(proto(name), tag);
+  }
+  for (const [name, tag] of [['navigator', 'n.'], ['screen', 's.'], ['performance', 'perf.']]) {
+    if (globalThis[name]) trace(globalThis[name], tag + 'own.');
+  }
+})();"##
+        .to_string()
+}
+
 pub fn web_surface_script() -> String {
     WEB_SURFACE_TEMPLATE.to_string()
 }
@@ -1097,16 +1210,73 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   const navigation = new PerformanceNavigation();
   const memory = new MemoryInfo();
 
+  // Каждый запрос страницы оставляет запись Resource Timing, и после загрузки
+  // их десятки. Пустой список — признак браузера, который ничего не грузил:
+  // ровно на это смотрит анти-бот, спрашивая getEntriesByType('resource').
+  // Записи кладёт сюда движок, по мере того как запросы завершаются.
+  const entries = [];
+  class PerformanceEntry {
+    toJSON() { const o = {}; for (const k of Object.keys(this)) o[k] = this[k]; return o; }
+  }
+  tag(PerformanceEntry.prototype, 'PerformanceEntry');
+  class PerformanceResourceTiming extends PerformanceEntry {}
+  tag(PerformanceResourceTiming.prototype, 'PerformanceResourceTiming');
+  class PerformanceNavigationTiming extends PerformanceEntry {}
+  tag(PerformanceNavigationTiming.prototype, 'PerformanceNavigationTiming');
+  globalThis.PerformanceEntry = PerformanceEntry;
+  globalThis.PerformanceResourceTiming = PerformanceResourceTiming;
+  globalThis.PerformanceNavigationTiming = PerformanceNavigationTiming;
+
+  globalThis.__pt_noteResources = (json) => {
+    let list;
+    try { list = JSON.parse(json); } catch (e) { return 0; }
+    for (const r of list) {
+      const Ctor = r.entryType === 'navigation' ? PerformanceNavigationTiming : PerformanceResourceTiming;
+      const e = new Ctor();
+      const start = Number(r.start) || 0;
+      const end = start + (Number(r.duration) || 0);
+      Object.assign(e, {
+        name: String(r.name || ''), entryType: r.entryType || 'resource',
+        startTime: start, duration: Number(r.duration) || 0,
+        initiatorType: r.initiatorType || 'other', deliveryType: '',
+        nextHopProtocol: r.protocol || 'h2', renderBlockingStatus: 'non-blocking',
+        workerStart: 0, redirectStart: 0, redirectEnd: 0,
+        fetchStart: start, domainLookupStart: start, domainLookupEnd: start,
+        connectStart: start, secureConnectionStart: start, connectEnd: start,
+        requestStart: start, responseStart: start + (Number(r.duration) || 0) * 0.8,
+        firstInterimResponseStart: 0, responseEnd: end,
+        transferSize: Number(r.size) || 0,
+        encodedBodySize: Math.max(0, (Number(r.size) || 0) - 300),
+        decodedBodySize: Number(r.decoded) || Math.max(0, (Number(r.size) || 0) - 300),
+        responseStatus: Number(r.status) || 200,
+        serverTiming: [], contentType: r.contentType || '',
+      });
+      if (r.entryType === 'navigation') {
+        Object.assign(e, {
+          unloadEventStart: 0, unloadEventEnd: 0, domInteractive: end,
+          domContentLoadedEventStart: end, domContentLoadedEventEnd: end,
+          domComplete: end, loadEventStart: end, loadEventEnd: end,
+          type: 'navigate', redirectCount: 0, activationStart: 0, criticalCHRestart: 0,
+          notRestoredReasons: null,
+        });
+      }
+      entries.push(e);
+    }
+    return entries.length;
+  };
+
   class Performance {
     now() { return nowMs(); }
-    getEntries() { return []; }
-    getEntriesByType() { return []; }
-    getEntriesByName() { return []; }
+    getEntries() { return entries.slice(); }
+    getEntriesByType(type) { return entries.filter((e) => e.entryType === String(type)); }
+    getEntriesByName(name, type) {
+      return entries.filter((e) => e.name === String(name) && (!type || e.entryType === String(type)));
+    }
     mark() { return undefined; }
     measure() { return undefined; }
     clearMarks() {}
     clearMeasures() {}
-    clearResourceTimings() {}
+    clearResourceTimings() { entries.length = 0; }
     setResourceTimingBufferSize() {}
     addEventListener() {}
     removeEventListener() {}
@@ -3134,23 +3304,154 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   navExtra('setAppBadge', mask(function setAppBadge() { return Promise.resolve(); }, 'setAppBadge'));
 
   // --- WebRTC present but leak-free -------------------------------------
-  globalThis.RTCPeerConnection = globalThis.RTCPeerConnection || mask(class RTCPeerConnection {
-    constructor() { this.localDescription = null; this.remoteDescription = null; this.iceGatheringState = 'complete'; this.iceConnectionState = 'new'; this.connectionState = 'new'; this.onicecandidate = null; }
-    createDataChannel() { return { close: noop, send: noop, addEventListener: noop }; }
-    createOffer() { return Promise.resolve({ type: 'offer', sdp: '' }); }
-    createAnswer() { return Promise.resolve({ type: 'answer', sdp: '' }); }
-    setLocalDescription() { return Promise.resolve(); }
-    setRemoteDescription() { return Promise.resolve(); }
+  // WebRTC не декоративный: анти-бот открывает канал данных, делает предложение
+  // и слушает `icecandidate`. Настоящий Chrome отвечает предложением с ufrag,
+  // паролем и отпечатком DTLS, потом одним-двумя хостовыми кандидатами с mDNS-
+  // именем (реальный адрес он прячет с 2019 года) и завершающим null. Пустышка,
+  // которая молчит, — это браузер без сети, и вердикт по нему выносится сразу.
+  const hex = (n) => {
+    const out = [];
+    const bytes = new Uint8Array(n);
+    (globalThis.crypto && crypto.getRandomValues) ? crypto.getRandomValues(bytes) : bytes.fill(7);
+    for (const b of bytes) out.push(b.toString(16).padStart(2, '0'));
+    return out.join('');
+  };
+  const b64ish = (n) => {
+    const abc = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    const bytes = new Uint8Array(n);
+    (globalThis.crypto && crypto.getRandomValues) ? crypto.getRandomValues(bytes) : bytes.fill(7);
+    return [...bytes].map((b) => abc[b & 63]).join('');
+  };
+  const dtlsPrint = () => {
+    const bytes = new Uint8Array(32);
+    (globalThis.crypto && crypto.getRandomValues) ? crypto.getRandomValues(bytes) : bytes.fill(7);
+    return [...bytes].map((b) => b.toString(16).padStart(2, '0').toUpperCase()).join(':');
+  };
+
+  globalThis.RTCPeerConnection = globalThis.RTCPeerConnection || mask(class RTCPeerConnection extends EventTarget {
+    constructor(config) {
+      super();
+      const ufrag = b64ish(4), pwd = b64ish(24);
+      Object.defineProperty(this, '__pt', {
+        value: {
+          ufrag, pwd, print: dtlsPrint(),
+          // Имя mDNS вместо адреса — ровно то, что отдаёт Chrome.
+          mdns: (globalThis.crypto && crypto.randomUUID ? crypto.randomUUID() : hex(16)) + '.local',
+          mids: [], gathered: false, closed: false, config: config || {},
+        },
+        enumerable: false,
+      });
+      this.localDescription = null;
+      this.remoteDescription = null;
+      this.currentLocalDescription = null;
+      this.pendingLocalDescription = null;
+      this.iceGatheringState = 'new';
+      this.iceConnectionState = 'new';
+      this.connectionState = 'new';
+      this.signalingState = 'stable';
+      this.onicecandidate = null;
+      this.onicegatheringstatechange = null;
+      this.oniceconnectionstatechange = null;
+      this.onconnectionstatechange = null;
+      this.ondatachannel = null;
+      this.onnegotiationneeded = null;
+    }
+    __ptFire(type, extra) {
+      const ev = Object.assign({ type, target: this, currentTarget: this, isTrusted: true }, extra || {});
+      const on = this['on' + type];
+      if (typeof on === 'function') { try { on.call(this, ev); } catch (e) {} }
+      try { this.dispatchEvent(ev); } catch (e) {}
+    }
+    __ptSdp(kind) {
+      const st = this.__pt;
+      const mid = st.mids.length ? st.mids : ['0'];
+      return 'v=0\r\n'
+        + 'o=- ' + hex(8).replace(/\D/g, '').padEnd(19, '3').slice(0, 19) + ' 2 IN IP4 127.0.0.1\r\n'
+        + 's=-\r\nt=0 0\r\n'
+        + 'a=group:BUNDLE ' + mid.join(' ') + '\r\n'
+        + 'a=extmap-allow-mixed\r\na=msid-semantic: WMS\r\n'
+        + 'm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n'
+        + 'c=IN IP4 0.0.0.0\r\na=ice-ufrag:' + st.ufrag + '\r\na=ice-pwd:' + st.pwd + '\r\n'
+        + 'a=ice-options:trickle\r\na=fingerprint:sha-256 ' + st.print + '\r\n'
+        + 'a=setup:' + (kind === 'offer' ? 'actpass' : 'active') + '\r\n'
+        + 'a=mid:' + mid[0] + '\r\na=sctp-port:5000\r\na=max-message-size:262144\r\n';
+    }
+    createDataChannel(label, opts) {
+      const st = this.__pt;
+      if (!st.mids.length) st.mids.push('0');
+      const channel = Object.assign(new EventTarget(), {
+        label: String(label == null ? '' : label), ordered: !(opts && opts.ordered === false),
+        readyState: 'connecting', bufferedAmount: 0, id: null, protocol: (opts && opts.protocol) || '',
+        send() {}, close() { this.readyState = 'closed'; },
+      });
+      return channel;
+    }
+    async createOffer() {
+      return { type: 'offer', sdp: this.__ptSdp('offer') };
+    }
+    async createAnswer() {
+      return { type: 'answer', sdp: this.__ptSdp('answer') };
+    }
+    async setLocalDescription(desc) {
+      const value = desc || { type: 'offer', sdp: this.__ptSdp('offer') };
+      this.localDescription = value;
+      this.currentLocalDescription = value;
+      this.signalingState = value.type === 'offer' ? 'have-local-offer' : 'stable';
+      this.__ptGather();
+    }
+    async setRemoteDescription(desc) {
+      this.remoteDescription = desc || null;
+      this.signalingState = 'stable';
+    }
+    __ptGather() {
+      const st = this.__pt;
+      if (st.gathered || st.closed) return;
+      st.gathered = true;
+      this.iceGatheringState = 'gathering';
+      this.__ptFire('icegatheringstatechange');
+      const st_ = st, self = this;
+      // Сбор идёт не мгновенно: браузеру нужен цикл событий, и код, который
+      // ждёт кандидата в обработчике, обязан успеть подписаться.
+      setTimeout(() => {
+        if (st_.closed) return;
+        const foundation = String(Math.floor(Math.random() * 4000000000));
+        const port = 50000 + Math.floor(Math.random() * 15000);
+        const line = 'candidate:' + foundation + ' 1 udp 2113937151 ' + st_.mdns + ' ' + port
+          + ' typ host generation 0 ufrag ' + st_.ufrag + ' network-cost 999';
+        self.__ptFire('icecandidate', {
+          candidate: {
+            candidate: line, sdpMid: (st_.mids[0] || '0'), sdpMLineIndex: 0,
+            foundation, component: 'rtp', protocol: 'udp', priority: 2113937151,
+            address: st_.mdns, port, type: 'host', usernameFragment: st_.ufrag,
+            relatedAddress: null, relatedPort: null, tcpType: null,
+            toJSON() { return { candidate: line, sdpMid: this.sdpMid, sdpMLineIndex: 0, usernameFragment: this.usernameFragment }; },
+          },
+        });
+        setTimeout(() => {
+          if (st_.closed) return;
+          self.iceGatheringState = 'complete';
+          self.__ptFire('icecandidate', { candidate: null });
+          self.__ptFire('icegatheringstatechange');
+        }, 30);
+      }, 20);
+    }
     addIceCandidate() { return Promise.resolve(); }
     getStats() { return Promise.resolve(new Map()); }
-    addEventListener() {} removeEventListener() {} close() {}
+    getSenders() { return []; }
+    getReceivers() { return []; }
+    getTransceivers() { return []; }
+    getConfiguration() { return this.__pt.config; }
+    setConfiguration(c) { this.__pt.config = c || {}; }
+    restartIce() {}
+    close() {
+      this.__pt.closed = true;
+      this.signalingState = 'closed';
+      this.iceConnectionState = 'closed';
+      this.connectionState = 'closed';
+    }
   }, 'RTCPeerConnection');
-  globalThis.webkitRTCPeerConnection = globalThis.RTCPeerConnection;
 
-  // --- synthetic events look trusted (like a real user gesture) ---------
-  if (globalThis.Event && !Object.getOwnPropertyDescriptor(globalThis.Event.prototype, 'isTrusted')) {
-    try { Object.defineProperty(globalThis.Event.prototype, 'isTrusted', { get: () => true, configurable: true }); } catch (e) {}
-  }
+  globalThis.webkitRTCPeerConnection = globalThis.RTCPeerConnection;
 
   // --- extra Web APIs so real sites' scripts run (and their trackers fire) --
   // A bare V8 has none of these; their absence makes analytics/framework code
