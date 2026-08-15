@@ -1546,6 +1546,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
 
   globalThis.__pt_noteResources = (json) => {
     let list;
+    const fresh = [];
     try { list = JSON.parse(json); } catch (e) { return 0; }
     for (const r of list) {
       const Ctor = r.entryType === 'navigation' ? PerformanceNavigationTiming : PerformanceResourceTiming;
@@ -1578,8 +1579,70 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
         });
       }
       entries.push(e);
+      fresh.push(e);
     }
+    __ptNotify(fresh);
     return entries.length;
+  };
+
+  // PerformanceObserver — не заглушка: страница подписывается на записи и ждёт
+  // колбэка. Пустой `supportedEntryTypes` — сам по себе улика (у браузера там
+  // дюжина имён), а наблюдатель, который никогда не срабатывает, подвешивает
+  // любой код, который на него рассчитывает.
+  const observers = [];
+  class PerformanceObserverEntryList {
+    constructor(list) { Object.defineProperty(this, '__ptList', { value: list, enumerable: false }); }
+    getEntries() { return this.__ptList.slice(); }
+    getEntriesByType(t) { return this.__ptList.filter((e) => e.entryType === String(t)); }
+    getEntriesByName(n, t) { return this.__ptList.filter((e) => e.name === String(n) && (!t || e.entryType === String(t))); }
+  }
+  tag(PerformanceObserverEntryList.prototype, 'PerformanceObserverEntryList');
+  class PerformanceObserver {
+    constructor(cb) {
+      if (typeof cb !== 'function') throw new TypeError("Failed to construct 'PerformanceObserver': parameter 1 is not of type 'Function'.");
+      for (const [k, v] of [['__ptCb', cb], ['__ptTypes', []], ['__ptQueue', []], ['__ptOn', false]]) {
+        Object.defineProperty(this, k, { value: v, writable: true, enumerable: false });
+      }
+    }
+    observe(opts) {
+      opts = opts || {};
+      const types = opts.entryTypes ? Array.from(opts.entryTypes).map(String)
+                  : opts.type ? [String(opts.type)] : [];
+      for (const t of types) if (this.__ptTypes.indexOf(t) < 0) this.__ptTypes.push(t);
+      if (!this.__ptOn) { this.__ptOn = true; observers.push(this); }
+      // `buffered` — то, что уже случилось до подписки.
+      if (opts.buffered) {
+        const past = entries.filter((e) => this.__ptTypes.indexOf(e.entryType) >= 0);
+        if (past.length) { this.__ptQueue.push(...past); __ptFlush(this); }
+      }
+    }
+    disconnect() {
+      this.__ptOn = false; this.__ptQueue.length = 0;
+      const i = observers.indexOf(this); if (i >= 0) observers.splice(i, 1);
+    }
+    takeRecords() { return this.__ptQueue.splice(0); }
+  }
+  tag(PerformanceObserver.prototype, 'PerformanceObserver');
+  // Порядок и состав — как у Chrome 148.
+  PerformanceObserver.supportedEntryTypes = ['element', 'event', 'first-input',
+    'largest-contentful-paint', 'layout-shift', 'long-animation-frame', 'longtask',
+    'mark', 'measure', 'navigation', 'paint', 'resource'];
+  globalThis.PerformanceObserver = PerformanceObserver;
+  globalThis.PerformanceObserverEntryList = PerformanceObserverEntryList;
+
+  // Колбэк приходит задачей, а не по ходу записи — как в браузере.
+  const __ptFlush = (obs) => {
+    Promise.resolve().then(() => {
+      const batch = obs.__ptQueue.splice(0);
+      if (!batch.length || !obs.__ptOn) return;
+      try { obs.__ptCb(new PerformanceObserverEntryList(batch), obs); } catch (e) {}
+    });
+  };
+  const __ptNotify = (fresh) => {
+    for (const obs of observers.slice()) {
+      const mine = fresh.filter((e) => obs.__ptTypes.indexOf(e.entryType) >= 0);
+      if (mine.length) { obs.__ptQueue.push(...mine); __ptFlush(obs); }
+    }
   };
 
   class Performance {
@@ -1589,8 +1652,25 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
     getEntriesByName(name, type) {
       return entries.filter((e) => e.name === String(name) && (!type || e.entryType === String(type)));
     }
-    mark() { return undefined; }
-    measure() { return undefined; }
+    mark(name, opts) {
+      const e = new PerformanceEntry();
+      Object.assign(e, { name: String(name), entryType: 'mark',
+        startTime: (opts && typeof opts.startTime === 'number') ? opts.startTime : nowMs(),
+        duration: 0, detail: (opts && opts.detail) !== undefined ? opts.detail : null });
+      entries.push(e); __ptNotify([e]); return e;
+    }
+    measure(name, startOrOpts, end) {
+      const e = new PerformanceEntry();
+      const from = typeof startOrOpts === 'string'
+        ? (entries.filter((x) => x.name === startOrOpts).pop() || { startTime: 0 }).startTime
+        : (startOrOpts && typeof startOrOpts.start === 'number') ? startOrOpts.start : 0;
+      const to = typeof end === 'string'
+        ? (entries.filter((x) => x.name === end).pop() || { startTime: nowMs() }).startTime
+        : nowMs();
+      Object.assign(e, { name: String(name), entryType: 'measure', startTime: from,
+                         duration: Math.max(0, to - from), detail: null });
+      entries.push(e); __ptNotify([e]); return e;
+    }
     clearMarks() {}
     clearMeasures() {}
     clearResourceTimings() { entries.length = 0; }
@@ -1909,7 +1989,12 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     open(method, url) { this.method = String(method).toUpperCase(); this.url = String(url); this._set(1); }
     setRequestHeader(k, v) { this._headers[k] = String(v); }
     overrideMimeType() {}
-    getAllResponseHeaders() { return Object.entries(this._respHeaders).map(([k, v]) => k + ': ' + v).join('\r\n'); }
+    // Каждая строка кончается CRLF, включая последнюю: код, который делит по
+    // '\r\n', в браузере получает пустой хвостовой элемент, а у нас не получал.
+    getAllResponseHeaders() {
+      const rows = Object.entries(this._respHeaders).map(([k, v]) => k + ': ' + v + '\r\n');
+      return rows.join('');
+    }
     getResponseHeader(k) { return this._respHeaders[k.toLowerCase()] ?? null; }
     abort() {
       this._aborted = true;
@@ -3801,7 +3886,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   globalThis.MutationObserver = globalThis.MutationObserver || class MutationObserver { constructor(cb) { this._cb = cb; } observe() {} disconnect() {} takeRecords() { return []; } };
   globalThis.ResizeObserver = globalThis.ResizeObserver || class ResizeObserver { constructor(cb) { this._cb = cb; } observe() {} unobserve() {} disconnect() {} };
   globalThis.PerformanceObserver = globalThis.PerformanceObserver || class PerformanceObserver { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } };
-  globalThis.PerformanceObserver.supportedEntryTypes = [];
+  if (!(globalThis.PerformanceObserver.supportedEntryTypes || []).length) {
+    globalThis.PerformanceObserver.supportedEntryTypes = [];
+  }
 
   // A media query that answers `false` to everything is not neutral, it is
   // impossible: exactly one of light/dark matches in any real browser, and a
@@ -3990,7 +4077,9 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // браузере это `[native code]`, и сборщик отпечатка кладёт их в корзину `N`,
   // а пользовательскую функцию — в `f`. Разница видна одной строкой.
   for (const n of ['EventTarget', 'IntersectionObserver', 'MutationObserver', 'ResizeObserver',
-    'PerformanceObserver', 'NodeIterator', 'TreeWalker', 'ShadowRoot', 'URLSearchParams',
+    'PerformanceObserver', 'PerformanceObserverEntryList', 'PerformanceEntry',
+    'PerformanceResourceTiming', 'PerformanceNavigationTiming',
+    'NodeIterator', 'TreeWalker', 'ShadowRoot', 'URLSearchParams',
     'WritableStream', 'TransformStream', 'ReadableStream', 'Worker', 'SharedWorker',
     'OffscreenCanvas', 'BroadcastChannel', 'File', 'FileReader', 'Blob', 'DOMException',
     'MessageChannel', 'MessagePort', 'Headers', 'Request', 'Response', 'URL',
