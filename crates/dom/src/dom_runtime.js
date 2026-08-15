@@ -528,6 +528,22 @@
       if (this.__ptConnectFrame) this.__ptConnectFrame();
       if (this.__ptRunScript) this.__ptRunScript();
     }
+    // `srcdoc` — документ, написанный прямо в атрибуте: у него нет адреса, и
+    // отражается он как есть. Присвоение после вставки в документ означает
+    // новый документ в этом окне, как навигация.
+    get srcdoc() { const v = this.getAttribute('srcdoc'); return v === null ? '' : v; }
+    set srcdoc(v) {
+      this.setAttribute('srcdoc', v);
+      if (this.__ptLocal !== 'iframe') return;
+      try {
+        const w = this.__ptRealm || (this.isConnected ? this.__ptRealmWindow() : null);
+        if (w && typeof w.__pt_writeDocument === 'function') w.__pt_writeDocument(String(v));
+      } catch (e) {}
+    }
+    get sandbox() { return this.getAttribute('sandbox') || ''; }
+    set sandbox(v) { this.setAttribute('sandbox', v); }
+    get allow() { return this.getAttribute('allow') || ''; }
+    set allow(v) { this.setAttribute('allow', v); }
     get href() { return this.__ptUrlAttr('href'); }
     set href(v) { this.setAttribute('href', v); }
 
@@ -661,6 +677,12 @@
         try { Object.defineProperty(w, k, { value: v, configurable: true }); } catch (e) {}
       }
       Object.defineProperty(this, '__ptRealm', { value: w, configurable: true, enumerable: false });
+      // Пустое окно — не пустой документ: у браузера там html/head/body, и
+      // страница туда пишет. `srcdoc` кладётся тем же путём.
+      try {
+        const markup = this.getAttribute('srcdoc');
+        if (typeof w.__pt_writeDocument === 'function') w.__pt_writeDocument(markup || '');
+      } catch (e) {}
       return w;
     }
     // A `<script>` that has just entered the document runs — once. The "already
@@ -703,7 +725,12 @@
     __ptConnectFrame() {
       if (this.__ptFrameId || this.__ptLocal !== 'iframe') return;
       const src = this.getAttribute('src');
-      if (!src) return;
+      if (!src) {
+        // Кадр с `srcdoc` грузится сам, как только попал в документ, — ждать,
+        // пока кто-нибудь прочитает `contentWindow`, браузер не заставляет.
+        if (this.getAttribute('srcdoc') !== null) { try { this.__ptRealmWindow(); } catch (e) {} }
+        return;
+      }
       const id = __nextFrameId++;
       Object.defineProperty(this, '__ptFrameId', { value: id, configurable: true, enumerable: false });
       const st = { el: this, ready: false, sameOrigin: false, win: null, doc: null, pending: [] };
@@ -1630,6 +1657,41 @@
   let scriptNodes = [];
 
   // Called by the loader with the Rust-parsed <html> tree.
+  // Документ дочернего окна, построенный на месте — без сети и без движка.
+  // Пустой iframe в браузере получает `<html><head></head><body></body></html>`,
+  // а `srcdoc` — разобранную разметку; и в обоих случаях скрипты внутри
+  // исполняются в этом окне. У нас документ реалма был пуст, поэтому и
+  // `contentDocument.body` был null, и класть туда было некуда.
+  globalThis.__pt_writeDocument = (html) => {
+    const nodes = parseFragment(String(html == null ? '' : html));
+    let root = nodes.find((n) => n.nodeType === 1 && n.tagName === 'HTML');
+    if (!root) {
+      root = document.createElement('html');
+      for (const n of nodes) root.appendChild(n);
+    }
+    if (!root.getElementsByTagName('head')[0]) root.insertBefore(document.createElement('head'), root.firstChild);
+    let body = root.getElementsByTagName('body')[0];
+    if (!body) {
+      body = document.createElement('body');
+      // Всё, что разметка положила мимо head, — содержимое тела.
+      const head = root.getElementsByTagName('head')[0];
+      for (const n of root.childNodes.slice ? root.childNodes.slice() : Array.from(root.childNodes)) {
+        if (n !== head) { root.removeChild(n); body.appendChild(n); }
+      }
+      root.appendChild(body);
+    }
+    document.__ptKids = [];
+    document.documentElement = null;
+    document.appendChild(root);
+    document.documentElement = root;
+    document.readyState = 'complete';
+    // Скрипты разметки исполняются здесь и сейчас, в этом окне.
+    for (const el of root.getElementsByTagName('script')) {
+      try { el.__ptRunScript(); } catch (e) {}
+    }
+    return document;
+  };
+
   globalThis.__pt_installDocument = (tree, dt) => {
     document.__ptKids = [];
     document.documentElement = null;
