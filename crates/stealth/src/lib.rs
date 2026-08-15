@@ -3603,7 +3603,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   };
 
   // --- patch canvas element methods -------------------------------------
-  const proto = globalThis.HTMLElement && globalThis.HTMLElement.prototype;
+  // Методы холста живут у браузера на HTMLCanvasElement, а не на HTMLElement:
+  // `Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'getContext')`
+  // читают напрямую, и лишний этаж здесь так же заметен, как недостающий.
+  const proto = (globalThis.HTMLCanvasElement && globalThis.HTMLCanvasElement.prototype)
+    || (globalThis.HTMLElement && globalThis.HTMLElement.prototype);
   if (proto) {
     proto.getContext = mask(function getContext(type) {
       if (this.localName !== 'canvas') return null;
@@ -4299,6 +4303,14 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     'addEventListener', 'removeEventListener', 'queueMicrotask', 'structuredClone']) {
     if (typeof globalThis[n] === 'function') __ptNative.add(globalThis[n]);
   }
+  // Лестница интерфейсов элементов строится в DOM-рантайме, до того как здесь
+  // появляется реестр нативных, — поэтому забираем их все по имени.
+  for (const n of Object.getOwnPropertyNames(globalThis)) {
+    if (!/^(HTML|SVG)[A-Za-z]*Element$/.test(n)) continue;
+    const c = globalThis[n];
+    if (typeof c === 'function') { __ptNative.add(c); maskProto(c.prototype); }
+  }
+
   // `console.log.toString()` читают так же, как всё остальное.
   try {
     for (const k of Object.getOwnPropertyNames(globalThis.console || {})) {

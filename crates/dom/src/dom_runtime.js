@@ -999,8 +999,14 @@
 
     createElement(tag) {
       const C = __customs.get(String(tag).toLowerCase());
+      if (globalThis.__pt_setPendingTag) __pt_setPendingTag(tag);
       const e = C ? new C() : new Element(tag);
       if (C) Object.defineProperty(e, '__ptUpgraded', { value: true, configurable: true, enumerable: false });
+      // Элемент стоит на своей ступени лестницы интерфейсов: `<canvas>` — на
+      // HTMLCanvasElement, неизвестный тег — на HTMLUnknownElement.
+      if (!C && globalThis.__pt_elementProto) {
+        try { Object.setPrototypeOf(e, __pt_elementProto(tag)); } catch (x) {}
+      }
       e.ownerDocument = this;
       return e;
     }
@@ -1640,31 +1646,125 @@
 
   globalThis.Node = Node;
   globalThis.Element = Element;
-  globalThis.HTMLElement = Element;
-  // Concrete element interfaces alias the generic Element, so their `.prototype`
-  // carries our accessors (notably `value`). Playwright's `fill` sets a field via
-  // the *native* setter it looks up on `HTMLInputElement.prototype`, so that
-  // descriptor must exist there.
-  // A missing one is not a cosmetic gap: real bundles reference these directly
-  // (Cloudflare's Turnstile loader dies on `HTMLScriptElement is not defined`
-  // before it can draw its widget), and a fingerprinter can list them in a line.
-  for (const n of ['HTMLInputElement', 'HTMLTextAreaElement', 'HTMLSelectElement',
-    'HTMLButtonElement', 'HTMLAnchorElement', 'HTMLDivElement', 'HTMLSpanElement',
-    'HTMLParagraphElement', 'HTMLFormElement', 'HTMLOptionElement', 'HTMLLabelElement',
-    'HTMLScriptElement', 'HTMLIFrameElement', 'HTMLBodyElement', 'HTMLHeadElement',
-    'HTMLHtmlElement', 'HTMLStyleElement', 'HTMLLinkElement', 'HTMLMetaElement',
-    'HTMLTitleElement', 'HTMLTemplateElement', 'HTMLSlotElement', 'HTMLPictureElement',
-    'HTMLSourceElement', 'HTMLMediaElement', 'HTMLVideoElement', 'HTMLAudioElement',
-    'HTMLTableElement', 'HTMLTableRowElement', 'HTMLTableCellElement',
-    'HTMLTableSectionElement', 'HTMLUListElement', 'HTMLOListElement', 'HTMLLIElement',
-    'HTMLHeadingElement', 'HTMLPreElement', 'HTMLBRElement', 'HTMLHRElement',
-    'HTMLFieldSetElement', 'HTMLLegendElement', 'HTMLOptGroupElement', 'HTMLDataListElement',
-    'HTMLOutputElement', 'HTMLProgressElement', 'HTMLMeterElement', 'HTMLDetailsElement',
-    'HTMLDialogElement', 'HTMLMapElement', 'HTMLAreaElement', 'HTMLQuoteElement',
-    'HTMLTimeElement', 'HTMLModElement', 'HTMLObjectElement', 'HTMLEmbedElement',
-    'HTMLUnknownElement']) {
-    if (!globalThis[n]) globalThis[n] = Element;
+  // В браузере интерфейсы элементов — лестница: Element → HTMLElement →
+  // HTMLCanvasElement и так далее, и у каждой ступени свои члены. У нас все они
+  // были **одним объектом**: `HTMLCanvasElement.prototype === HTMLDivElement
+  // .prototype === Element.prototype`, поэтому `div instanceof HTMLCanvasElement`
+  // отвечало true, а `constructor.name` любого элемента — `Element`. Строим
+  // лестницу; сами члены пока живут на Element, их развес — следующим шагом.
+  const __ifaceProto = new Map();
+  let __pendingTag = 'div';
+  const __mkIface = (name, parentProto) => {
+    const C = function () {
+      // `new HTMLElement()` в браузере бросает, но `super()` из класса
+      // кастомного элемента обязан работать — это его штатный путь.
+      if (new.target && new.target !== C) return Reflect.construct(Element, [__pendingTag], new.target);
+      throw new TypeError("Illegal constructor");
+    };
+    try { Object.defineProperty(C, 'name', { value: name, configurable: true }); } catch (e) {}
+    C.prototype = Object.create(parentProto);
+    Object.defineProperty(C.prototype, 'constructor', { value: C, writable: true, configurable: true });
+    try { Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {}
+    globalThis[name] = globalThis.__pt_native ? __pt_native(C) : C;
+    return C.prototype;
+  };
+  const __htmlProto = __mkIface('HTMLElement', Element.prototype);
+  // Тег → интерфейс, снято с Chrome 148.
+  const TAG_IFACE = {
+    a: 'HTMLAnchorElement', area: 'HTMLAreaElement', audio: 'HTMLAudioElement',
+    br: 'HTMLBRElement', base: 'HTMLBaseElement', body: 'HTMLBodyElement',
+    button: 'HTMLButtonElement', canvas: 'HTMLCanvasElement', data: 'HTMLDataElement',
+    datalist: 'HTMLDataListElement', del: 'HTMLModElement', details: 'HTMLDetailsElement',
+    dialog: 'HTMLDialogElement', div: 'HTMLDivElement', dl: 'HTMLDListElement',
+    embed: 'HTMLEmbedElement', fieldset: 'HTMLFieldSetElement', form: 'HTMLFormElement',
+    h1: 'HTMLHeadingElement', h2: 'HTMLHeadingElement', h3: 'HTMLHeadingElement',
+    h4: 'HTMLHeadingElement', h5: 'HTMLHeadingElement', h6: 'HTMLHeadingElement',
+    head: 'HTMLHeadElement', hr: 'HTMLHRElement', html: 'HTMLHtmlElement',
+    iframe: 'HTMLIFrameElement', img: 'HTMLImageElement', input: 'HTMLInputElement',
+    ins: 'HTMLModElement', label: 'HTMLLabelElement', legend: 'HTMLLegendElement',
+    li: 'HTMLLIElement', link: 'HTMLLinkElement', map: 'HTMLMapElement',
+    menu: 'HTMLMenuElement', meta: 'HTMLMetaElement', meter: 'HTMLMeterElement',
+    object: 'HTMLObjectElement', ol: 'HTMLOListElement', optgroup: 'HTMLOptGroupElement',
+    option: 'HTMLOptionElement', output: 'HTMLOutputElement', p: 'HTMLParagraphElement',
+    picture: 'HTMLPictureElement', pre: 'HTMLPreElement', progress: 'HTMLProgressElement',
+    q: 'HTMLQuoteElement', blockquote: 'HTMLQuoteElement', script: 'HTMLScriptElement',
+    select: 'HTMLSelectElement', slot: 'HTMLSlotElement', source: 'HTMLSourceElement',
+    span: 'HTMLSpanElement', style: 'HTMLStyleElement', table: 'HTMLTableElement',
+    caption: 'HTMLTableCaptionElement', td: 'HTMLTableCellElement', th: 'HTMLTableCellElement',
+    col: 'HTMLTableColElement', colgroup: 'HTMLTableColElement', tr: 'HTMLTableRowElement',
+    tbody: 'HTMLTableSectionElement', tfoot: 'HTMLTableSectionElement',
+    thead: 'HTMLTableSectionElement', template: 'HTMLTemplateElement',
+    textarea: 'HTMLTextAreaElement', time: 'HTMLTimeElement', title: 'HTMLTitleElement',
+    track: 'HTMLTrackElement', ul: 'HTMLUListElement', video: 'HTMLVideoElement',
+  };
+  // Теги без своего интерфейса, но известные HTML: у них HTMLElement.
+  const PLAIN_TAGS = new Set(['abbr', 'address', 'article', 'aside', 'b', 'bdi', 'bdo',
+    'cite', 'code', 'dd', 'dfn', 'dt', 'em', 'figcaption', 'figure', 'footer', 'header',
+    'hgroup', 'i', 'kbd', 'main', 'mark', 'nav', 'noscript', 'rp', 'rt', 'ruby', 's',
+    'samp', 'search', 'section', 'small', 'strong', 'sub', 'summary', 'sup', 'u', 'var',
+    'wbr', 'center', 'font', 'big', 'strike', 'tt', 'nobr']);
+  for (const name of new Set(Object.values(TAG_IFACE))) __ifaceProto.set(name, __mkIface(name, __htmlProto));
+  // Мультимедиа наследует HTMLMediaElement, как в браузере.
+  const __mediaProto = __mkIface('HTMLMediaElement', __htmlProto);
+  for (const n of ['HTMLVideoElement', 'HTMLAudioElement']) {
+    try { Object.setPrototypeOf(globalThis[n].prototype, __mediaProto); } catch (e) {}
   }
+  __ifaceProto.set('HTMLUnknownElement', __mkIface('HTMLUnknownElement', __htmlProto));
+  for (const n of ['HTMLFrameSetElement', 'HTMLFrameElement', 'HTMLMarqueeElement',
+                   'HTMLDirectoryElement', 'HTMLFontElement', 'HTMLParamElement']) {
+    if (!globalThis[n]) __mkIface(n, __htmlProto);
+  }
+  globalThis.__pt_elementProto = (tag) => {
+    tag = String(tag).toLowerCase();
+    const iface = TAG_IFACE[tag];
+    if (iface) return __ifaceProto.get(iface) || __htmlProto;
+    if (PLAIN_TAGS.has(tag)) return __htmlProto;
+    // Всё, чего в HTML нет, — HTMLUnknownElement, как у браузера.
+    return /^[a-z][a-z0-9]*(-[a-z0-9]+)+$/.test(tag) ? __htmlProto : __ifaceProto.get('HTMLUnknownElement');
+  };
+  globalThis.__pt_setPendingTag = (tag) => { __pendingTag = String(tag || 'div'); };
+
+  // `hidden` — отражаемый атрибут HTMLElement: мы его читали внутри себя, но
+  // наружу не отдавали вовсе, хотя в браузере он есть у каждого элемента.
+  Object.defineProperty(__htmlProto, 'hidden', {
+    get() { return this.hasAttribute('hidden'); },
+    set(v) { if (v) this.setAttribute('hidden', ''); else this.removeAttribute('hidden'); },
+    enumerable: true, configurable: true,
+  });
+
+  // Развес членов по ступеням — списки сняты с Chrome 148. Наши реализации
+  // универсальны (читают атрибуты), поэтому член, который в браузере есть у
+  // нескольких интерфейсов, кладётся на каждый из них тем же дескриптором.
+const CHROME_ELEMENT = ["activeViewTransition","after","animate","append","ariaActiveDescendantElement","ariaAtomic","ariaAutoComplete","ariaBrailleLabel","ariaBrailleRoleDescription","ariaBusy","ariaChecked","ariaColCount","ariaColIndex","ariaColIndexText","ariaColSpan","ariaControlsElements","ariaCurrent","ariaDescribedByElements","ariaDescription","ariaDetailsElements","ariaDisabled","ariaErrorMessageElements","ariaExpanded","ariaFlowToElements","ariaHasPopup","ariaHidden","ariaInvalid","ariaKeyShortcuts","ariaLabel","ariaLabelledByElements","ariaLevel","ariaLive","ariaModal","ariaMultiLine","ariaMultiSelectable","ariaNotify","ariaOrientation","ariaPlaceholder","ariaPosInSet","ariaPressed","ariaReadOnly","ariaRelevant","ariaRequired","ariaRoleDescription","ariaRowCount","ariaRowIndex","ariaRowIndexText","ariaRowSpan","ariaSelected","ariaSetSize","ariaSort","ariaValueMax","ariaValueMin","ariaValueNow","ariaValueText","assignedSlot","attachShadow","attributes","before","checkVisibility","childElementCount","children","classList","className","clientHeight","clientLeft","clientTop","clientWidth","closest","computedStyleMap","currentCSSZoom","customElementRegistry","elementTiming","firstElementChild","getAnimations","getAttribute","getAttributeNS","getAttributeNames","getAttributeNode","getAttributeNodeNS","getBoundingClientRect","getClientRects","getElementsByClassName","getElementsByTagName","getElementsByTagNameNS","getHTML","hasAttribute","hasAttributeNS","hasAttributes","hasPointerCapture","id","innerHTML","insertAdjacentElement","insertAdjacentHTML","insertAdjacentText","lastElementChild","localName","matches","moveBefore","namespaceURI","nextElementSibling","onbeforecopy","onbeforecut","onbeforepaste","onfullscreenchange","onfullscreenerror","onsearch","onwebkitfullscreenchange","onwebkitfullscreenerror","outerHTML","part","prefix","prepend","previousElementSibling","querySelector","querySelectorAll","releasePointerCapture","remove","removeAttribute","removeAttributeNS","removeAttributeNode","replaceChildren","replaceWith","requestFullscreen","requestPointerLock","role","scroll","scrollBy","scrollHeight","scrollIntoView","scrollIntoViewIfNeeded","scrollLeft","scrollTo","scrollTop","scrollWidth","setAttribute","setAttributeNS","setAttributeNode","setAttributeNodeNS","setHTML","setHTMLUnsafe","setPointerCapture","shadowRoot","slot","startViewTransition","tagName","toggleAttribute","webkitMatchesSelector","webkitRequestFullScreen","webkitRequestFullscreen"];
+const CHROME_HTMLELEMENT = ["accessKey","attachInternals","attributeStyleMap","autocapitalize","autofocus","blur","click","contentEditable","dataset","dir","draggable","editContext","enterKeyHint","focus","hidden","hidePopover","inert","innerText","inputMode","isContentEditable","lang","nonce","offsetHeight","offsetLeft","offsetParent","offsetTop","offsetWidth","onabort","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","onauxclick","onbeforeinput","onbeforematch","onbeforetoggle","onbeforexrselect","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncopy","oncuechange","oncut","ondblclick","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","ongotpointercapture","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onload","onloadeddata","onloadedmetadata","onloadstart","onlostpointercapture","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onpaste","onpause","onplay","onplaying","onpointercancel","onpointerdown","onpointerenter","onpointerleave","onpointermove","onpointerout","onpointerover","onpointerrawupdate","onpointerup","onprogress","onratechange","onreset","onresize","onscroll","onscrollend","onscrollsnapchange","onscrollsnapchanging","onsecuritypolicyviolation","onseeked","onseeking","onselect","onselectionchange","onselectstart","onslotchange","onstalled","onsubmit","onsuspend","ontimeupdate","ontoggle","ontransitioncancel","ontransitionend","ontransitionrun","ontransitionstart","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkittransitionend","onwheel","outerText","popover","showPopover","spellcheck","style","tabIndex","title","togglePopover","translate","virtualKeyboardPolicy","writingSuggestions"];
+const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","coords","download","hash","host","hostname","href","hrefTranslate","hreflang","interestForElement","name","origin","password","pathname","ping","port","protocol","referrerPolicy","rel","relList","rev","search","shape","target","text","toString","type","username"],"HTMLBRElement":["clear"],"HTMLBodyElement":["aLink","background","bgColor","link","onafterprint","onbeforeprint","onbeforeunload","onblur","onerror","onfocus","ongamepadconnected","ongamepaddisconnected","onhashchange","onlanguagechange","onload","onmessage","onmessageerror","onoffline","ononline","onpagehide","onpageshow","onpopstate","onrejectionhandled","onresize","onscroll","onstorage","onunhandledrejection","onunload","text","vLink"],"HTMLButtonElement":["checkValidity","command","commandForElement","disabled","form","formAction","formEnctype","formMethod","formNoValidate","formTarget","interestForElement","labels","name","popoverTargetAction","popoverTargetElement","reportValidity","setCustomValidity","type","validationMessage","validity","value","willValidate"],"HTMLCanvasElement":["captureStream","getContext","height","toBlob","toDataURL","transferControlToOffscreen","width"],"HTMLDivElement":["align"],"HTMLFormElement":["acceptCharset","action","autocomplete","checkValidity","elements","encoding","enctype","length","method","name","noValidate","rel","relList","reportValidity","requestSubmit","reset","submit","target"],"HTMLHeadingElement":["align"],"HTMLHtmlElement":["version"],"HTMLIFrameElement":["adAuctionHeaders","align","allow","allowFullscreen","allowPaymentRequest","browsingTopics","contentDocument","contentWindow","credentialless","csp","featurePolicy","frameBorder","getSVGDocument","height","loading","longDesc","marginHeight","marginWidth","name","privateToken","referrerPolicy","sandbox","scrolling","sharedStorageWritable","src","srcdoc","width"],"HTMLImageElement":["align","alt","attributionSrc","border","browsingTopics","complete","crossOrigin","currentSrc","decode","decoding","fetchPriority","height","hspace","isMap","loading","longDesc","lowsrc","name","naturalHeight","naturalWidth","referrerPolicy","sharedStorageWritable","sizes","src","srcset","useMap","vspace","width","x","y"],"HTMLInputElement":["accept","align","alt","autocomplete","checkValidity","checked","defaultChecked","defaultValue","dirName","disabled","files","form","formAction","formEnctype","formMethod","formNoValidate","formTarget","height","incremental","indeterminate","labels","list","max","maxLength","min","minLength","multiple","name","pattern","placeholder","popoverTargetAction","popoverTargetElement","readOnly","reportValidity","required","select","selectionDirection","selectionEnd","selectionStart","setCustomValidity","setRangeText","setSelectionRange","showPicker","size","src","step","stepDown","stepUp","type","useMap","validationMessage","validity","value","valueAsDate","valueAsNumber","webkitEntries","webkitdirectory","width","willValidate"],"HTMLLIElement":["type","value"],"HTMLLabelElement":["control","form","htmlFor"],"HTMLLinkElement":["as","blocking","charset","crossOrigin","disabled","fetchPriority","href","hreflang","imageSizes","imageSrcset","integrity","media","referrerPolicy","rel","relList","rev","sheet","sizes","target","type"],"HTMLMetaElement":["content","httpEquiv","media","name","scheme"],"HTMLOptionElement":["defaultSelected","disabled","form","index","label","selected","text","value"],"HTMLParagraphElement":["align"],"HTMLScriptElement":["async","attributionSrc","blocking","charset","crossOrigin","defer","event","fetchPriority","htmlFor","innerText","integrity","noModule","referrerPolicy","src","text","textContent","type"],"HTMLSelectElement":["add","autocomplete","checkValidity","disabled","form","item","labels","length","multiple","name","namedItem","options","remove","reportValidity","required","selectedIndex","selectedOptions","setCustomValidity","showPicker","size","type","validationMessage","validity","value","willValidate"],"HTMLStyleElement":["blocking","disabled","media","sheet","type"],"HTMLTableElement":["align","bgColor","border","caption","cellPadding","cellSpacing","createCaption","createTBody","createTFoot","createTHead","deleteCaption","deleteRow","deleteTFoot","deleteTHead","frame","insertRow","rows","rules","summary","tBodies","tFoot","tHead","width"],"HTMLTextAreaElement":["autocomplete","checkValidity","cols","defaultValue","dirName","disabled","form","labels","maxLength","minLength","name","placeholder","readOnly","reportValidity","required","rows","select","selectionDirection","selectionEnd","selectionStart","setCustomValidity","setRangeText","setSelectionRange","textLength","type","validationMessage","validity","value","willValidate","wrap"],"HTMLTitleElement":["text"],"HTMLUListElement":["compact","type"],"HTMLVideoElement":["cancelVideoFrameCallback","disablePictureInPicture","getVideoPlaybackQuality","height","onenterpictureinpicture","onleavepictureinpicture","playsInline","poster","requestPictureInPicture","requestVideoFrameCallback","videoHeight","videoWidth","webkitDecodedFrameCount","webkitDroppedFrameCount","width"]};
+  {
+    const onElement = new Set(CHROME_ELEMENT);
+    const onHtml = new Set(CHROME_HTMLELEMENT);
+    const owners = new Map();   // имя -> [прототипы интерфейсов]
+    for (const [iface, members] of Object.entries(CHROME_IFACE_MEMBERS)) {
+      const proto = __ifaceProto.get(iface);
+      if (!proto) continue;
+      for (const m of members) {
+        if (!owners.has(m)) owners.set(m, []);
+        owners.get(m).push(proto);
+      }
+    }
+    for (const name of Object.getOwnPropertyNames(Element.prototype)) {
+      if (name === 'constructor' || name.lastIndexOf('__pt', 0) === 0) continue;
+      if (onElement.has(name)) continue;
+      const d = Object.getOwnPropertyDescriptor(Element.prototype, name);
+      if (!d || !d.configurable) continue;
+      const targets = onHtml.has(name) ? [__htmlProto] : (owners.get(name) || []);
+      if (!targets.length) continue;   // наше собственное — оставляем как есть
+      for (const proto of targets) {
+        if (Object.getOwnPropertyDescriptor(proto, name)) continue;
+        try { Object.defineProperty(proto, name, d); } catch (e) {}
+      }
+      try { delete Element.prototype[name]; } catch (e) {}
+    }
+  }
+
   globalThis.ShadowRoot = ShadowRoot;
   globalThis.Text = Text;
   globalThis.Comment = Comment;

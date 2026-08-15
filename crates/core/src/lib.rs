@@ -3338,7 +3338,8 @@ mod tests {
                 MouseEvent: MouseEvent.toString(),
                 KeyboardEvent: KeyboardEvent.toString(),
                 nodeTypeGetter: Object.getOwnPropertyDescriptor(Node.prototype, 'nodeType').get.toString(),
-                styleGetter: Object.getOwnPropertyDescriptor(Element.prototype, 'style').get.toString(),
+                // `style` rides HTMLElement, as it does in a browser.
+                styleGetter: Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'style').get.toString(),
                 uaGetter: Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent').get.toString(),
                 toStringItself: Function.prototype.toString.toString()
               },
@@ -5794,6 +5795,69 @@ mod tests {
         assert_eq!(out["dcl"], "interactive", "DOMContentLoaded fires at interactive");
         assert_eq!(out["after"], "complete", "and load leaves it complete");
         assert_eq!(out["active"], "BODY", "activeElement is never null");
+    }
+
+    /// The element interfaces are a ladder, as they are in a browser. Ours were
+    /// one rung: `HTMLCanvasElement.prototype`, `HTMLDivElement.prototype` and
+    /// `Element.prototype` were the *same object*, so `div instanceof
+    /// HTMLCanvasElement` answered true and every element called itself
+    /// `Element`. Measured against Chrome 148, a `<canvas>` climbs
+    /// HTMLCanvasElement → HTMLElement → Element → Node → EventTarget → Object.
+    #[tokio::test]
+    async fn element_interfaces_are_a_ladder_not_one_rung() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const canvas = document.createElement('canvas');
+            const div = document.createElement('div');
+            const odd = document.createElement('nosuchtag');
+            const chain = (o) => { const c = []; o = Object.getPrototypeOf(o);
+              while (o) { c.push((o.constructor && o.constructor.name) || '?'); o = Object.getPrototypeOf(o); } return c; };
+            return JSON.stringify({
+              distinct: HTMLElement.prototype !== Element.prototype
+                     && HTMLCanvasElement.prototype !== HTMLElement.prototype
+                     && HTMLDivElement.prototype !== HTMLCanvasElement.prototype,
+              canvasChain: chain(canvas),
+              names: [canvas.constructor.name, div.constructor.name, odd.constructor.name],
+              tags: [Object.prototype.toString.call(canvas), Object.prototype.toString.call(div)],
+              isCanvas: canvas instanceof HTMLCanvasElement,
+              divIsNotCanvas: !(div instanceof HTMLCanvasElement),
+              climbs: canvas instanceof HTMLElement && canvas instanceof Element
+                   && canvas instanceof Node && canvas instanceof EventTarget,
+              // The members ride the rung they ride in a browser.
+              getContextOn: !!Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'getContext'),
+              idOn: !!Object.getOwnPropertyDescriptor(Element.prototype, 'id'),
+              hiddenOn: !!Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'hidden'),
+            });
+        })()"#).await;
+
+        assert_eq!(out["distinct"], true, "three interfaces, three prototypes: {out}");
+        assert_eq!(
+            out["canvasChain"],
+            serde_json::json!(["HTMLCanvasElement", "HTMLElement", "Element", "Node", "EventTarget", "Object"]),
+            "a canvas climbs Chrome's ladder: {}",
+            out["canvasChain"]
+        );
+        assert_eq!(
+            out["names"],
+            serde_json::json!(["HTMLCanvasElement", "HTMLDivElement", "HTMLUnknownElement"]),
+            "and each element says what it is"
+        );
+        assert_eq!(
+            out["tags"],
+            serde_json::json!(["[object HTMLCanvasElement]", "[object HTMLDivElement]"])
+        );
+        assert_eq!(out["isCanvas"], true);
+        assert_eq!(out["divIsNotCanvas"], true, "a div is not a canvas");
+        assert_eq!(out["climbs"], true, "and it is still an Element, a Node, a target");
+        assert_eq!(out["getContextOn"], true, "getContext belongs to the canvas");
+        assert_eq!(out["idOn"], true, "`id` to Element");
+        assert_eq!(out["hiddenOn"], true, "`hidden` to HTMLElement");
     }
 
     /// Turnstile's own classifier, run against our window graph. The challenge
