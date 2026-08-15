@@ -411,9 +411,24 @@ async fn main() -> Result<()> {
             {
                 dump(format!("worker {url}"), v);
             }
+            // Ключи челленджа этого прогона: без них ответ сервера не расшифровать
+            // задним числом (ключ выводится из ray самого виджета).
+            for f in ctx.frame_list() {
+                if let Ok(serde_json::Value::String(t)) = ctx
+                    .evaluate_in_frame(
+                        f.id,
+                        "JSON.stringify({ray: (globalThis._cf_chl_opt||{}).wxfI5 || null,                          sitekey: (globalThis._cf_chl_opt||{}).ZSOv1 || null})",
+                    )
+                    .await
+                {
+                    if t.contains("\"ray\":\"") {
+                        eprintln!("# chl frame {}: {t}", f.id);
+                    }
+                }
+            }
             // Хвост: чем страница и каждый фрейм занимались последними, по порядку.
             let tail = match std::env::var("NOKK_TRACE_HEAD") {
-                Ok(_) => "typeof __pt_probeHead === 'function' ? __pt_probeHead(600) : ''",
+                Ok(_) => "typeof __pt_probeHead === 'function' ? __pt_probeHead(6000) : ''",
                 Err(_) => "typeof __pt_probeTail === 'function' ? __pt_probeTail(40) : ''",
             };
             let mut where_: Vec<Option<u32>> = vec![None];

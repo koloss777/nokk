@@ -969,7 +969,10 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
     else q.delete(best.id);
     const outer = depth;
     depth = best.depth;
-    try { best.fn(); } catch (e) { /* timer callback threw */ }
+    try { best.fn(); } catch (e) {
+      // То же, что и у обработчика события: браузер про это сообщает.
+      if (typeof globalThis.__pt_reportError === 'function') __pt_reportError(e, 'timer');
+    }
     finally { depth = outer; }
     return 1;
   };
@@ -1031,11 +1034,15 @@ pub fn probe_tracer_script() -> String {
   // Поэтому рядом — хвост: последние обращения по порядку, со временем от начала.
   const tail = [], head = [];
   const t0 = Date.now();
+  // `isNaN` в цикле декодера даёт сотни тысяч записей и топит след; счётчик по
+  // нему всё равно бесполезен.
+  const NOISY = /^isNaN\(/;
   const note = (name, v) => {
+    if (NOISY.test(name)) return v;
     const e = log.get(name) || { n: 0, last: '' };
     e.n++; e.last = show(v);
     log.set(name, e);
-    if (head.length < 600) head.push([Date.now() - t0, name, e.last]);
+    if (head.length < 6000) head.push([Date.now() - t0, name, e.last]);
     if (tail.length >= 400) tail.shift();
     tail.push([Date.now() - t0, name, e.last]);
     return v;
@@ -1044,7 +1051,7 @@ pub fn probe_tracer_script() -> String {
     .sort((a, b) => b[1].n - a[1].n)
     .map(([k, v]) => [k, v.n, v.last]));
   globalThis.__pt_probeTail = (n) => JSON.stringify(tail.slice(-(n || 60)));
-  globalThis.__pt_probeHead = (n) => JSON.stringify(head.slice(0, n || 600));
+  globalThis.__pt_probeHead = (n) => JSON.stringify(head.slice(0, n || 6000));
 
   const native = globalThis.__pt_native || ((f) => f);
   const rename = (f, name) => {
@@ -1137,6 +1144,33 @@ pub fn probe_tracer_script() -> String {
       note('URL.createObjectURL(' + nameOf(o) + ')', url);
       return url;
     }, 'createObjectURL');
+  } catch (e) {}
+  // XHR: страница спрашивает не только свойства — она ещё и ждёт ответа. Что
+  // ушло, что вернулось и в каком состоянии — половина разбора зависаний.
+  try {
+    const X = globalThis.XMLHttpRequest;
+    if (typeof X === 'function') {
+      const open_ = X.prototype.open, send_ = X.prototype.send;
+      X.prototype.open = rename(function (m, u) {
+        note('xhr.open(' + String(m) + ' ' + String(u).slice(-48) + ')', 'открыт');
+        try {
+          this.addEventListener('readystatechange', () => {
+            if (this.readyState !== 4) return;
+            let n = -1;
+            try { n = String(this.responseText || '').length; } catch (e) {}
+            note('xhr.done(' + String(u).slice(-48) + ')', this.status + ', ' + n + ' байт');
+          });
+          this.addEventListener('timeout', () => note('xhr.timeout(' + String(u).slice(-48) + ')', 'истёк'));
+          this.addEventListener('error', () => note('xhr.error(' + String(u).slice(-48) + ')', 'ошибка'));
+        } catch (e) {}
+        return open_.apply(this, arguments);
+      }, 'open');
+      X.prototype.send = rename(function (body) {
+        note('xhr.send', (body && body.length) || 0);
+        return send_.apply(this, arguments);
+      }, 'send');
+      native(X.prototype.open); native(X.prototype.send);
+    }
   } catch (e) {}
   try {
     globalThis.Function = new Proxy(origFunction, {

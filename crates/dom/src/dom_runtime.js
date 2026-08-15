@@ -222,7 +222,7 @@
         for (const { fn } of l.slice()) {
           if (event.__ptStopImm) break;
           event.currentTarget = node;
-          try { fn.call(node, event); } catch (e) { /* page handler threw */ }
+          try { fn.call(node, event); } catch (e) { __pt_reportError(e, 'listener ' + event.type); }
         }
       };
       for (let i = path.length - 1; i >= 1; i--) { if (event.__ptStop) break; if (path[i].__ptLis && path[i].__ptLis[event.type]) { event.eventPhase = 1; fireCapture(path[i], event); } }
@@ -232,15 +232,37 @@
       // слушатель цели, и вызывает его тот же dispatch, а не вызывающий код.
       if (!event.__ptStopImm) {
         const on = this['on' + event.type];
-        if (typeof on === 'function') { event.currentTarget = this; try { on.call(this, event); } catch (e) {} }
+        if (typeof on === 'function') { event.currentTarget = this; try { on.call(this, event); } catch (e) { __pt_reportError(e, 'on' + event.type); } }
       }
       if (event.bubbles) for (let i = 1; i < path.length; i++) { if (event.__ptStop) break; event.eventPhase = 3; fire(path[i]); }
       return !event.defaultPrevented;
     }
   }
+  // Исключение из обработчика в браузере не пропадает: оно уходит в
+  // `window.onerror`, поднимает событие `error` на окне и печатается в консоль.
+  // Мы его молча глотали — из-за чего страница, у которой обработчик падает,
+  // выглядела как страница, которая просто чего-то ждёт.
+  globalThis.__pt_reportError = (e, where) => {
+    const msg = 'Uncaught ' + String((e && e.name ? e.name + ': ' + e.message : e));
+    try {
+      const on = globalThis.onerror;
+      if (typeof on === 'function') {
+        on.call(globalThis, msg, (e && e.fileName) || (globalThis.location && location.href) || '',
+                (e && e.lineNumber) || 0, (e && e.columnNumber) || 0, e);
+      }
+    } catch (x) {}
+    try {
+      if (globalThis.ErrorEvent && globalThis.dispatchEvent) {
+        const ev = new ErrorEvent('error', { message: msg, error: e });
+        globalThis.dispatchEvent(ev);
+      }
+    } catch (x) {}
+    try { console.error(msg + (where ? ' (' + where + ')' : ''), (e && e.stack) || ''); } catch (x) {}
+  };
+
   function fireCapture(node, event) {
     const l = node.__ptLis && node.__ptLis[event.type]; if (!l) return;
-    for (const e of l.slice()) { if (!e.cap) continue; if (event.__ptStopImm) break; event.currentTarget = node; try { e.fn.call(node, event); } catch (_) {} }
+    for (const e of l.slice()) { if (!e.cap) continue; if (event.__ptStopImm) break; event.currentTarget = node; try { e.fn.call(node, event); } catch (x) { __pt_reportError(x, 'capture ' + event.type); } }
   }
 
   // В браузере эти три метода живут на `EventTarget.prototype` — один раз, для
@@ -719,7 +741,7 @@
         return;
       }
       // Indirect eval: a classic script runs in global scope, not in ours.
-      try { (0, eval)(code); } catch (e) { /* page script threw */ }
+      try { (0, eval)(code); } catch (e) { __pt_reportError(e, 'inline script'); }
     }
 
     __ptConnectFrame() {
