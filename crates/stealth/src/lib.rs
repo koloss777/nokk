@@ -1421,6 +1421,51 @@ pub fn web_surface_script() -> String {
 /// а скрипты страницы ещё не выполнялись — их собственные глобальные останутся
 /// перечислимыми, как и положено.
 const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
+  // Цепочка окна, снятая с Chrome 148:
+  //   window → Window.prototype (TEMPORARY, PERSISTENT) → WindowProperties →
+  //   EventTarget.prototype (addEventListener, dispatchEvent, removeEventListener,
+  //   when) → Object.prototype,  и `window.constructor === Window`.
+  // У нас все шесть имён лежали собственными свойствами окна, а само окно
+  // наследовало прямо от Object: `window.constructor` отвечал `Object`.
+  const native = globalThis.__pt_native || ((f) => f);
+  const ET = globalThis.EventTarget;
+  const etProto = (ET && ET.prototype) || Object.prototype;
+  for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent', 'when']) {
+    let own;
+    try { own = Object.getOwnPropertyDescriptor(globalThis, name); } catch (e) { continue; }
+    if (!own) continue;
+    // То, чего на EventTarget ещё нет, переезжает туда; остальное просто уходит
+    // с окна — работать будет унаследованное.
+    if (!Object.getOwnPropertyDescriptor(etProto, name)) {
+      try { Object.defineProperty(etProto, name, Object.assign({}, own, { enumerable: true })); } catch (e) {}
+    }
+    try { delete globalThis[name]; } catch (e) {}
+  }
+
+  const windowProperties = Object.create(etProto);
+  const Window = globalThis.Window && typeof globalThis.Window === 'function'
+    ? globalThis.Window
+    : native(function Window() { throw new TypeError('Illegal constructor'); });
+  const winProto = Object.create(windowProperties);
+  for (const [name, fallback] of [['TEMPORARY', 0], ['PERSISTENT', 1]]) {
+    let own;
+    try { own = Object.getOwnPropertyDescriptor(globalThis, name); } catch (e) {}
+    try {
+      Object.defineProperty(winProto, name, {
+        value: own ? own.value : fallback, enumerable: true, writable: false, configurable: false,
+      });
+    } catch (e) {}
+    try { delete globalThis[name]; } catch (e) {}
+  }
+  try { Object.defineProperty(winProto, 'constructor', { value: Window, writable: true, configurable: true }); } catch (e) {}
+  try { Object.defineProperty(winProto, Symbol.toStringTag, { value: 'Window', configurable: true }); } catch (e) {}
+  try { Object.defineProperty(Window, 'prototype', { value: winProto, writable: false, configurable: false }); } catch (e) { Window.prototype = winProto; }
+  globalThis.Window = Window;
+  if (Object.setPrototypeOf(globalThis, winProto) === globalThis) {
+    // Имя окна теперь на прототипе, как в браузере, — собственный тег лишний.
+    try { delete globalThis[Symbol.toStringTag]; } catch (e) {}
+  }
+
   const ENUM = new Set(__WINDOW_ENUMERABLE__);
   for (const name of Object.getOwnPropertyNames(globalThis)) {
     if (name.lastIndexOf('__pt', 0) === 0 || name === '__out') continue;
@@ -1984,27 +2029,35 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   // own timeout and reported failure (300010). A missing `EventTarget` global is
   // also a one-line tell in its own right.
   if (!globalThis.EventTarget) {
+    // Без получателя — окно: `addEventListener('x', f)` без префикса даёт
+    // `this === undefined` (методы класса всегда строгие), и браузер в этом
+    // случае берёт глобальный объект. Проверено на Chrome 148: голый вызов,
+    // строгий режим и даже `.call(undefined)` там работают.
+    const __ptSelf = (t) => (t === undefined || t === null ? globalThis : t);
     globalThis.EventTarget = class EventTarget {
       constructor() { Object.defineProperty(this, '__ptLis', { value: Object.create(null), enumerable: false, writable: true }); }
       addEventListener(type, fn, opts) {
+        const t = __ptSelf(this);
         if (!fn) return;
-        if (!this.__ptLis) Object.defineProperty(this, '__ptLis', { value: Object.create(null), enumerable: false, writable: true });
-        const l = (this.__ptLis[type] = this.__ptLis[type] || []);
+        if (!t.__ptLis) Object.defineProperty(t, '__ptLis', { value: Object.create(null), enumerable: false, writable: true });
+        const l = (t.__ptLis[type] = t.__ptLis[type] || []);
         if (!l.some(e => e.fn === fn)) l.push({ fn, once: !!(opts && opts.once) });
       }
       removeEventListener(type, fn) {
-        const l = this.__ptLis && this.__ptLis[type];
-        if (l) this.__ptLis[type] = l.filter(e => e.fn !== fn);
+        const t = __ptSelf(this);
+        const l = t.__ptLis && t.__ptLis[type];
+        if (l) t.__ptLis[type] = l.filter(e => e.fn !== fn);
       }
       dispatchEvent(ev) {
+        const t = __ptSelf(this);
         const type = ev && ev.type;
-        const l = (this.__ptLis && this.__ptLis[type]) || [];
+        const l = (t.__ptLis && t.__ptLis[type]) || [];
         for (const e of l.slice()) {
-          if (e.once) this.removeEventListener(type, e.fn);
-          try { typeof e.fn === 'function' ? e.fn.call(this, ev) : (e.fn.handleEvent && e.fn.handleEvent(ev)); } catch (x) {}
+          if (e.once) t.removeEventListener(type, e.fn);
+          try { typeof e.fn === 'function' ? e.fn.call(t, ev) : (e.fn.handleEvent && e.fn.handleEvent(ev)); } catch (x) {}
         }
-        const on = this['on' + type];
-        if (typeof on === 'function') { try { on.call(this, ev); } catch (x) {} }
+        const on = t['on' + type];
+        if (typeof on === 'function') { try { on.call(t, ev); } catch (x) {} }
         return !ev || !ev.defaultPrevented;
       }
     };
