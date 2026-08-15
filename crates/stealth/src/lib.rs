@@ -1466,6 +1466,82 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
     try { delete globalThis[Symbol.toStringTag]; } catch (e) {}
   }
 
+  // Screen наследует EventTarget, но сами методы у браузера лежат на
+  // EventTarget.prototype, а не на Screen.prototype: там ровно 12 имён.
+  if (globalThis.Screen && Screen.prototype) {
+    try { Object.setPrototypeOf(Screen.prototype, etProto); } catch (e) {}
+    for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent', 'when']) {
+      try { delete Screen.prototype[name]; } catch (e) {}
+    }
+  }
+
+  // Location — единственный интерфейс, чьи члены браузер держит собственными
+  // свойствами самого объекта (неудаляемыми), а на прототипе оставляет один
+  // `constructor`. У нас было наоборот.
+  try {
+    const loc = globalThis.location;
+    const lproto = loc && Object.getPrototypeOf(loc);
+    if (loc && lproto && lproto !== Object.prototype) {
+      for (const name of Object.getOwnPropertyNames(lproto)) {
+        if (name === 'constructor') continue;
+        const d = Object.getOwnPropertyDescriptor(lproto, name);
+        if (!d) continue;
+        try {
+          // `valueOf` у браузера неперечислим, остальные пятнадцать — да.
+          Object.defineProperty(loc, name, Object.assign({}, d, {
+            enumerable: name !== 'valueOf', configurable: false,
+          }));
+          delete lproto[name];
+        } catch (e) {}
+      }
+    }
+  } catch (e) {}
+
+  // Документ живёт на два этажа: члены на Document.prototype, а между ним и
+  // самим документом — пустой HTMLDocument.prototype с одним `constructor`.
+  // И `location` у браузера — собственное свойство документа.
+  try {
+    const dproto = Object.getPrototypeOf(globalThis.document);
+    const HTMLDocument = typeof globalThis.HTMLDocument === 'function'
+      ? globalThis.HTMLDocument
+      : function HTMLDocument() { throw new TypeError('Illegal constructor'); };
+    if (dproto && !Object.getOwnPropertyDescriptor(dproto, 'constructor')) {
+      // ничего: прототип документа без конструктора нам не встречался
+    }
+    if (Object.getPrototypeOf(dproto) !== null && dproto.constructor !== HTMLDocument) {
+      const htmlDocProto = Object.create(dproto);
+      Object.defineProperty(htmlDocProto, 'constructor', { value: HTMLDocument, writable: true, configurable: true });
+      try { Object.defineProperty(htmlDocProto, Symbol.toStringTag, { value: 'HTMLDocument', configurable: true }); } catch (e) {}
+      try { Object.defineProperty(HTMLDocument, 'prototype', { value: htmlDocProto, writable: false, configurable: false }); }
+      catch (e) { HTMLDocument.prototype = htmlDocProto; }
+      globalThis.HTMLDocument = globalThis.__pt_native ? __pt_native(HTMLDocument) : HTMLDocument;
+      Object.setPrototypeOf(globalThis.document, htmlDocProto);
+    }
+    // Наследство HTML4, которое браузер держит до сих пор, — шесть атрибутов
+    // документа; и наоборот, то, что принадлежит Node, на Document не дублируется.
+    for (const name of ['baseURI', 'nodeName', 'textContent', 'when']) {
+      try { delete dproto[name]; } catch (e) {}
+    }
+    for (const [name, initial] of [['alinkColor', ''], ['bgColor', ''], ['fgColor', ''],
+                                   ['linkColor', ''], ['vlinkColor', ''], ['dir', '']]) {
+      if (Object.getOwnPropertyDescriptor(dproto, name)) continue;
+      let value = initial;
+      try {
+        Object.defineProperty(dproto, name, {
+          get: function () { return value; },
+          set: function (v) { value = String(v); },
+          enumerable: true, configurable: true,
+        });
+      } catch (e) {}
+    }
+    const locDesc = Object.getOwnPropertyDescriptor(dproto, 'location');
+    if (locDesc) {
+      Object.defineProperty(globalThis.document, 'location',
+        Object.assign({}, locDesc, { enumerable: true, configurable: false }));
+      delete dproto.location;
+    }
+  } catch (e) {}
+
   const ENUM = new Set(__WINDOW_ENUMERABLE__);
   for (const name of Object.getOwnPropertyNames(globalThis)) {
     if (name.lastIndexOf('__pt', 0) === 0 || name === '__out') continue;

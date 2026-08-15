@@ -190,9 +190,13 @@
     }
 
     get textContent() {
+      // У документа и doctype его нет вовсе — браузер отвечает null, а не
+      // склеенным текстом страницы.
+      if (this.nodeType === 9 || this.nodeType === 10) return null;
       let s = ''; for (const c of this.__ptKids) s += c.textContent; return s;
     }
     set textContent(v) {
+      if (this.nodeType === 9 || this.nodeType === 10) return;
       this.__ptKids = [];
       if (v !== '') this.appendChild(new Text(String(v)));
     }
@@ -208,7 +212,7 @@
       const l = this.__ptLis[type]; if (!l) return;
       this.__ptLis[type] = l.filter(e => !(e.fn === fn && e.cap === cap));
     }
-    dispatchEvent(event) {
+    __ptDispatch(event) {
       event.target = this;
       // Build the ancestor path for capture/bubble.
       const path = []; for (let n = this; n; n = n.parentNode) path.push(n);
@@ -221,15 +225,71 @@
           try { fn.call(node, event); } catch (e) { /* page handler threw */ }
         }
       };
-      for (let i = path.length - 1; i >= 1; i--) { if (event.__ptStop) break; if (path[i].__ptLis[event.type]) { event.eventPhase = 1; fireCapture(path[i], event); } }
-      event.eventPhase = 2; if (!event.__ptStop) fire(this);
+      for (let i = path.length - 1; i >= 1; i--) { if (event.__ptStop) break; if (path[i].__ptLis && path[i].__ptLis[event.type]) { event.eventPhase = 1; fireCapture(path[i], event); } }
+      event.eventPhase = 2;
+      if (!event.__ptStop) fire(this);
+      // Обработчик-свойство (`onclick`, `onload`, `onmessage`) — такой же
+      // слушатель цели, и вызывает его тот же dispatch, а не вызывающий код.
+      if (!event.__ptStopImm) {
+        const on = this['on' + event.type];
+        if (typeof on === 'function') { event.currentTarget = this; try { on.call(this, event); } catch (e) {} }
+      }
       if (event.bubbles) for (let i = 1; i < path.length; i++) { if (event.__ptStop) break; event.eventPhase = 3; fire(path[i]); }
       return !event.defaultPrevented;
     }
   }
   function fireCapture(node, event) {
-    const l = node.__ptLis[event.type]; if (!l) return;
+    const l = node.__ptLis && node.__ptLis[event.type]; if (!l) return;
     for (const e of l.slice()) { if (!e.cap) continue; if (event.__ptStopImm) break; event.currentTarget = node; try { e.fn.call(node, event); } catch (_) {} }
+  }
+
+  // В браузере эти три метода живут на `EventTarget.prototype` — один раз, для
+  // всех целей, и они же разносят событие по дереву, когда цель в дереве. У нас
+  // они стояли на `Node.prototype` (лишние имена там, где браузер их не держит)
+  // плюс отдельная копия на EventTarget. Теперь реализация одна, а имена — там,
+  // где им положено.
+  {
+    const ET = globalThis.EventTarget;
+    if (ET && ET.prototype) {
+      const store = (t) => {
+        if (!t.__ptLis) {
+          try { Object.defineProperty(t, '__ptLis', { value: Object.create(null), enumerable: false, writable: true }); }
+          catch (e) { return Object.create(null); }
+        }
+        return t.__ptLis;
+      };
+      // Без получателя цель — окно: голый `addEventListener(...)` даёт
+      // `this === undefined`, и браузер подставляет глобальный объект.
+      const self_ = (t) => (t === undefined || t === null ? globalThis : t);
+      const proto = ET.prototype;
+      for (const [name, fn] of [
+        ['addEventListener', function addEventListener(type, fn, opts) {
+          const t = self_(this); if (!fn) return;
+          const cap = !!(opts && (opts === true || opts.capture));
+          const l = store(t); (l[type] = l[type] || []).push({ fn, cap, once: !!(opts && opts.once) });
+        }],
+        ['removeEventListener', function removeEventListener(type, fn, opts) {
+          const t = self_(this);
+          const cap = !!(opts && (opts === true || opts.capture));
+          const l = t.__ptLis && t.__ptLis[type]; if (!l) return;
+          t.__ptLis[type] = l.filter((e) => !(e.fn === fn && e.cap === cap));
+        }],
+        ['dispatchEvent', function dispatchEvent(event) {
+          const t = self_(this);
+          return Node.prototype.__ptDispatch.call(t, event);
+        }],
+      ]) {
+        try {
+          Object.defineProperty(proto, name, { value: globalThis.__pt_native ? __pt_native(fn) : fn,
+                                               writable: true, enumerable: true, configurable: true });
+        } catch (e) {}
+      }
+      // Узел наследует их оттуда же, откуда и браузерный.
+      try { Object.setPrototypeOf(Node.prototype, proto); } catch (e) {}
+      for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) {
+        try { delete Node.prototype[name]; } catch (e) {}
+      }
+    }
   }
 
   // Expose the standard node properties as prototype accessors over the hidden
@@ -1422,11 +1482,94 @@
   // check `node.nodeType !== Node.ELEMENT_NODE` before acting on a node.
   const NODE_TYPES = {
     ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4,
+    // Пятый и шестой типы давно не создаются, но константы у Node остались, и
+    // их пересчитывают: у Chrome на `Node.prototype` ровно 48 имён.
+    ENTITY_REFERENCE_NODE: 5, ENTITY_NODE: 6,
     PROCESSING_INSTRUCTION_NODE: 7, COMMENT_NODE: 8, DOCUMENT_NODE: 9,
-    DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11,
+    DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11, NOTATION_NODE: 12,
+    DOCUMENT_POSITION_DISCONNECTED: 1, DOCUMENT_POSITION_PRECEDING: 2,
+    DOCUMENT_POSITION_FOLLOWING: 4, DOCUMENT_POSITION_CONTAINS: 8,
+    DOCUMENT_POSITION_CONTAINED_BY: 16, DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC: 32,
   };
   Object.assign(Node, NODE_TYPES);
   Object.assign(Node.prototype, NODE_TYPES);
+
+  // Члены Node, которых у нас не было вовсе или которые лежали этажом ниже, на
+  // Element. В браузере они все здесь, и сборщик отпечатка считает именно этот
+  // этаж.
+  const __nodeName = function () {
+    switch (this.nodeType) {
+      case 1: return this.tagName;
+      case 3: return '#text';
+      case 8: return '#comment';
+      case 9: return '#document';
+      case 10: return this.name || 'html';
+      case 11: return '#document-fragment';
+      default: return '#unknown';
+    }
+  };
+  const __nodeMembers = {
+    baseURI: { get: function () { const d = this.nodeType === 9 ? this : this.ownerDocument; return (d && d.URL) || (globalThis.location && location.href) || 'about:blank'; } },
+    nodeName: { get: __nodeName },
+    parentElement: { get: function () { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; } },
+    nodeValue: {
+      get: function () { return (this.nodeType === 3 || this.nodeType === 8) ? this.data : null; },
+      set: function (v) { if (this.nodeType === 3 || this.nodeType === 8) this.data = String(v); },
+    },
+    isSameNode: { value: function isSameNode(other) { return this === other; } },
+    isEqualNode: {
+      value: function isEqualNode(other) {
+        if (!other || this.nodeType !== other.nodeType) return false;
+        if (this.nodeName !== other.nodeName) return false;
+        if (this.nodeType === 3 || this.nodeType === 8) return this.data === other.data;
+        if (this.nodeType === 1) {
+          const a = this.attributes || [], b = other.attributes || [];
+          if (a.length !== b.length) return false;
+          for (let i = 0; i < a.length; i++) {
+            if (other.getAttribute(a[i].name) !== a[i].value) return false;
+          }
+        }
+        const x = this.childNodes, y = other.childNodes;
+        if (x.length !== y.length) return false;
+        for (let i = 0; i < x.length; i++) if (!x[i].isEqualNode(y[i])) return false;
+        return true;
+      },
+    },
+    compareDocumentPosition: {
+      value: function compareDocumentPosition(other) {
+        if (this === other) return 0;
+        if (!other) return 1;
+        if (this.contains && this.contains(other)) return 20;   // CONTAINED_BY | FOLLOWING
+        if (other.contains && other.contains(this)) return 10;  // CONTAINS | PRECEDING
+        const root = (n) => { while (n.parentNode) n = n.parentNode; return n; };
+        if (root(this) !== root(other)) return 35;              // DISCONNECTED | IMPLEMENTATION_SPECIFIC | PRECEDING
+        const order = [];
+        (function walk(n) { order.push(n); for (const c of n.childNodes) walk(c); })(root(this));
+        return order.indexOf(this) < order.indexOf(other) ? 4 : 2;
+      },
+    },
+    normalize: {
+      value: function normalize() {
+        const kids = this.childNodes;
+        for (let i = kids.length - 1; i > 0; i--) {
+          const cur = kids[i], prev = kids[i - 1];
+          if (cur.nodeType === 3 && prev.nodeType === 3) { prev.data += cur.data; this.removeChild(cur); }
+        }
+        for (const c of this.childNodes) if (c.normalize) c.normalize();
+      },
+    },
+    isDefaultNamespace: { value: function isDefaultNamespace(ns) { return ns === 'http://www.w3.org/1999/xhtml'; } },
+    lookupNamespaceURI: { value: function lookupNamespaceURI(prefix) { return prefix ? null : 'http://www.w3.org/1999/xhtml'; } },
+    lookupPrefix: { value: function lookupPrefix() { return null; } },
+  };
+  for (const [name, spec] of Object.entries(__nodeMembers)) {
+    if (Object.getOwnPropertyDescriptor(Node.prototype, name)) continue;
+    try {
+      Object.defineProperty(Node.prototype, name,
+        Object.assign({ enumerable: true, configurable: true }, spec,
+                      spec.value ? { writable: true } : {}));
+    } catch (e) {}
+  }
   // A WebIDL interface's members are *enumerable* on its prototype: in a browser
   // `Object.keys(Document.prototype)` lists `body`, `title`, `querySelector` and
   // the rest. Ours were declared with `class`, whose members are non-enumerable by
@@ -1536,8 +1679,6 @@
     document.readyState = 'interactive';
     document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
     document.readyState = 'complete';
-    if (globalThis.onload) { try { globalThis.onload(new Event('load')); } catch (_) {} }
-    const l = globalThis.__ptLis && globalThis.__ptLis['load'];
     globalThis.dispatchEvent && globalThis.dispatchEvent(new Event('load'));
   };
 
@@ -1815,7 +1956,6 @@
       type: 'message', data, origin: String(origin || ''), lastEventId: '',
       source, ports: [], isTrusted: true, target: globalThis, currentTarget: globalThis,
     };
-    try { if (typeof globalThis.onmessage === 'function') globalThis.onmessage(ev); } catch (e) {}
     try { globalThis.dispatchEvent && globalThis.dispatchEvent(ev); } catch (e) {}
   };
 

@@ -3241,8 +3241,13 @@ mod tests {
               // Chrome hides SharedArrayBuffer without cross-origin isolation.
               sab: typeof SharedArrayBuffer,
               isolated: globalThis.crossOriginIsolated,
-              // Location has its own enumerable valueOf; ours used to inherit Object's.
-              locValueOf: Object.keys(Object.getPrototypeOf(location)).includes('valueOf'),
+              // Location is the interface whose members are own properties of the
+              // object itself — fifteen of them, with `valueOf` the one that is
+              // not enumerable, and only `constructor` left on the prototype.
+              locOwn: Object.getOwnPropertyNames(location).length,
+              locValueOf: Object.getOwnPropertyNames(location).includes('valueOf')
+                && !Object.getOwnPropertyDescriptor(location, 'valueOf').enumerable,
+              locProto: Object.getOwnPropertyNames(Object.getPrototypeOf(location)),
               // A document that declares nothing is parsed as windows-1252.
               charset: document.characterSet,
             });
@@ -3253,7 +3258,9 @@ mod tests {
         assert_eq!(out["kidsLen"], 1, "and it still counts the children");
         assert_eq!(out["kidsIter"], 1, "and still spreads");
         assert_eq!(out["kidsTag"], "[object NodeList]");
-        assert_eq!(out["docOwn"], 0, "a real document has no own properties");
+        // Chrome's document has exactly one own property, and it is `location` —
+        // measured, not assumed. Everything else lives on the interfaces.
+        assert_eq!(out["docOwn"], 1, "a document owns `location`, and nothing else");
         assert_eq!(out["navOwn"], 0, "nor does a real navigator");
         assert!(out["docGraph"].as_u64().unwrap() > 280, "document graph: {}", out["docGraph"]);
         assert!(out["navGraph"].as_u64().unwrap() > 75, "navigator graph: {}", out["navGraph"]);
@@ -3276,7 +3283,13 @@ mod tests {
         assert_eq!(out["elRemove"], "function", "elements keep theirs");
         assert_eq!(out["sab"], "undefined", "no SharedArrayBuffer without isolation");
         assert_eq!(out["isolated"], false);
-        assert_eq!(out["locValueOf"], true, "Location.valueOf is its own enumerable member");
+        assert_eq!(out["locOwn"], 15, "Location's members are the object's own");
+        assert_eq!(out["locValueOf"], true, "and `valueOf` among them, non-enumerable");
+        assert_eq!(
+            out["locProto"],
+            serde_json::json!(["constructor"]),
+            "Location.prototype carries nothing but its constructor"
+        );
         assert_eq!(out["charset"], "windows-1252", "undeclared documents are windows-1252");
     }
 
@@ -3337,9 +3350,7 @@ mod tests {
 
         // A real DOM node / event / document exposes no own properties — ours must
         // keep its state in hidden (__pt-prefixed, filtered) backing fields.
-        for key in [
-            "bodyOwn", "btnOwn", "inpOwn", "textOwn", "evtOwn", "docOwn", "navOwn", "navKeys",
-        ] {
+        for key in ["bodyOwn", "btnOwn", "inpOwn", "textOwn", "evtOwn", "navOwn", "navKeys"] {
             let leaked = p[key]
                 .as_array()
                 .unwrap_or_else(|| panic!("probe missing {key}"));
@@ -3348,6 +3359,14 @@ mod tests {
                 "{key} exposes own properties: {leaked:?}"
             );
         }
+        // The document is the one exception, and Chrome names it: `location` is
+        // an own property of the document, the only one.
+        assert_eq!(
+            p["docOwn"],
+            serde_json::json!(["location"]),
+            "the document owns `location`, and nothing else: {}",
+            p["docOwn"]
+        );
 
         // The Rust<->JS bridge is invisible through every introspection route...
         for key in ["gopnPt", "ownKeysPt", "protoPt"] {
