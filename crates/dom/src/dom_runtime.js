@@ -840,7 +840,11 @@
     get charset() { return this.characterSet; }
     get inputEncoding() { return this.characterSet; }
     get contentType() { return 'text/html'; }
-    get compatMode() { return 'CSS1Compat'; }
+    // Страница без `<!DOCTYPE>` живёт в режиме совместимости, и браузер это
+    // говорит: `BackCompat` и `doctype === null`. Мы отвечали «стандартный
+    // режим» всегда и выдавали объект-заглушку вместо узла.
+    get compatMode() { return this.__ptDoctype ? 'CSS1Compat' : 'BackCompat'; }
+    get doctype() { return this.__ptDoctype || null; }
     get designMode() { return 'off'; }
     set designMode(v) {}
     // Формат браузера — MM/DD/YYYY HH:MM:SS, а не локализованная строка.
@@ -1483,10 +1487,31 @@
   let scriptNodes = [];
 
   // Called by the loader with the Rust-parsed <html> tree.
-  globalThis.__pt_installDocument = (tree) => {
+  globalThis.__pt_installDocument = (tree, dt) => {
     document.__ptKids = [];
     document.documentElement = null;
     document.currentScript = null;
+    // `<!DOCTYPE html>` — это узел документа, первый его ребёнок, а не флаг.
+    document.__ptDoctype = null;
+    if (dt) {
+      // Узел обязан называть себя: `Object.prototype.toString.call(doctype)` —
+      // `[object DocumentType]`, как у всякого интерфейса.
+      try {
+        if (globalThis.DocumentType && !Object.getOwnPropertyDescriptor(DocumentType.prototype, Symbol.toStringTag)) {
+          Object.defineProperty(DocumentType.prototype, Symbol.toStringTag, { value: 'DocumentType', configurable: true });
+        }
+      } catch (e) {}
+      const node = Object.create((globalThis.DocumentType && DocumentType.prototype) || Object.prototype);
+      Object.defineProperty(node, '__ptE', { value: {}, enumerable: false, writable: true });
+      for (const [k, v] of [['name', String(dt.name || 'html')], ['publicId', String(dt.publicId || '')],
+                            ['systemId', String(dt.systemId || '')], ['nodeName', String(dt.name || 'html')],
+                            ['nodeType', 10], ['nodeValue', null], ['textContent', null],
+                            ['ownerDocument', document], ['parentNode', document], ['childNodes', []]]) {
+        Object.defineProperty(node, k, { get: () => v, configurable: true });
+      }
+      document.__ptDoctype = node;
+      document.__ptKids.push(node);
+    }
     if (tree && tree.k === 'e') {
       const html = buildNode(document, tree);
       document.appendChild(html);

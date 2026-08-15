@@ -38,12 +38,23 @@ pub struct ParsedPage {
     pub root: Value,
     /// Scripts to execute, in document order.
     pub scripts: Vec<Script>,
+    /// The document's `<!DOCTYPE …>`, if it had one: name, public id, system id.
+    /// A page without one is in quirks mode and its `document.doctype` is null —
+    /// both of which a fingerprint reads, so the difference has to survive the
+    /// parse instead of being dropped with the node.
+    pub doctype: Option<(String, String, String)>,
 }
 
 impl ParsedPage {
     /// The JS statement that installs this page's tree as `document`.
     pub fn install_script(&self) -> String {
-        format!("globalThis.__pt_installDocument({});", self.root)
+        let dt = match &self.doctype {
+            Some((name, public, system)) => json!({
+                "name": name, "publicId": public, "systemId": system
+            }),
+            None => Value::Null,
+        };
+        format!("globalThis.__pt_installDocument({}, {});", self.root, dt)
     }
 }
 
@@ -56,6 +67,18 @@ pub fn parse(html: &str) -> ParsedPage {
 
     let mut scripts = Vec::new();
     // The document's children are the doctype and the root <html> element.
+    let doctype = dom.document.children.borrow().iter().find_map(|c| match &c.data {
+        NodeData::Doctype {
+            name,
+            public_id,
+            system_id,
+        } => Some((
+            name.to_string(),
+            public_id.to_string(),
+            system_id.to_string(),
+        )),
+        _ => None,
+    });
     let root = dom
         .document
         .children
@@ -65,7 +88,11 @@ pub fn parse(html: &str) -> ParsedPage {
         .map(|html| serialize(html, &mut scripts))
         .unwrap_or(Value::Null);
 
-    ParsedPage { root, scripts }
+    ParsedPage {
+        root,
+        scripts,
+        doctype,
+    }
 }
 
 /// Serialize one node to JSON, recording any scripts encountered.

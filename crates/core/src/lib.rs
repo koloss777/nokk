@@ -5663,6 +5663,59 @@ mod tests {
         );
     }
 
+    /// A property that a page enumerated and read still reaches what the page
+    /// computed — after the loop doing it has been warmed.
+    ///
+    /// This is the engine under the engine. V8's mid-tier optimiser miscompiles
+    /// exactly the loop a fingerprint collector runs — walk a root's keys, read
+    /// each value, sort it by a string comparison — once that loop has run over
+    /// the window graph and tiered up. From then on one property silently
+    /// vanishes from the result: the same source, run as a fresh function object,
+    /// is correct. It was found by diffing our map against Chrome's, where
+    /// `document.cookie` was the one name of 1634 we did not report. The engine
+    /// starts V8 with `--no-maglev` because of this (see `init_platform`), and a
+    /// stock build fails this test.
+    #[tokio::test]
+    async fn a_warmed_enumeration_still_sees_every_property() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const walk = (o) => { let n = []; while (o) { n = n.concat(Object.keys(o)); o = Object.getPrototypeOf(o); } return n; };
+            const collect = (root, prefix) => {
+              const keys = Array.from(new Set(walk(root).concat(Object.getOwnPropertyNames(root))));
+              const out = {};
+              const put = (k, name) => { (out[k] = out[k] || []).push(name); };
+              for (let i = 0; i < keys.length; i++) {
+                const name = keys[i], full = prefix + name;
+                try {
+                  const v = root[name];
+                  const cat = v === null ? 'x' : v === undefined ? 'u' : typeof v === 'string' ? 's'
+                            : typeof v === 'function' ? 'N' : typeof v === 'number' ? 'n' : 'o';
+                  if (cat === 's' || cat === 'n') {
+                    const num = +v, isNumeric = cat === 's' && num === num;
+                    if (full === 'd.cookie') put(cat, full);
+                    else if (!isNumeric) put(String(v), full);
+                  } else put(cat, full);
+                } catch (e) { put('i', full); }
+              }
+              return out;
+            };
+            for (let w = 0; w < 3; w++) collect(globalThis, '');   // the window graph warms the loop
+            const d = collect(document, 'd.');     // and then it answers about the document
+            return JSON.stringify({ cookie: (d.s || []).indexOf('d.cookie') >= 0 });
+        })()"#).await;
+
+        assert_eq!(
+            out["cookie"], true,
+            "an enumerated, readable property survives the loop that read it: {out}"
+        );
+    }
+
     /// Two answers a document gives about itself, both found by running the
     /// challenge's collector next to real Chrome's and diffing the maps.
     ///

@@ -44,6 +44,23 @@ static CREATE_LOCK: Mutex<()> = Mutex::new(());
 /// in [`Isolate::new`] is then a no-op.
 pub(crate) fn init_platform() {
     V8_INIT.call_once(|| {
+        // Maglev — the mid-tier optimiser — miscompiles a loop this engine meets
+        // on its first real page: a fingerprint collector walking the global
+        // graph. After ~1300 iterations the function tiers up, and from then on a
+        // string comparison inside it answers wrongly, so one property silently
+        // vanishes from what the page computed. Same source run as a fresh
+        // function object is correct; `--no-maglev`, `--no-turbofan`, `--no-opt`
+        // and `--jitless` all make it correct. TurboFan keeps hot code fast, so
+        // this costs warm-up speed only — and a page that computes the wrong
+        // answer quickly is worth nothing. Overridable: `NOKK_V8_FLAGS` replaces
+        // this entirely (`--no-opt` to bisect, `""` to run stock V8).
+        //
+        // Fix rather than mitigation: v8 137 → a current release, then re-run
+        // `a_warmed_enumeration_still_sees_every_property`.
+        let flags = std::env::var("NOKK_V8_FLAGS").unwrap_or_else(|_| "--no-maglev".to_string());
+        if !flags.is_empty() {
+            v8::V8::set_flags_from_string(&flags);
+        }
         let platform = v8::new_default_platform(0, false).make_shared();
         // Pin one ref for the whole process so the platform is never freed while
         // isolates still reference it (a use-after-free otherwise).
