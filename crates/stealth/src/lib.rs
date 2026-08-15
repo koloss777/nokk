@@ -3970,7 +3970,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     'MessageChannel', 'MessagePort', 'Headers', 'Request', 'Response', 'URL',
     'AbortController', 'AbortSignal', 'XMLHttpRequest', 'Node', 'Element', 'HTMLElement',
     'Document', 'Text', 'Comment', 'DocumentFragment', 'Event', 'UIEvent', 'MouseEvent',
-    'PointerEvent', 'KeyboardEvent', 'InputEvent', 'FocusEvent', 'MessageEvent', 'CustomEvent']) {
+    'PointerEvent', 'KeyboardEvent', 'InputEvent', 'FocusEvent', 'MessageEvent', 'CustomEvent',
+    // Найдены коллектором самого челленджа: эти четыре читались как
+    // пользовательские функции, то есть попадали в корзину `f` там, где браузер
+    // даёт `N`. Четыре имени из тысячи — ровно тот разряд, которым отпечаток и
+    // отличается.
+    'PerformanceEntry', 'PerformanceResourceTiming', 'PerformanceNavigationTiming',
+    'CustomElementRegistry']) {
     const c = globalThis[n];
     if (typeof c === 'function') { __ptNative.add(c); maskProto(c.prototype); }
   }

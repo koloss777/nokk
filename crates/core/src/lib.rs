@@ -5640,6 +5640,69 @@ mod tests {
         );
     }
 
+    /// Turnstile's own classifier, run against our window graph. The challenge
+    /// walks the global object graph and sorts every value into one character:
+    /// `N` for a native function, `f` for a page-defined one, `i` for a getter
+    /// that threw, `?` for a `typeof` it does not know. In a browser a fresh
+    /// window yields no `f`, no `i` and no `?` at all — every function up there
+    /// is the browser's own. Four of ours (`PerformanceEntry`,
+    /// `PerformanceResourceTiming`, `PerformanceNavigationTiming`,
+    /// `CustomElementRegistry`) read as page functions until this test was
+    /// written, which is a four-bit signature no browser has.
+    #[tokio::test]
+    async fn nothing_on_the_window_graph_reads_as_a_page_function() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        // The classifier, transcribed from the challenge: enumerable keys up the
+        // prototype chain, plus the root's own names, each value to one char.
+        let out = probe(&ctx, r#"(() => {
+            const N = globalThis;
+            const chars = { object: 'o', string: 's', undefined: 'u', symbol: 'z', number: 'n', bigint: 'I' };
+            const classify = (v) => {
+              if (v === null || v === undefined) return v === undefined ? 'u' : 'x';
+              const t = typeof v;
+              if (t === 'object') { try { if (v instanceof Promise) return 'p'; } catch (e) {} }
+              return Array.isArray(v) ? 'a' : v === Array ? 'D' : v === true ? 'T' : v === false ? 'F'
+                : t === 'function'
+                  ? (v instanceof Function && Function.prototype.toString.call(v).indexOf('[native code]') > 0 ? 'N' : 'f')
+                  : (chars[t] || '?');
+            };
+            const walk = (o) => { let names = []; while (o) { names = names.concat(Object.keys(o)); o = Object.getPrototypeOf(o); } return names; };
+            const out = {};
+            for (const [root, prefix] of [[globalThis, ''], [navigator, 'n.'], [document, 'd.'],
+                                          [screen, 's.'], [location, 'l.'], [history, 'h.']]) {
+              const keys = Array.from(new Set(walk(root).concat(Object.getOwnPropertyNames(root))));
+              for (const name of keys) {
+                let cat;
+                try { cat = classify(root[name]); } catch (e) { cat = 'i'; }
+                (out[cat] = out[cat] || []).push(prefix + name);
+              }
+            }
+            return JSON.stringify({
+              f: out.f || [], unknown: out['?'] || [], inaccessible: out.i || [],
+              native: (out.N || []).length,
+            });
+        })()"#).await;
+
+        assert_eq!(
+            out["f"],
+            serde_json::json!([]),
+            "every function on the graph is the browser's own: {}",
+            out["f"]
+        );
+        assert_eq!(out["unknown"], serde_json::json!([]), "no unclassifiable value");
+        assert_eq!(out["inaccessible"], serde_json::json!([]), "no getter throws");
+        assert!(
+            out["native"].as_u64().unwrap_or(0) > 1000,
+            "and the graph is a browser's size: {out}"
+        );
+    }
+
     /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`
     /// is the idiom every collector uses, Cloudflare's included — the URL is dead
     /// one line after the worker starts. Reading the blob when the engine got
