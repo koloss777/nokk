@@ -669,11 +669,37 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
     Object.defineProperty(win, Symbol.toStringTag, { value: 'Window', configurable: true });
   } catch (e) {}
 
-  const noop = () => {};
-  win.console = {
-    log: noop, warn: noop, error: noop, info: noop, debug: noop,
-    trace: noop, dir: noop, table: noop, group: noop, groupEnd: noop, assert: noop
+  // Консоль браузера — не один общий `() => {}` на все имена: там два десятка
+  // методов, каждый со своим именем и `[native code]`, а сам объект зовётся
+  // `[object console]`. И сказанное в неё не должно пропадать: страница,
+  // сообщающая «[Cloudflare Turnstile] Unhandled error: …», говорит это именно
+  // сюда, а у нас это был самый тихий способ потерять причину.
+  const CONSOLE = ['assert', 'clear', 'context', 'count', 'countReset', 'createTask', 'debug',
+    'dir', 'dirxml', 'error', 'group', 'groupCollapsed', 'groupEnd', 'info', 'log', 'profile',
+    'profileEnd', 'table', 'time', 'timeEnd', 'timeLog', 'timeStamp', 'trace', 'warn'];
+  const SPOKEN = { log: 1, info: 1, warn: 1, error: 1, debug: 1, trace: 1, assert: 1, dir: 1 };
+  const said = [];
+  globalThis.__pt_drainConsole = () => said.splice(0);
+  const show = (v) => {
+    try {
+      if (typeof v === 'string') return v;
+      if (v instanceof Error) return String(v.stack || v.message || v);
+      if (typeof v === 'object' && v !== null) { try { return JSON.stringify(v); } catch (e) { return String(v); } }
+      return String(v);
+    } catch (e) { return '?'; }
   };
+  const con = {};
+  for (const name of CONSOLE) {
+    con[name] = { [name]: function () {
+      if (!SPOKEN[name] || said.length > 256) return undefined;
+      const parts = [];
+      for (let i = 0; i < arguments.length && i < 8; i++) parts.push(show(arguments[i]));
+      said.push([name, parts.join(' ').slice(0, 600)]);
+      return undefined;
+    } }[name];
+  }
+  try { Object.defineProperty(con, Symbol.toStringTag, { value: 'console', configurable: true }); } catch (e) {}
+  win.console = con;
 })();"#;
 
 /// Replacement `Intl` + `Date`/`String`/`Number` locale APIs. The prebuilt V8's
@@ -3984,6 +4010,13 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     'addEventListener', 'removeEventListener', 'queueMicrotask', 'structuredClone']) {
     if (typeof globalThis[n] === 'function') __ptNative.add(globalThis[n]);
   }
+  // `console.log.toString()` читают так же, как всё остальное.
+  try {
+    for (const k of Object.getOwnPropertyNames(globalThis.console || {})) {
+      const f = console[k];
+      if (typeof f === 'function') __ptNative.add(f);
+    }
+  } catch (e) {}
 
   // `NodeFilter` — интерфейсный объект, то есть функция с константами на себе,
   // а не словарь: в браузере он попадает в ту же корзину `N`.

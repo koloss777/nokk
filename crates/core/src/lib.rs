@@ -1235,6 +1235,7 @@ impl BrowserContext {
             let script_ops: Vec<Value> = queues["scripts"].as_array().cloned().unwrap_or_default();
             let nav_ops: Vec<Value> = queues["nav"].as_array().cloned().unwrap_or_default();
             let worker_ops: Vec<Value> = queues["workers"].as_array().cloned().unwrap_or_default();
+            self.log_console("page", &queues);
             // How long until the page's next timer, straight from the same queue
             // the driver just pumped: -1 for "nothing pending".
             let next_timer_ms = queues["timers"].as_i64().unwrap_or(-1);
@@ -1815,6 +1816,7 @@ impl BrowserContext {
                 Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
                 _ => Value::Null,
             };
+            self.log_console("worker", &queues);
             if let Some(reqs) = queues["fetch"].as_array() {
                 for r in reqs.iter().take(32) {
                     work += 1;
@@ -1878,6 +1880,25 @@ impl BrowserContext {
             }
         }
         out
+    }
+
+    /// Everything the page said into `console`, on its way to the log. A page
+    /// reports its own failures there — a challenge widget that dies says so in
+    /// one line — and dropping it was the quietest way to lose the reason. Not
+    /// counted as work: talking is not activity, and a page that logs on a timer
+    /// must still be allowed to go idle.
+    fn log_console(&self, where_: &str, queues: &Value) {
+        let Some(lines) = queues["console"].as_array() else {
+            return;
+        };
+        for line in lines.iter().take(64) {
+            let level = line[0].as_str().unwrap_or("log");
+            let text = line[1].as_str().unwrap_or("");
+            if text.is_empty() {
+                continue;
+            }
+            tracing::debug!(target: "nokk::console", %level, %where_, "{text}");
+        }
     }
 
     /// Hand a worker's context back to the isolate. A worker usually ends before
@@ -2283,6 +2304,7 @@ impl BrowserContext {
                 _ => Value::Null,
             };
             let base = self.frame_base(id);
+            self.log_console(&format!("frame {id}"), &queues);
 
             // A frame is a document like any other: its `fetch`/XHR has to reach
             // the network, resolved against *its* URL. Draining this queue and
@@ -2750,6 +2772,7 @@ const DRAIN_IO: &str = "JSON.stringify({\
     scripts: typeof __pt_drainScriptQueue === 'function' ? __pt_drainScriptQueue() : [],\
     nav: typeof __pt_drainNavQueue === 'function' ? __pt_drainNavQueue() : [],\
     workers: typeof __pt_drainWorkerQueue === 'function' ? __pt_drainWorkerQueue() : [],\
+    console: typeof __pt_drainConsole === 'function' ? __pt_drainConsole() : [],\
     timers: typeof __pt_nextTimerDelay === 'function' ? __pt_nextTimerDelay() : -1})";
 
 /// How long [`BrowserContext::run_event_loop`] may spend *waiting* for timers
@@ -5638,6 +5661,52 @@ mod tests {
             ctx.workers.lock().unwrap().is_empty(),
             "a worker that hung up is not still on the isolate"
         );
+    }
+
+    /// Two answers a document gives about itself, both found by running the
+    /// challenge's collector next to real Chrome's and diffing the maps.
+    ///
+    /// `document.readyState` is `loading` while the document's own scripts run —
+    /// the whole point of the `readyState !== 'loading' ? start() : wait for
+    /// DOMContentLoaded` idiom, and we said `interactive` from the first line, so
+    /// every page took the branch a browser does not. And `document.activeElement`
+    /// is `<body>` from the moment a body exists, never `null`: the collector
+    /// buckets it as an object, and we handed it the bucket for null.
+    #[tokio::test]
+    async fn a_document_answers_for_its_own_lifecycle() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<html><body><script>globalThis.__at = {\
+               ready: document.readyState,\
+               active: document.activeElement && document.activeElement.tagName,\
+             };\
+             document.addEventListener('DOMContentLoaded', () => {\
+               globalThis.__dcl = document.readyState;\
+             });</script></body></html>",
+        )
+        .await
+        .unwrap();
+
+        let out = probe(
+            &ctx,
+            "JSON.stringify({ during: globalThis.__at, dcl: globalThis.__dcl, \
+             after: document.readyState, active: document.activeElement.tagName })",
+        )
+        .await;
+        assert_eq!(
+            out["during"]["ready"], "loading",
+            "a document runs its scripts while it is still loading: {out}"
+        );
+        assert_eq!(
+            out["during"]["active"], "BODY",
+            "and its body already has the focus"
+        );
+        assert_eq!(out["dcl"], "interactive", "DOMContentLoaded fires at interactive");
+        assert_eq!(out["after"], "complete", "and load leaves it complete");
+        assert_eq!(out["active"], "BODY", "activeElement is never null");
     }
 
     /// Turnstile's own classifier, run against our window graph. The challenge

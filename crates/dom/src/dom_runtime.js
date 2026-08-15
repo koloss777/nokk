@@ -312,7 +312,11 @@
     get firstElementChild() { return this.children[0] || null; }
     get lastElementChild() { const c = this.children; return c[c.length - 1] || null; }
     get childElementCount() { return this.children.length; }
-    get activeElement() { return null; }
+    // В браузере это `<body>`, как только тело есть, — не null. И это
+    // свойство присваивают (`focus()`), так что одного геттера мало:
+    // присваивание в него молча пропадало.
+    get activeElement() { return this.__ptActive || this.body || null; }
+    set activeElement(v) { this.__ptActive = v; }
     get styleSheets() { return []; }
     get adoptedStyleSheets() { return this.__ptAdopted || (this.__ptAdopted = []); }
     set adoptedStyleSheets(v) { this.__ptAdopted = v; }
@@ -775,7 +779,10 @@
     set documentElement(v) { this.__ptDocEl = v; }
     get readyState() { return this.__ptReady; }
     set readyState(v) { this.__ptReady = v; }
-    get activeElement() { return this.__ptActive; }
+    // В браузере это `<body>`, как только тело есть, и никогда не null у
+    // загруженного документа: сборщик отпечатка кладёт его в корзину объектов,
+    // а null — в корзину «x».
+    get activeElement() { return this.__ptActive || this.body || null; }
     set activeElement(v) { this.__ptActive = v; }
     elementFromPoint(x, y) { return __elementFromPoint(x, y); }
     elementsFromPoint(x, y) { const e = __elementFromPoint(x, y); return e ? [e] : []; }
@@ -1486,7 +1493,11 @@
       document.documentElement = html;
     }
     scriptNodes = document.getElementsByTagName('script') || [];
-    document.readyState = 'interactive';
+    // Пока идут собственные скрипты документа, браузер отвечает 'loading', и
+    // код это читает: «если не loading — запускайся сразу, иначе жди
+    // DOMContentLoaded». Мы отвечали 'interactive' с самого начала, то есть
+    // всегда первую ветку.
+    document.readyState = 'loading';
   };
 
   // The loader brackets each page script with these so `document.currentScript`
@@ -1497,9 +1508,9 @@
 
   // Called after all page scripts have run: fire DOMContentLoaded then load.
   globalThis.__pt_finishLoad = () => {
-    document.readyState = 'complete';
-    if (!document.activeElement) document.activeElement = document.body || null;
+    document.readyState = 'interactive';
     document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
+    document.readyState = 'complete';
     if (globalThis.onload) { try { globalThis.onload(new Event('load')); } catch (_) {} }
     const l = globalThis.__ptLis && globalThis.__ptLis['load'];
     globalThis.dispatchEvent && globalThis.dispatchEvent(new Event('load'));
