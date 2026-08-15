@@ -411,6 +411,33 @@ async fn main() -> Result<()> {
             {
                 dump(format!("worker {url}"), v);
             }
+            // Хвост: чем страница и каждый фрейм занимались последними, по порядку.
+            let tail = match std::env::var("NOKK_TRACE_HEAD") {
+                Ok(_) => "typeof __pt_probeHead === 'function' ? __pt_probeHead(600) : ''",
+                Err(_) => "typeof __pt_probeTail === 'function' ? __pt_probeTail(40) : ''",
+            };
+            let mut where_: Vec<Option<u32>> = vec![None];
+            where_.extend(ctx.frame_list().iter().map(|f| Some(f.id)));
+            for slot in where_ {
+                let out = match slot {
+                    None => ctx.evaluate(tail).await,
+                    Some(id) => ctx.evaluate_in_frame(id, tail).await,
+                };
+                if let Ok(serde_json::Value::String(text)) = out {
+                    if let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
+                        if !rows.is_empty() {
+                            let label = slot
+                                .map(|i| format!("frame {i}"))
+                                .unwrap_or_else(|| "page".to_string());
+                            eprintln!("# tail {label}:");
+                            for row in rows {
+                                eprintln!("#   {:>6}ms {} -> {}", row[0].as_i64().unwrap_or(0),
+                                          row[1].as_str().unwrap_or(""), row[2].as_str().unwrap_or(""));
+                            }
+                        }
+                    }
+                }
+            }
             let trace = "JSON.stringify(globalThis.__pt_workerTrace || [])";
             let mut traces = vec![ctx.evaluate(trace).await];
             for f in ctx.frame_list() {
