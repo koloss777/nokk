@@ -334,14 +334,28 @@ async fn main() -> Result<()> {
                   // его сожмут и зашифруют — это единственная точка, где видно,
                   // что именно мы про себя рассказали.
                   try {
+                    let n = 0, biggest = '';
                     const S = JSON.stringify;
                     JSON.stringify = function (v) {
                       const out = S.apply(this, arguments);
-                      if (typeof out === 'string' && out.length > 2000) {
-                        try { console.error('[payload ' + out.length + '] ' + out.slice(0, 1500)); } catch (e) {}
+                      if (typeof out === 'string' && out.length > biggest.length) biggest = out;
+                      if (typeof out === 'string' && out.length > 300 && n++ < 6) {
+                        try { console.error('[payload ' + out.length + '] ' + out.slice(0, 900)); } catch (e) {}
                       }
                       return out;
                     };
+                    globalThis.__pt_biggestPayload = () => biggest.slice(0, 4000);
+                    // Их собственная сериализация: у бандла есть свой сборщик строк,
+                    // и отпечаток может уйти мимо JSON. Ловим и это.
+                    const A = globalThis.btoa;
+                    if (typeof A === 'function') {
+                      globalThis.btoa = function (x) {
+                        if (typeof x === 'string' && x.length > 300) {
+                          try { console.error('[b64 ' + x.length + '] ' + x.slice(0, 600)); } catch (e) {}
+                        }
+                        return A.apply(this, arguments);
+                      };
+                    }
                   } catch (e) {}
                   const wrap = (obj, label) => {
                     for (const k of Object.keys(obj)) {
@@ -463,7 +477,7 @@ async fn main() -> Result<()> {
             {
                 eprintln!("# page ids: {t}");
             }
-            if let Ok(serde_json::Value::String(t)) = ctx.evaluate("(() => { const seen = []; const walk = (root) => {                            for (const el of root.querySelectorAll('*')) {                              const tag = el.localName;                              if (tag === 'input' || tag === 'button' || el.getAttribute('role'))                                seen.push(tag + (el.type ? '[' + el.type + ']' : '') +                                          (el.getAttribute('role') ? '{' + el.getAttribute('role') + '}' : ''));                              const sr = el.shadowRoot || el.__ptShadow; if (sr) walk(sr); } };                          const root = document.body && (document.body.shadowRoot || document.body.__ptShadow);                          try { walk(document); if (root) walk(root); } catch (e) {}                          return JSON.stringify({controls: seen.slice(0, 12),                            bodyShadow: !!root,                            shadowKids: root ? root.childNodes.length : -1,                            shadowText: root ? String(root.textContent || '').trim().slice(0, 60) : '',                            bodyKids: document.body ? document.body.childNodes.length : -1,                            view: [innerWidth, innerHeight],                            html: (document.documentElement ? document.documentElement.outerHTML : '').length}); })()").await {
+            if let Ok(serde_json::Value::String(t)) = ctx.evaluate("(() => { const seen = []; const walk = (root) => {                            for (const el of root.querySelectorAll('*')) {                              const tag = el.localName;                              if (tag === 'input' || tag === 'button' || el.getAttribute('role'))                                seen.push(tag + (el.type ? '[' + el.type + ']' : '') +                                          (el.getAttribute('role') ? '{' + el.getAttribute('role') + '}' : ''));                              const sr = el.shadowRoot || el.__ptShadow; if (sr) walk(sr); } };                          const root = document.body && (document.body.shadowRoot || document.body.__ptShadow);                          try { walk(document); if (root) walk(root); } catch (e) {}                          return JSON.stringify({controls: seen.slice(0, 12),                            events: (globalThis._cf_chl_opt && _cf_chl_opt.FELcX1) ? _cf_chl_opt.FELcX1.length : -1, bodyShadow: !!root,                            shadowKids: root ? root.childNodes.length : -1,                            shadowText: root ? String(root.textContent || '').trim().slice(0, 60) : '',                            bodyKids: document.body ? document.body.childNodes.length : -1,                            view: [innerWidth, innerHeight],                            html: (document.documentElement ? document.documentElement.outerHTML : '').length}); })()").await {
                 eprintln!("# page widget: {t}");
             }
             // Что виджет в итоге нарисовал: интерактивный контрол — то, чего
@@ -472,7 +486,7 @@ async fn main() -> Result<()> {
                 if let Ok(serde_json::Value::String(t)) = ctx
                     .evaluate_in_frame(
                         f.id,
-                        "(() => { const seen = []; const walk = (root) => {                            for (const el of root.querySelectorAll('*')) {                              const tag = el.localName;                              if (tag === 'input' || tag === 'button' || el.getAttribute('role'))                                seen.push(tag + (el.type ? '[' + el.type + ']' : '') +                                          (el.getAttribute('role') ? '{' + el.getAttribute('role') + '}' : ''));                              const sr = el.shadowRoot || el.__ptShadow; if (sr) walk(sr); } };                          const root = document.body && (document.body.shadowRoot || document.body.__ptShadow);                          try { walk(document); if (root) walk(root); } catch (e) {}                          return JSON.stringify({controls: seen.slice(0, 12),                            bodyShadow: !!root,                            shadowKids: root ? root.childNodes.length : -1,                            shadowText: root ? String(root.textContent || '').trim().slice(0, 60) : '',                            bodyKids: document.body ? document.body.childNodes.length : -1,                            view: [innerWidth, innerHeight],                            html: (document.documentElement ? document.documentElement.outerHTML : '').length}); })()",
+                        "(() => { const seen = []; const walk = (root) => {                            for (const el of root.querySelectorAll('*')) {                              const tag = el.localName;                              if (tag === 'input' || tag === 'button' || el.getAttribute('role'))                                seen.push(tag + (el.type ? '[' + el.type + ']' : '') +                                          (el.getAttribute('role') ? '{' + el.getAttribute('role') + '}' : ''));                              const sr = el.shadowRoot || el.__ptShadow; if (sr) walk(sr); } };                          const root = document.body && (document.body.shadowRoot || document.body.__ptShadow);                          try { walk(document); if (root) walk(root); } catch (e) {}                          return JSON.stringify({controls: seen.slice(0, 12),                            events: (globalThis._cf_chl_opt && _cf_chl_opt.FELcX1) ? _cf_chl_opt.FELcX1.length : -1, bodyShadow: !!root,                            shadowKids: root ? root.childNodes.length : -1,                            shadowText: root ? String(root.textContent || '').trim().slice(0, 60) : '',                            bodyKids: document.body ? document.body.childNodes.length : -1,                            view: [innerWidth, innerHeight],                            html: (document.documentElement ? document.documentElement.outerHTML : '').length}); })()",
                     )
                     .await
                 {
