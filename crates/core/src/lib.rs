@@ -5983,6 +5983,105 @@ mod tests {
         );
     }
 
+    /// A widget that wants a worker does not hand `new Worker` a string: it asks
+    /// Trusted Types for a policy and passes the `TrustedScriptURL` the policy
+    /// makes. `trustedTypes` used to be a bare `{}` — the name was there, the
+    /// factory was not — and `createPolicy` threw a TypeError that took the whole
+    /// collection with it. This is that path, end to end.
+    #[tokio::test]
+    async fn a_trusted_policy_makes_a_url_a_worker_will_take() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const p = trustedTypes.createPolicy('nokk-test', { createScriptURL: (s) => s });
+            const u = p.createScriptURL('blob:https://example.com/abc');
+            return __ptJSON.stringify({
+              factory: Object.prototype.toString.call(trustedTypes),
+              policy: Object.prototype.toString.call(p),
+              name: p.name,
+              url: Object.prototype.toString.call(u),
+              text: String(u),
+              json: u.toJSON(),
+              isScriptURL: trustedTypes.isScriptURL(u),
+              isHTML: trustedTypes.isHTML(u),
+              attributeType: trustedTypes.getAttributeType('script', 'src'),
+              defaultPolicy: trustedTypes.defaultPolicy,
+              // Worker takes it because it stringifies, the way Chrome's does.
+              worker: (() => { try { new Worker(u); return 'started'; } catch (e) { return 'THREW ' + e; } })(),
+            });
+        })()"#).await;
+
+        assert_eq!(out["factory"], "[object TrustedTypePolicyFactory]");
+        assert_eq!(out["policy"], "[object TrustedTypePolicy]");
+        assert_eq!(out["name"], "nokk-test");
+        assert_eq!(out["url"], "[object TrustedScriptURL]");
+        assert_eq!(out["text"], "blob:https://example.com/abc");
+        assert_eq!(out["json"], "blob:https://example.com/abc");
+        assert_eq!(out["isScriptURL"], true);
+        assert_eq!(out["isHTML"], false);
+        assert_eq!(out["attributeType"], "TrustedScriptURL");
+        assert_eq!(out["defaultPolicy"], serde_json::Value::Null);
+        assert_eq!(out["worker"], "started", "the worker takes the trusted url");
+    }
+
+    /// Names without bodies: the graph table gave `navigator.gpu` and its
+    /// neighbours the right names and left them as `{}`, so the first call threw
+    /// and the prototype chain a collector walks was empty where Chrome has an
+    /// interface. Values here are Chrome 148's, measured on this machine.
+    #[tokio::test]
+    async fn the_platform_objects_are_interfaces_not_bare_objects() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        ctx.evaluate(r#"(async () => {
+            const tag = (v) => Object.prototype.toString.call(v);
+            const adapter = await navigator.gpu.requestAdapter();
+            const layout = await navigator.keyboard.getLayoutMap();
+            globalThis.__out = __ptJSON.stringify({
+              done: true,
+              brands: [tag(navigator.gpu), tag(navigator.storage), tag(navigator.permissions),
+                       tag(navigator.connection), tag(navigator.keyboard), tag(navigator.mediaCapabilities),
+                       tag(navigator.userAgentData), tag(screen.orientation)],
+              adapter: tag(adapter),
+              limits: [tag(adapter.limits), adapter.limits.maxTextureDimension2D],
+              info: [tag(adapter.info), adapter.info.vendor],
+              features: [tag(adapter.features), adapter.features.has('shader-f16')],
+              format: navigator.gpu.getPreferredCanvasFormat(),
+              layout: [tag(layout), layout.size, layout.get('KeyQ')],
+              decoding: (await navigator.mediaCapabilities.decodingInfo({ type: 'file' })).supported,
+              highEntropy: (await navigator.userAgentData.getHighEntropyValues(['architecture'])).architecture,
+            });
+        })()"#).await.unwrap();
+        let text = pump_until(&ctx, "globalThis.__out || ''", 20).await;
+        let out: Value = serde_json::from_str(text.as_str().unwrap()).unwrap();
+
+        assert_eq!(
+            out["brands"],
+            serde_json::json!([
+                "[object GPU]", "[object StorageManager]", "[object Permissions]",
+                "[object NetworkInformation]", "[object Keyboard]", "[object MediaCapabilities]",
+                "[object NavigatorUAData]", "[object ScreenOrientation]"
+            ]),
+        );
+        assert_eq!(out["adapter"], "[object GPUAdapter]");
+        assert_eq!(out["limits"], serde_json::json!(["[object GPUSupportedLimits]", 16384]));
+        assert_eq!(out["info"], serde_json::json!(["[object GPUAdapterInfo]", "intel"]));
+        assert_eq!(out["features"], serde_json::json!(["[object GPUSupportedFeatures]", true]));
+        assert_eq!(out["format"], "rgba8unorm");
+        assert_eq!(out["layout"], serde_json::json!(["[object KeyboardLayoutMap]", 48, "q"]));
+        assert_eq!(out["decoding"], true);
+        assert_eq!(out["highEntropy"], "x86");
+    }
+
     /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`
     /// is the idiom every collector uses, Cloudflare's included — the URL is dead
     /// one line after the worker starts. Reading the blob when the engine got

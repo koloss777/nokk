@@ -382,11 +382,25 @@ async fn main() -> Result<()> {
                       };
                     }
                   } catch (e) {}
+                  // Что VM успела потрогать перед броском. Стек внутри их
+                  // интерпретатора ничего не говорит: там один диспетчер опкодов,
+                  // а вот последние обращения к хостовым таблицам — говорят.
+                  const recent = [];
+                  const remember = (s) => { recent.push(s); if (recent.length > 24) recent.shift(); };
+                  globalThis.__pt_recent = () => recent.join(' → ');
+                  try {
+                    const D = EventTarget.prototype.dispatchEvent;
+                    EventTarget.prototype.dispatchEvent = function (e) {
+                      remember('dispatch:' + (e && e.type));
+                      return D.apply(this, arguments);
+                    };
+                  } catch (e) {}
                   const wrap = (obj, label) => {
                     for (const k of Object.keys(obj)) {
                       const v = obj[k];
                       if (typeof v !== 'function') continue;
                       obj[k] = function () {
+                        remember(label + '.' + k);
                         try { console.error('[hook] ' + label + '.' + k); } catch (e) {}
                         try {
                           return v.apply(this, arguments);
@@ -400,6 +414,40 @@ async fn main() -> Result<()> {
                     }
                     return obj;
                   };
+                  // Их интерпретатор: программа с сервера приходит байткодом и
+                  // исполняется через window.runProgram. Сколько она работала и
+                  // чем кончила — половина ответа на «почему нет второго круга».
+                  try {
+                    let rp;
+                    Object.defineProperty(globalThis, 'runProgram', {
+                      configurable: true,
+                      get() { return rp; },
+                      set(v) {
+                        rp = typeof v !== 'function' ? v : function (src) {
+                          const t0 = Date.now();
+                          let fn;
+                          try { fn = v.apply(this, arguments); }
+                          catch (e) { console.error('[vm] build threw after ' + (Date.now() - t0) + 'ms: ' + e); throw e; }
+                          console.error('[vm] built in ' + (Date.now() - t0) + 'ms from ' +
+                                        ((src && src.length) || 0) + ' bytes → ' + typeof fn);
+                          if (typeof fn !== 'function') return fn;
+                          return function () {
+                            const t1 = Date.now();
+                            try {
+                              const out = fn.apply(this, arguments);
+                              console.error('[vm] ran ' + (Date.now() - t1) + 'ms → ' + typeof out);
+                              return out;
+                            } catch (e) {
+                              console.error('[vm] threw after ' + (Date.now() - t1) + 'ms: ' +
+                                            String((e && e.stack) || e).split('\n').join(' | '));
+                              try { console.error('[vm] before the throw: ' + recent.join(' → ')); } catch (e2) {}
+                              throw e;
+                            }
+                          };
+                        };
+                      },
+                    });
+                  } catch (e) {}
                   for (const name of ['RItcy2', 'HuCI0']) {
                     let store;
                     try {

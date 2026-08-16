@@ -1465,7 +1465,7 @@ const WINDOW_ENUMERABLE: &str = r#"["alert", "atob", "blur", "btoa", "caches", "
 
 pub fn web_surface_script() -> String {
     format!(
-        "{WEB_SURFACE_TEMPLATE}\n{}",
+        "{WEB_SURFACE_TEMPLATE}\n{WEB_BODIES_TEMPLATE}\n{}",
         WINDOW_SHAPE_TEMPLATE.replace("__WINDOW_ENUMERABLE__", WINDOW_ENUMERABLE)
     )
 }
@@ -1607,6 +1607,289 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
     try { Object.defineProperty(globalThis, name, Object.assign({}, d, { enumerable: want })); } catch (e) {}
   }
 })();"#;
+
+/// Тела для интерфейсов, которым таблица графа даёт одно имя.
+///
+/// Заглушка `{}` отвечает на вопрос «есть ли такое имя», но не на «что оно
+/// умеет», и разница видна на первом же вызове: `trustedTypes.createPolicy`
+/// у нас бросал TypeError, а виджет Turnstile именно через политику собирает
+/// URL для своего воркера — сбор отпечатка идёт внутри него. Один непрошедший
+/// вызов обрывал всю вторую стадию.
+///
+/// Значения — не выдумка: сняты с локального Chrome 148 (`measure_cdp.js`),
+/// включая набор лимитов и фич адаптера WebGPU и раскладку клавиатуры.
+///
+/// Идёт после [`WEB_SURFACE_TEMPLATE`]: имена вроде `navigator.gpu` создаёт
+/// именно он, и пересаживать заглушку на интерфейс можно только когда она уже
+/// есть.
+const WEB_BODIES_TEMPLATE: &str = r##"(() => {
+  const native = globalThis.__pt_native || ((f) => f);
+  const defv = (o, k, v) => {
+    try { Object.defineProperty(o, k, { value: v, writable: true, enumerable: true, configurable: true }); } catch (e) {}
+  };
+  const defg = (o, k, g) => {
+    try { Object.defineProperty(g, 'name', { value: 'get ' + k, configurable: true }); } catch (e) {}
+    try { Object.defineProperty(o, k, { get: native(g), enumerable: true, configurable: true }); } catch (e) {}
+  };
+  const fn = (name, f) => {
+    try { Object.defineProperty(f, 'name', { value: name, configurable: true }); } catch (e) {}
+    return native(f);
+  };
+  const meth = (proto, name, f) => defv(proto, name, fn(name, f));
+
+  // Интерфейс так, как его видит страница: конструктор бросает «Illegal
+  // constructor», прототип несёт toStringTag и обратную ссылку на конструктор,
+  // а имя лежит на окне неперечислимым — как у любого браузерного интерфейса.
+  const iface = (name, base) => {
+    const C = function () { throw new TypeError('Illegal constructor'); };
+    try { Object.defineProperty(C, 'name', { value: name, configurable: true }); } catch (e) {}
+    if (base) { try { Object.setPrototypeOf(C.prototype, base); } catch (e) {} }
+    try { Object.defineProperty(C.prototype, 'constructor', { value: C, writable: true, configurable: true }); } catch (e) {}
+    try { Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {}
+    native(C);
+    try { Object.defineProperty(globalThis, name, { value: C, writable: true, enumerable: false, configurable: true }); } catch (e) {}
+    return C;
+  };
+
+  // Пересадка уже работающего объекта на настоящий интерфейс. Значения
+  // переезжают на прототип: у Chrome ни у `navigator.storage`, ни у
+  // `screen.orientation` собственных свойств нет вовсе — всё на прототипе,
+  // и сборщик отпечатка идёт по графу именно так.
+  const rebrand = (obj, name, base) => {
+    if (!obj || typeof obj !== 'object') return obj;
+    const C = iface(name, base);
+    for (const k of Object.getOwnPropertyNames(obj)) {
+      let d;
+      try { d = Object.getOwnPropertyDescriptor(obj, k); } catch (e) { continue; }
+      if (!d || !d.configurable) continue;
+      try {
+        if (typeof d.value === 'function') defv(C.prototype, k, native(d.value));
+        else if ('value' in d) { const v = d.value; defg(C.prototype, k, function () { return v; }); }
+        else Object.defineProperty(C.prototype, k, d);
+        delete obj[k];
+      } catch (e) {}
+    }
+    try { Object.setPrototypeOf(obj, C.prototype); } catch (e) {}
+    return C;
+  };
+
+  const ET = globalThis.EventTarget && EventTarget.prototype;
+
+  // ── Trusted Types ────────────────────────────────────────────────────────
+  // Значение живёт в WeakMap, а не на объекте: у настоящего TrustedScriptURL
+  // собственных свойств нет, только toString/toJSON на прототипе.
+  const VAL = new WeakMap();
+  const TrustedHTML = iface('TrustedHTML');
+  const TrustedScript = iface('TrustedScript');
+  const TrustedScriptURL = iface('TrustedScriptURL');
+  const wrapped = (C, s) => { const o = Object.create(C.prototype); VAL.set(o, String(s)); return o; };
+  for (const C of [TrustedHTML, TrustedScript, TrustedScriptURL]) {
+    meth(C.prototype, 'toString', function () { return VAL.get(this); });
+    meth(C.prototype, 'toJSON', function () { return VAL.get(this); });
+  }
+
+  const POL = new WeakMap();
+  const TrustedTypePolicy = iface('TrustedTypePolicy');
+  defg(TrustedTypePolicy.prototype, 'name', function () { const p = POL.get(this); return p ? p.name : ''; });
+  const creator = (member, C) => function (input) {
+    const p = POL.get(this);
+    const rule = p && p.rules && p.rules[member];
+    if (typeof rule !== 'function') {
+      throw new TypeError("Failed to execute '" + member + "' on 'TrustedTypePolicy': Policy " +
+                          (p ? p.name : '') + "'s TrustedTypePolicyOptions did not specify a '" + member + "' member.");
+    }
+    return wrapped(C, rule.apply(p.rules, arguments));
+  };
+  meth(TrustedTypePolicy.prototype, 'createHTML', creator('createHTML', TrustedHTML));
+  meth(TrustedTypePolicy.prototype, 'createScript', creator('createScript', TrustedScript));
+  meth(TrustedTypePolicy.prototype, 'createScriptURL', creator('createScriptURL', TrustedScriptURL));
+
+  const TrustedTypePolicyFactory = iface('TrustedTypePolicyFactory');
+  const TTF = TrustedTypePolicyFactory.prototype;
+  const emptyHTML = wrapped(TrustedHTML, '');
+  const emptyScript = wrapped(TrustedScript, '');
+  let defaultPolicy = null;
+  meth(TTF, 'createPolicy', function (name, rules) {
+    const p = Object.create(TrustedTypePolicy.prototype);
+    POL.set(p, { name: String(name), rules: rules || {} });
+    if (String(name) === 'default') defaultPolicy = p;
+    return p;
+  });
+  defg(TTF, 'emptyHTML', function () { return emptyHTML; });
+  defg(TTF, 'emptyScript', function () { return emptyScript; });
+  defg(TTF, 'defaultPolicy', function () { return defaultPolicy; });
+  // Where Chrome demands a trusted value — measured, not guessed.
+  const ATTR = {
+    'script:src': 'TrustedScriptURL', 'script:text': 'TrustedScript',
+    'iframe:srcdoc': 'TrustedHTML', 'embed:src': 'TrustedScriptURL',
+    'object:data': 'TrustedScriptURL', 'object:codebase': 'TrustedScriptURL',
+  };
+  const PROP = { 'script:src': 'TrustedScriptURL', 'script:text': 'TrustedScript',
+                 'script:innerText': 'TrustedScript', 'script:textContent': 'TrustedScript',
+                 'iframe:srcdoc': 'TrustedHTML', '*:innerHTML': 'TrustedHTML', '*:outerHTML': 'TrustedHTML' };
+  meth(TTF, 'getAttributeType', function (tag, attr) {
+    return ATTR[String(tag).toLowerCase() + ':' + String(attr).toLowerCase()] || null;
+  });
+  meth(TTF, 'getPropertyType', function (tag, prop) {
+    const t = String(tag).toLowerCase(), p = String(prop);
+    return PROP[t + ':' + p] || PROP['*:' + p] || null;
+  });
+  meth(TTF, 'getTypeMapping', function () { return {}; });
+  meth(TTF, 'isHTML', function (v) { return v instanceof TrustedHTML; });
+  meth(TTF, 'isScript', function (v) { return v instanceof TrustedScript; });
+  meth(TTF, 'isScriptURL', function (v) { return v instanceof TrustedScriptURL; });
+  try {
+    Object.defineProperty(globalThis, 'trustedTypes', {
+      value: Object.create(TTF), writable: true, enumerable: true, configurable: true,
+    });
+  } catch (e) {}
+
+  // ── navigator.* ──────────────────────────────────────────────────────────
+  const nav = globalThis.navigator;
+  if (nav) {
+    const Storage_ = rebrand(nav.storage, 'StorageManager');
+    if (Storage_) {
+      if (typeof nav.storage.estimate !== 'function') {
+        meth(Storage_.prototype, 'estimate', function () {
+          return Promise.resolve({ quota: 10737418240, usage: 0, usageDetails: {} });
+        });
+      }
+      meth(Storage_.prototype, 'persisted', function () { return Promise.resolve(false); });
+      meth(Storage_.prototype, 'persist', function () { return Promise.resolve(false); });
+      meth(Storage_.prototype, 'getDirectory', function () {
+        return Promise.reject(new TypeError('Failed to execute \'getDirectory\' on \'StorageManager\': Storage directory access is denied.'));
+      });
+    }
+
+    rebrand(nav.permissions, 'Permissions');
+    rebrand(nav.connection, 'NetworkInformation', ET);
+    rebrand(nav.ink, 'Ink');
+    rebrand(nav.locks, 'LockManager');
+    rebrand(nav.devicePosture, 'DevicePosture', ET);
+
+    const MC = rebrand(nav.mediaCapabilities, 'MediaCapabilities');
+    if (MC) {
+      // Chrome отвечает так на любой поддерживаемый профиль; проверено на месте.
+      meth(MC.prototype, 'decodingInfo', function () {
+        return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, keySystemAccess: null });
+      });
+      meth(MC.prototype, 'encodingInfo', function () {
+        return Promise.resolve({ supported: true, smooth: true, powerEfficient: true });
+      });
+    }
+
+    const KB = rebrand(nav.keyboard, 'Keyboard');
+    if (KB) {
+      const LAYOUT = [["KeyK","k"],["KeyG","g"],["Digit2","2"],["Digit0","0"],["KeyV","v"],["KeyA","a"],["Backquote","`"],["KeyL","l"],["IntlBackslash","<"],["Quote","'"],["KeyW","w"],["Digit8","8"],["KeyM","m"],["KeyH","h"],["Period","."],["Digit7","7"],["Digit1","1"],["KeyP","p"],["KeyD","d"],["KeyF","f"],["KeyO","o"],["KeyQ","q"],["KeyC","c"],["KeyN","n"],["BracketLeft","["],["KeyZ","z"],["KeyY","y"],["Digit3","3"],["Digit6","6"],["Digit5","5"],["KeyX","x"],["Slash","/"],["Backslash","\\"],["Comma",","],["Minus","-"],["Digit4","4"],["KeyB","b"],["KeyT","t"],["Digit9","9"],["KeyS","s"],["KeyI","i"],["KeyU","u"],["Equal","="],["KeyJ","j"],["Semicolon",";"],["KeyR","r"],["BracketRight","]"],["KeyE","e"]];
+      const KLM = iface('KeyboardLayoutMap');
+      const MAP = new WeakMap();
+      defg(KLM.prototype, 'size', function () { return MAP.get(this).size; });
+      meth(KLM.prototype, 'get', function (k) { return MAP.get(this).get(String(k)); });
+      meth(KLM.prototype, 'has', function (k) { return MAP.get(this).has(String(k)); });
+      meth(KLM.prototype, 'keys', function () { return MAP.get(this).keys(); });
+      meth(KLM.prototype, 'values', function () { return MAP.get(this).values(); });
+      meth(KLM.prototype, 'entries', function () { return MAP.get(this).entries(); });
+      meth(KLM.prototype, 'forEach', function (f, t) { return MAP.get(this).forEach(f, t); });
+      try {
+        Object.defineProperty(KLM.prototype, Symbol.iterator, {
+          value: fn('[Symbol.iterator]', function () { return MAP.get(this).entries(); }),
+          writable: true, configurable: true,
+        });
+      } catch (e) {}
+      meth(KB.prototype, 'getLayoutMap', function () {
+        const m = Object.create(KLM.prototype);
+        MAP.set(m, new Map(LAYOUT));
+        return Promise.resolve(m);
+      });
+      meth(KB.prototype, 'lock', function () { return Promise.resolve(); });
+      meth(KB.prototype, 'unlock', function () {});
+    }
+
+    const UA = nav.userAgentData;
+    if (UA) {
+      // Значения уже есть (их ставит слой отпечатка) — забираем их до пересадки.
+      const brands = UA.brands, mobile = UA.mobile, platform = UA.platform;
+      const HIGH = {"architecture":"x86","bitness":"64","formFactors":["Desktop"],"fullVersionList":[{"brand":"Chromium","version":"148.0.7778.178"},{"brand":"Google Chrome","version":"148.0.7778.178"},{"brand":"Not/A)Brand","version":"99.0.0.0"}],"model":"","platformVersion":"","uaFullVersion":"148.0.7778.178","wow64":false};
+      const UAD = rebrand(UA, 'NavigatorUAData');
+      meth(UAD.prototype, 'toJSON', function () { return { brands: brands, mobile: mobile, platform: platform }; });
+      meth(UAD.prototype, 'getHighEntropyValues', function (hints) {
+        const out = { brands: brands, mobile: mobile, platform: platform };
+        for (const h of (hints || [])) if (Object.prototype.hasOwnProperty.call(HIGH, h)) out[h] = HIGH[h];
+        return Promise.resolve(out);
+      });
+    }
+
+    // ── WebGPU ─────────────────────────────────────────────────────────────
+    const GPU_ = rebrand(nav.gpu, 'GPU');
+    if (GPU_) {
+      const LIMITS = {"maxTextureDimension1D":16384,"maxTextureDimension2D":16384,"maxTextureDimension3D":2048,"maxTextureArrayLayers":2048,"maxBindGroups":4,"maxBindGroupsPlusVertexBuffers":24,"maxBindingsPerBindGroup":1000,"maxDynamicUniformBuffersPerPipelineLayout":8,"maxDynamicStorageBuffersPerPipelineLayout":4,"maxSampledTexturesPerShaderStage":16,"maxSamplersPerShaderStage":16,"maxStorageBuffersPerShaderStage":16,"maxStorageTexturesPerShaderStage":4,"maxUniformBuffersPerShaderStage":12,"maxUniformBufferBindingSize":65536,"maxStorageBufferBindingSize":1073741824,"minUniformBufferOffsetAlignment":256,"minStorageBufferOffsetAlignment":256,"maxVertexBuffers":8,"maxBufferSize":1073741824,"maxVertexAttributes":16,"maxVertexBufferArrayStride":2048,"maxInterStageShaderVariables":16,"maxColorAttachments":8,"maxColorAttachmentBytesPerSample":128,"maxComputeWorkgroupStorageSize":65536,"maxComputeInvocationsPerWorkgroup":1024,"maxComputeWorkgroupSizeX":1024,"maxComputeWorkgroupSizeY":1024,"maxComputeWorkgroupSizeZ":64,"maxComputeWorkgroupsPerDimension":65535,"maxStorageBuffersInFragmentStage":16,"maxStorageTexturesInFragmentStage":4,"maxStorageBuffersInVertexStage":16,"maxStorageTexturesInVertexStage":4};
+      const FEATURES = ["bgra8unorm-storage","clip-distances","core-features-and-limits","depth-clip-control","depth32float-stencil8","dual-source-blending","float32-blendable","float32-filterable","indirect-first-instance","primitive-index","rg11b10ufloat-renderable","shader-f16","subgroups","texture-component-swizzle","texture-compression-astc","texture-compression-astc-sliced-3d","texture-compression-bc","texture-compression-bc-sliced-3d","texture-compression-etc2","texture-formats-tier1","texture-formats-tier2","timestamp-query"];
+      const INFO = {"vendor":"intel","architecture":"gen-12lp","device":"","description":"","subgroupMinSize":8,"subgroupMaxSize":32,"isFallbackAdapter":false};
+      const WGSL = ["linear_indexing","packed_4x8_integer_dot_product","pointer_composite_access","readonly_and_readwrite_storage_textures","subgroup_id","subgroup_uniformity","texture_and_sampler_let","uniform_buffer_standard_layout","unrestricted_pointer_parameters"];
+
+      // setlike-интерфейс: Chrome отдаёт их именно так, а не массивом.
+      const setlike = (name) => {
+        const C = iface(name);
+        const S = new WeakMap();
+        defg(C.prototype, 'size', function () { return S.get(this).size; });
+        meth(C.prototype, 'has', function (k) { return S.get(this).has(String(k)); });
+        meth(C.prototype, 'keys', function () { return S.get(this).keys(); });
+        meth(C.prototype, 'values', function () { return S.get(this).values(); });
+        meth(C.prototype, 'entries', function () { return S.get(this).entries(); });
+        meth(C.prototype, 'forEach', function (f, t) { return S.get(this).forEach(f, t); });
+        try {
+          Object.defineProperty(C.prototype, Symbol.iterator, {
+            value: fn('[Symbol.iterator]', function () { return S.get(this).values(); }),
+            writable: true, configurable: true,
+          });
+        } catch (e) {}
+        return (items) => { const o = Object.create(C.prototype); S.set(o, new Set(items)); return o; };
+      };
+      const mkFeatures = setlike('GPUSupportedFeatures');
+      const mkWgsl = setlike('WGSLLanguageFeatures');
+
+      const GPUSupportedLimits = iface('GPUSupportedLimits');
+      for (const k of Object.keys(LIMITS)) {
+        const v = LIMITS[k];
+        defg(GPUSupportedLimits.prototype, k, function () { return v; });
+      }
+      const GPUAdapterInfo = iface('GPUAdapterInfo');
+      for (const k of Object.keys(INFO)) {
+        const v = INFO[k];
+        defg(GPUAdapterInfo.prototype, k, function () { return v; });
+      }
+      const GPUQueue = iface('GPUQueue');
+      const GPUDevice = iface('GPUDevice', ET);
+      const GPUAdapter = iface('GPUAdapter');
+
+      const limits = Object.create(GPUSupportedLimits.prototype);
+      const info = Object.create(GPUAdapterInfo.prototype);
+      const features = mkFeatures(FEATURES);
+      defg(GPUAdapter.prototype, 'features', function () { return features; });
+      defg(GPUAdapter.prototype, 'limits', function () { return limits; });
+      defg(GPUAdapter.prototype, 'info', function () { return info; });
+      defg(GPUDevice.prototype, 'features', function () { return features; });
+      defg(GPUDevice.prototype, 'limits', function () { return limits; });
+      defg(GPUDevice.prototype, 'adapterInfo', function () { return info; });
+      defg(GPUDevice.prototype, 'label', function () { return ''; });
+      // Живое устройство свой `lost` не разрешает — так это и выглядит.
+      const lost = new Promise(() => {});
+      defg(GPUDevice.prototype, 'lost', function () { return lost; });
+      defg(GPUDevice.prototype, 'queue', function () { return Object.create(GPUQueue.prototype); });
+      meth(GPUDevice.prototype, 'destroy', function () {});
+      meth(GPUAdapter.prototype, 'requestDevice', function () {
+        return Promise.resolve(Object.create(GPUDevice.prototype));
+      });
+      const adapter = Object.create(GPUAdapter.prototype);
+      meth(GPU_.prototype, 'requestAdapter', function () { return Promise.resolve(adapter); });
+      meth(GPU_.prototype, 'getPreferredCanvasFormat', function () { return 'rgba8unorm'; });
+      const wgsl = mkWgsl(WGSL);
+      defg(GPU_.prototype, 'wgslLanguageFeatures', function () { return wgsl; });
+    }
+  }
+
+  if (globalThis.screen) rebrand(screen.orientation, 'ScreenOrientation', ET);
+})();"##;
 
 const WEB_SURFACE_TEMPLATE: &str = r##"(() => {
   const T = {"window":{"#0":["TEMPORARY","pageXOffset","pageYOffset","scrollX","scrollY"],"#1":["PERSISTENT"],"#10":["screenLeft","screenTop","screenX","screenY"],"o":["GPUBufferUsage","GPUColorWrite","GPUMapMode","GPUShaderStage","GPUTextureUsage","Temporal","caches","clientInformation","cookieStore","crashReport","customElements","documentPictureInPicture","external","launchQueue","locationbar","menubar","navigation","personalbar","scheduler","scrollbars","sharedStorage","speechSynthesis","statusbar","styleMedia","toolbar","trustedTypes","viewport","visualViewport"],"F":["credentialless","crossOriginIsolated"],"x":["fence","frameElement","onabort","onafterprint","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","onappinstalled","onauxclick","onbeforeinput","onbeforeinstallprompt","onbeforematch","onbeforeprint","onbeforetoggle","onbeforeunload","onbeforexrselect","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncuechange","ondblclick","ondevicemotion","ondeviceorientation","ondeviceorientationabsolute","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","ongamepadconnected","ongamepaddisconnected","ongotpointercapture","onhashchange","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onlanguagechange","onload","onloadeddata","onloadedmetadata","onloadstart","onlostpointercapture","onmessage","onmessageerror","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onoffline","ononline","onpagehide","onpagereveal","onpageshow","onpageswap","onpause","onplay","onplaying","onpointercancel","onpointerdown","onpointerenter","onpointerleave","onpointermove","onpointerout","onpointerover","onpointerrawupdate","onpointerup","onpopstate","onprogress","onratechange","onrejectionhandled","onreset","onresize","onscroll","onscrollend","onscrollsnapchange","onscrollsnapchanging","onsearch","onsecuritypolicyviolation","onseeked","onseeking","onselect","onselectionchange","onselectstart","onslotchange","onstalled","onstorage","onsubmit","onsuspend","ontimeupdate","ontoggle","ontransitioncancel","ontransitionend","ontransitionrun","ontransitionstart","onunhandledrejection","onunload","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkittransitionend","onwheel","opener"],"u":["event"],"T":["isSecureContext","offscreenBuffering","originAgentCluster"],"N":["AbsoluteOrientationSensor","AbstractRange","Accelerometer","AnalyserNode","Animation","AnimationEffect","AnimationEvent","AnimationPlaybackEvent","AnimationTimeline","AnimationTrigger","AsyncDisposableStack","Attr","Audio","AudioBuffer","AudioBufferSourceNode","AudioData","AudioDecoder","AudioDestinationNode","AudioEncoder","AudioListener","AudioNode","AudioParam","AudioParamMap","AudioPlaybackStats","AudioProcessingEvent","AudioScheduledSourceNode","AudioSinkInfo","AudioWorklet","AudioWorkletNode","AuthenticatorAssertionResponse","AuthenticatorAttestationResponse","AuthenticatorResponse","BackgroundFetchManager","BackgroundFetchRecord","BackgroundFetchRegistration","BarProp","BaseAudioContext","BatteryManager","BeforeInstallPromptEvent","BeforeUnloadEvent","BiquadFilterNode","BlobEvent","BrowserCaptureMediaStreamTrack","ByteLengthQueuingStrategy","CDATASection","CSPViolationReportBody","CSSAnimation","CSSConditionRule","CSSContainerRule","CSSCounterStyleRule","CSSFontFaceRule","CSSFontFeatureValuesRule","CSSFontPaletteValuesRule","CSSFunctionDeclarations","CSSFunctionDescriptors","CSSFunctionRule","CSSGroupingRule","CSSImageValue","CSSImportRule","CSSKeyframeRule","CSSKeyframesRule","CSSKeywordValue","CSSLayerBlockRule","CSSLayerStatementRule","CSSMarginRule","CSSMathClamp","CSSMathInvert","CSSMathMax","CSSMathMin","CSSMathNegate","CSSMathProduct","CSSMathSum","CSSMathValue","CSSMatrixComponent","CSSMediaRule","CSSNamespaceRule","CSSNestedDeclarations","CSSNumericArray","CSSNumericValue","CSSPageRule","CSSPerspective","CSSPositionTryDescriptors","CSSPositionTryRule","CSSPositionValue","CSSPropertyRule","CSSRotate","CSSRule","CSSRuleList","CSSScale","CSSScopeRule","CSSSkew","CSSSkewX","CSSSkewY","CSSStartingStyleRule","CSSStyleDeclaration","CSSStyleRule","CSSStyleSheet","CSSStyleValue","CSSSupportsRule","CSSTransformComponent","CSSTransformValue","CSSTransition","CSSTranslate","CSSUnitValue","CSSUnparsedValue","CSSVariableReferenceValue","CSSViewTransitionRule","Cache","CacheStorage","CanvasCaptureMediaStreamTrack","CanvasGradient","CanvasPattern","CaptureController","CaretPosition","ChannelMergerNode","ChannelSplitterNode","ChapterInformation","CharacterBoundsUpdateEvent","CharacterData","Clipboard","ClipboardChangeEvent","ClipboardEvent","ClipboardItem","CloseEvent","CloseWatcher","CommandEvent","CompositionEvent","CompressionStream","ConstantSourceNode","ContentVisibilityAutoStateChangeEvent","ConvolverNode","CookieChangeEvent","CookieStore","CookieStoreManager","CountQueuingStrategy","CrashReportContext","CreateMonitor","Credential","CredentialsContainer","CropTarget","CustomElementRegistry","CustomStateSet","DOMError","DOMImplementation","DOMMatrix","DOMMatrixReadOnly","DOMParser","DOMPoint","DOMPointReadOnly","DOMQuad","DOMRect","DOMRectList","DOMRectReadOnly","DOMStringList","DOMStringMap","DOMTokenList","DataTransfer","DataTransferItem","DataTransferItemList","DecompressionStream","DelayNode","DelegatedInkTrailPresenter","DeviceMotionEvent","DeviceMotionEventAcceleration","DeviceMotionEventRotationRate","DeviceOrientationEvent","DevicePosture","DigitalCredential","DisposableStack","DocumentPictureInPicture","DocumentPictureInPictureEvent","DocumentTimeline","DocumentType","DragEvent","DynamicsCompressorNode","EditContext","ElementInternals","EncodedAudioChunk","EncodedVideoChunk","ErrorEvent","EventCounts","EventSource","External","FeaturePolicy","FederatedCredential","Fence","FencedFrameConfig","FetchLaterResult","FileList","FileSystemDirectoryHandle","FileSystemFileHandle","FileSystemHandle","FileSystemObserver","FileSystemWritableFileStream","Float16Array","FontData","FontFace","FontFaceSetLoadEvent","FormDataEvent","FragmentDirective","GPU","GPUAdapter","GPUAdapterInfo","GPUBindGroup","GPUBindGroupLayout","GPUBuffer","GPUCanvasContext","GPUCommandBuffer","GPUCommandEncoder","GPUCompilationInfo","GPUCompilationMessage","GPUComputePassEncoder","GPUComputePipeline","GPUDevice","GPUDeviceLostInfo","GPUError","GPUExternalTexture","GPUInternalError","GPUOutOfMemoryError","GPUPipelineError","GPUPipelineLayout","GPUQuerySet","GPUQueue","GPURenderBundle","GPURenderBundleEncoder","GPURenderPassEncoder","GPURenderPipeline","GPUSampler","GPUShaderModule","GPUSupportedFeatures","GPUSupportedLimits","GPUTexture","GPUTextureView","GPUUncapturedErrorEvent","GPUValidationError","GainNode","Gamepad","GamepadButton","GamepadEvent","GamepadHapticActuator","Geolocation","GeolocationCoordinates","GeolocationPosition","GeolocationPositionError","GravitySensor","Gyroscope","HID","HIDConnectionEvent","HIDDevice","HIDInputReportEvent","HTMLAllCollection","HTMLBaseElement","HTMLCollection","HTMLDListElement","HTMLDataElement","HTMLDirectoryElement","HTMLDocument","HTMLFencedFrameElement","HTMLFontElement","HTMLFormControlsCollection","HTMLFrameElement","HTMLFrameSetElement","HTMLGeolocationElement","HTMLMarqueeElement","HTMLMenuElement","HTMLOptionsCollection","HTMLParamElement","HTMLSelectedContentElement","HTMLTableCaptionElement","HTMLTableColElement","HTMLTrackElement","HashChangeEvent","Highlight","HighlightRegistry","IDBCursor","IDBCursorWithValue","IDBDatabase","IDBFactory","IDBIndex","IDBKeyRange","IDBObjectStore","IDBOpenDBRequest","IDBRecord","IDBRequest","IDBTransaction","IDBVersionChangeEvent","IIRFilterNode","IdentityCredential","IdentityCredentialError","IdentityProvider","IdleDeadline","IdleDetector","ImageBitmap","ImageBitmapRenderingContext","ImageCapture","ImageData","ImageDecoder","ImageTrack","ImageTrackList","Ink","InputDeviceCapabilities","InputDeviceInfo","IntegrityViolationReportBody","InterestEvent","IntersectionObserverEntry","Keyboard","KeyboardLayoutMap","KeyframeEffect","LanguageDetector","LanguageModel","LargestContentfulPaint","LaunchParams","LaunchQueue","LayoutShift","LayoutShiftAttribution","LinearAccelerationSensor","Lock","LockManager","MIDIAccess","MIDIConnectionEvent","MIDIInput","MIDIInputMap","MIDIMessageEvent","MIDIOutput","MIDIOutputMap","MIDIPort","MathMLElement","MediaCapabilities","MediaDeviceInfo","MediaDevices","MediaElementAudioSourceNode","MediaEncryptedEvent","MediaError","MediaKeyMessageEvent","MediaKeySession","MediaKeyStatusMap","MediaKeySystemAccess","MediaKeys","MediaList","MediaMetadata","MediaQueryList","MediaQueryListEvent","MediaRecorder","MediaSession","MediaSource","MediaSourceHandle","MediaStream","MediaStreamAudioDestinationNode","MediaStreamAudioSourceNode","MediaStreamEvent","MediaStreamTrack","MediaStreamTrackAudioStats","MediaStreamTrackEvent","MediaStreamTrackGenerator","MediaStreamTrackProcessor","MediaStreamTrackVideoStats","MutationRecord","NamedNodeMap","NavigateEvent","Navigation","NavigationActivation","NavigationCurrentEntryChangeEvent","NavigationDestination","NavigationHistoryEntry","NavigationPrecommitController","NavigationPreloadManager","NavigationTransition","NavigatorLogin","NavigatorManagedData","NavigatorUAData","NetworkInformation","NodeList","NotRestoredReasonDetails","NotRestoredReasons","Notification","OTPCredential","Observable","OfflineAudioCompletionEvent","OffscreenCanvasRenderingContext2D","Option","OrientationSensor","Origin","OscillatorNode","OverconstrainedError","PageRevealEvent","PageSwapEvent","PageTransitionEvent","PannerNode","PasswordCredential","Path2D","PaymentAddress","PaymentManager","PaymentMethodChangeEvent","PaymentRequest","PaymentRequestUpdateEvent","PaymentResponse","PerformanceElementTiming","PerformanceEntry","PerformanceEventTiming","PerformanceLongAnimationFrameTiming","PerformanceLongTaskTiming","PerformanceMark","PerformanceMeasure","PerformanceNavigationTiming","PerformanceObserverEntryList","PerformancePaintTiming","PerformanceResourceTiming","PerformanceScriptTiming","PerformanceServerTiming","PerformanceTimingConfidence","PeriodicSyncManager","PeriodicWave","PermissionStatus","Permissions","PictureInPictureEvent","PictureInPictureWindow","PopStateEvent","Presentation","PresentationAvailability","PresentationConnection","PresentationConnectionAvailableEvent","PresentationConnectionCloseEvent","PresentationConnectionList","PresentationReceiver","PresentationRequest","PressureObserver","PressureRecord","ProcessingInstruction","Profiler","ProgressEvent","PromiseRejectionEvent","ProtectedAudience","PublicKeyCredential","PushManager","PushSubscription","PushSubscriptionOptions","QuotaExceededError","RTCCertificate","RTCDTMFSender","RTCDTMFToneChangeEvent","RTCDataChannel","RTCDataChannelEvent","RTCDtlsTransport","RTCEncodedAudioFrame","RTCEncodedVideoFrame","RTCError","RTCErrorEvent","RTCIceCandidate","RTCIceTransport","RTCPeerConnectionIceErrorEvent","RTCPeerConnectionIceEvent","RTCRtpReceiver","RTCRtpScriptTransform","RTCRtpSender","RTCRtpTransceiver","RTCSctpTransport","RTCSessionDescription","RTCStatsReport","RTCTrackEvent","RadioNodeList","Range","ReadableByteStreamController","ReadableStreamBYOBReader","ReadableStreamBYOBRequest","ReadableStreamDefaultController","ReadableStreamDefaultReader","RelativeOrientationSensor","RemotePlayback","ReportBody","ReportingObserver","ResizeObserverEntry","ResizeObserverSize","RestrictionTarget","SVGAElement","SVGAngle","SVGAnimateElement","SVGAnimateMotionElement","SVGAnimateTransformElement","SVGAnimatedAngle","SVGAnimatedBoolean","SVGAnimatedEnumeration","SVGAnimatedInteger","SVGAnimatedLength","SVGAnimatedLengthList","SVGAnimatedNumber","SVGAnimatedNumberList","SVGAnimatedPreserveAspectRatio","SVGAnimatedRect","SVGAnimatedString","SVGAnimatedTransformList","SVGAnimationElement","SVGCircleElement","SVGClipPathElement","SVGComponentTransferFunctionElement","SVGDefsElement","SVGDescElement","SVGElement","SVGEllipseElement","SVGFEBlendElement","SVGFEColorMatrixElement","SVGFEComponentTransferElement","SVGFECompositeElement","SVGFEConvolveMatrixElement","SVGFEDiffuseLightingElement","SVGFEDisplacementMapElement","SVGFEDistantLightElement","SVGFEDropShadowElement","SVGFEFloodElement","SVGFEFuncAElement","SVGFEFuncBElement","SVGFEFuncGElement","SVGFEFuncRElement","SVGFEGaussianBlurElement","SVGFEImageElement","SVGFEMergeElement","SVGFEMergeNodeElement","SVGFEMorphologyElement","SVGFEOffsetElement","SVGFEPointLightElement","SVGFESpecularLightingElement","SVGFESpotLightElement","SVGFETileElement","SVGFETurbulenceElement","SVGFilterElement","SVGForeignObjectElement","SVGGElement","SVGGeometryElement","SVGGradientElement","SVGGraphicsElement","SVGImageElement","SVGLength","SVGLengthList","SVGLineElement","SVGLinearGradientElement","SVGMPathElement","SVGMarkerElement","SVGMaskElement","SVGMatrix","SVGMetadataElement","SVGNumber","SVGNumberList","SVGPathElement","SVGPatternElement","SVGPoint","SVGPointList","SVGPolygonElement","SVGPolylineElement","SVGPreserveAspectRatio","SVGRadialGradientElement","SVGRect","SVGRectElement","SVGSVGElement","SVGScriptElement","SVGSetElement","SVGStopElement","SVGStringList","SVGStyleElement","SVGSwitchElement","SVGSymbolElement","SVGTSpanElement","SVGTextContentElement","SVGTextElement","SVGTextPathElement","SVGTextPositioningElement","SVGTitleElement","SVGTransform","SVGTransformList","SVGUnitTypes","SVGUseElement","SVGViewElement","Sanitizer","Scheduler","Scheduling","ScreenDetailed","ScreenDetails","ScreenOrientation","ScriptProcessorNode","ScrollTimeline","SecurityPolicyViolationEvent","Selection","Sensor","SensorErrorEvent","Serial","SerialPort","ServiceWorker","ServiceWorkerContainer","ServiceWorkerRegistration","SharedStorage","SharedStorageAppendMethod","SharedStorageClearMethod","SharedStorageDeleteMethod","SharedStorageModifierMethod","SharedStorageSetMethod","SharedStorageWorklet","SnapEvent","SourceBuffer","SourceBufferList","SpeechGrammar","SpeechGrammarList","SpeechRecognition","SpeechRecognitionErrorEvent","SpeechRecognitionEvent","SpeechRecognitionPhrase","SpeechSynthesis","SpeechSynthesisErrorEvent","SpeechSynthesisEvent","SpeechSynthesisUtterance","SpeechSynthesisVoice","StaticRange","StereoPannerNode","Storage","StorageBucket","StorageBucketManager","StorageEvent","StorageManager","StylePropertyMap","StylePropertyMapReadOnly","StyleSheet","StyleSheetList","SubmitEvent","Subscriber","Summarizer","SuppressedError","SyncManager","TaskAttributionTiming","TaskController","TaskPriorityChangeEvent","TaskSignal","TextDecoderStream","TextEncoderStream","TextEvent","TextFormat","TextFormatUpdateEvent","TextMetrics","TextTrack","TextTrackCue","TextTrackCueList","TextTrackList","TextUpdateEvent","TimeRanges","TimelineTrigger","TimelineTriggerRange","TimelineTriggerRangeList","ToggleEvent","Touch","TouchEvent","TouchList","TrackEvent","TransformStreamDefaultController","TransitionEvent","Translator","TrustedHTML","TrustedScript","TrustedScriptURL","TrustedTypePolicy","TrustedTypePolicyFactory","URLPattern","USB","USBAlternateInterface","USBConfiguration","USBConnectionEvent","USBDevice","USBEndpoint","USBInTransferResult","USBInterface","USBIsochronousInTransferPacket","USBIsochronousInTransferResult","USBIsochronousOutTransferPacket","USBIsochronousOutTransferResult","USBOutTransferResult","UserActivation","VTTCue","ValidityState","VideoColorSpace","VideoDecoder","VideoEncoder","VideoFrame","VideoPlaybackQuality","ViewTimeline","ViewTransition","ViewTransitionTypeSet","Viewport","VirtualKeyboard","VirtualKeyboardGeometryChangeEvent","VisibilityStateEntry","VisualViewport","WGSLLanguageFeatures","WakeLock","WakeLockSentinel","WaveShaperNode","WebGLContextEvent","WebGLObject","WebGLQuery","WebGLSampler","WebGLShaderPrecisionFormat","WebGLSync","WebGLTransformFeedback","WebKitCSSMatrix","WebKitMutationObserver","WebSocketError","WebSocketStream","WebTransport","WebTransportBidirectionalStream","WebTransportDatagramDuplexStream","WebTransportError","WheelEvent","Window","WindowControlsOverlay","WindowControlsOverlayGeometryChangeEvent","Worklet","WritableStreamDefaultController","WritableStreamDefaultWriter","XMLDocument","XMLHttpRequestEventTarget","XMLHttpRequestUpload","XMLSerializer","XPathEvaluator","XPathExpression","XPathResult","XRAnchor","XRAnchorSet","XRBoundedReferenceSpace","XRCPUDepthInformation","XRCamera","XRCompositionLayer","XRCubeLayer","XRCylinderLayer","XRDOMOverlayState","XRDepthInformation","XREquirectLayer","XRFrame","XRHand","XRHitTestResult","XRHitTestSource","XRInputSource","XRInputSourceArray","XRInputSourceEvent","XRInputSourcesChangeEvent","XRJointPose","XRJointSpace","XRLayer","XRLayerEvent","XRLightEstimate","XRLightProbe","XRPlane","XRPlaneSet","XRPose","XRProjectionLayer","XRQuadLayer","XRRay","XRReferenceSpace","XRReferenceSpaceEvent","XRRenderState","XRRigidTransform","XRSession","XRSessionEvent","XRSpace","XRSubImage","XRSystem","XRTransientInputHitTestResult","XRTransientInputHitTestSource","XRView","XRViewerPose","XRViewport","XRVisibilityMaskChangeEvent","XRWebGLBinding","XRWebGLDepthInformation","XRWebGLLayer","XRWebGLSubImage","XSLTProcessor","alert","blur","captureEvents","close","confirm","createImageBitmap","fetchLater","find","focus","getScreenDetails","getSelection","moveBy","moveTo","open","postMessage","print","prompt","queryLocalFonts","releaseEvents","resizeBy","resizeTo","scroll","scrollBy","scrollTo","showDirectoryPicker","showOpenFilePicker","showSaveFilePicker","stop","webkitCancelAnimationFrame","webkitMediaStream","webkitRequestAnimationFrame","webkitRequestFileSystem","webkitResolveLocalFileSystemURL","webkitSpeechGrammar","webkitSpeechGrammarList","webkitSpeechRecognition","webkitSpeechRecognitionError","webkitSpeechRecognitionEvent","webkitURL","when"]},"document":{"#1":["DOCUMENT_POSITION_DISCONNECTED","childElementCount"],"#2":["DOCUMENT_POSITION_PRECEDING"],"#4":["DOCUMENT_POSITION_FOLLOWING"],"#5":["ENTITY_REFERENCE_NODE"],"#6":["ENTITY_NODE"],"#8":["DOCUMENT_POSITION_CONTAINS"],"#12":["NOTATION_NODE"],"#16":["DOCUMENT_POSITION_CONTAINED_BY"],"#32":["DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC"],"o":["applets","children","customElementRegistry","doctype","featurePolicy","firstElementChild","fonts","fragmentDirective","implementation","lastElementChild","scrollingElement","timeline"],"F":["fullscreen","prerendering","wasDiscarded","webkitHidden","webkitIsFullScreen","xmlStandalone"],"x":["activeViewTransition","fullscreenElement","nodeValue","onabort","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","onauxclick","onbeforecopy","onbeforecut","onbeforeinput","onbeforematch","onbeforepaste","onbeforetoggle","onbeforexrselect","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncopy","oncuechange","oncut","ondblclick","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","onfreeze","onfullscreenchange","onfullscreenerror","ongotpointercapture","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onload","onloadeddata","onloadedmetadata","onloadstart","onlostpointercapture","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onpaste","onpause","onplay","onplaying","onpointercancel","onpointerdown","onpointerenter","onpointerleave","onpointerlockchange","onpointerlockerror","onpointermove","onpointerout","onpointerover","onpointerrawupdate","onpointerup","onprerenderingchange","onprogress","onratechange","onreadystatechange","onreset","onresize","onresume","onscroll","onscrollend","onscrollsnapchange","onscrollsnapchanging","onsearch","onsecuritypolicyviolation","onseeked","onseeking","onselect","onselectionchange","onselectstart","onslotchange","onstalled","onsubmit","onsuspend","ontimeupdate","ontoggle","ontransitioncancel","ontransitionend","ontransitionrun","ontransitionstart","onvisibilitychange","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkitfullscreenchange","onwebkitfullscreenerror","onwebkittransitionend","onwheel","parentElement","pictureInPictureElement","pointerLockElement","rootElement","webkitCurrentFullScreenElement","webkitFullscreenElement","xmlEncoding","xmlVersion"],"u":["all"],"T":["fullscreenEnabled","pictureInPictureEnabled","webkitFullscreenEnabled"],"N":["adoptNode","append","ariaNotify","browsingTopics","captureEvents","caretPositionFromPoint","caretRangeFromPoint","clear","compareDocumentPosition","createAttribute","createAttributeNS","createCDATASection","createExpression","createNSResolver","createProcessingInstruction","createRange","evaluate","execCommand","exitFullscreen","exitPictureInPicture","exitPointerLock","getAnimations","getElementsByName","getElementsByTagNameNS","getSelection","hasFocus","hasPrivateToken","hasRedemptionRecord","hasStorageAccess","hasUnpartitionedCookieAccess","importNode","isDefaultNamespace","isEqualNode","isSameNode","lookupNamespaceURI","lookupPrefix","moveBefore","normalize","prepend","queryCommandEnabled","queryCommandIndeterm","queryCommandState","queryCommandSupported","queryCommandValue","releaseEvents","replaceChildren","requestStorageAccess","requestStorageAccessFor","startViewTransition","webkitCancelFullScreen","webkitExitFullscreen","when"]},"navigator":{"o":["clipboard","credentials","devicePosture","geolocation","gpu","hid","ink","keyboard","locks","login","managed","mediaCapabilities","mediaSession","presentation","protectedAudience","scheduling","serial","storageBuckets","usb","virtualKeyboard","wakeLock","webkitPersistentStorage","webkitTemporaryStorage","windowControlsOverlay","xr"],"F":["deprecatedRunAdAuctionEnforcesKAnonymity"],"N":["adAuctionComponents","canLoadAdAuctionFencedFrame","clearOriginJoinedAdInterestGroups","createAuctionNonce","deprecatedReplaceInURN","deprecatedURNToURL","getGamepads","getInstalledRelatedApps","getInterestGroupAdAuctionData","getUserMedia","javaEnabled","joinAdInterestGroup","leaveAdInterestGroup","registerProtocolHandler","requestMIDIAccess","requestMediaKeySystemAccess","runAdAuction","unregisterProtocolHandler","updateAdInterestGroups","webkitGetUserMedia"]},"location":{"o":["ancestorOrigins"],"N":["valueOf"]},"screen":{"x":["onchange"],"N":["addEventListener","dispatchEvent","removeEventListener","when"]}};
