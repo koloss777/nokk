@@ -70,11 +70,13 @@ const HOOK = `(() => {
   let id = 0; const send = (method, params = {}, sessionId) =>
     ws.send(JSON.stringify({ id: ++id, method, params, ...(sessionId ? { sessionId } : {}) }));
   const lines = [];
+  const t0 = Date.now();
   ws.addEventListener('message', (ev) => {
     const m = JSON.parse(ev.data);
     if (m.method === 'Runtime.consoleAPICalled') {
       const t = (m.params.args || []).map((a) => a.value).join(' ');
-      if (/^\[(send|hook|hookerr|blob|worker)\]/.test(String(t))) lines.push(t);
+      if (/^\[(send|hook|hookerr|blob|worker)\]/.test(String(t)))
+        lines.push(String(Date.now() - t0).padStart(6) + 'ms ' + t);
     }
     if (m.method === 'Target.attachedToTarget') {
       const s = m.params.sessionId;
