@@ -452,6 +452,19 @@ async fn main() -> Result<()> {
                   const recent = [];
                   const remember = (s) => { recent.push(s); if (recent.length > 24) recent.shift(); };
                   globalThis.__pt_recent = () => recent.join(' → ');
+                  // Вторая стадия сбора у них ставится таймером и молчит, если
+                  // внутри что-то бросило: браузер такое печатает, мы — нет.
+                  try {
+                    addEventListener('error', (e) => {
+                      try { console.error('[err] ' + (e && e.message) + ' @ ' + (e && e.filename) + ':' + (e && e.lineno)); } catch (x) {}
+                    });
+                    addEventListener('unhandledrejection', (e) => {
+                      try {
+                        const r = e && e.reason;
+                        console.error('[reject] ' + String((r && r.stack) || r).split('\n').join(' | ').slice(0, 300));
+                      } catch (x) {}
+                    });
+                  } catch (e) {}
                   try {
                     const D = EventTarget.prototype.dispatchEvent;
                     const show = (v) => {

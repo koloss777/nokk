@@ -927,6 +927,18 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
   let depth = 0;
 
   const add = (fn, delay, interval, args) => {
+    // Строка вместо функции — законный, пусть и старый, способ поставить
+    // таймер: браузер компилирует её как код глобальной области, когда время
+    // придёт. Мы её молча выбрасывали, и назначенная работа просто не
+    // происходила — ни ошибки, ни следа. Через эти же ворота Trusted Types
+    // передаёт TrustedScript.
+    if (typeof fn === 'string' || (fn !== null && typeof fn === 'object' &&
+        globalThis.trustedTypes && globalThis.trustedTypes.isScript &&
+        (() => { try { return trustedTypes.isScript(fn); } catch (e) { return false; } })())) {
+      const code = String(fn);
+      fn = () => { try { (0, eval)(code); } catch (e) { if (globalThis.__pt_reportError) __pt_reportError(e, 'timer string'); else throw e; } };
+      args = [];
+    }
     if (typeof fn !== 'function') return 0;
     let d = Number(delay);
     if (!(d > 0)) d = 0; // negative, NaN and undefined all mean "as soon as possible"
