@@ -1444,8 +1444,18 @@
   // OffscreenCanvas maps to a detached <canvas>, reusing its 2D/WebGL contexts.
   class OffscreenCanvas {
     constructor(width, height) {
-      const c = globalThis.document ? globalThis.document.createElement('canvas') : null;
-      if (c) { c.width = width | 0; c.height = height | 0; }
+      let c = globalThis.document ? globalThis.document.createElement('canvas') : null;
+      // В воркере документа нет вовсе, а OffscreenCanvas там есть и рисует —
+      // ради него он в воркере и существует. Холст без документа: методы те же,
+      // что у элемента, размеры свои. Без этого `getContext('2d')` в воркере
+      // отдавал null, и сборщик, который снимает там отпечаток холста, молча
+      // оставался ни с чем.
+      if (!c) {
+        const proto = globalThis.__pt_canvasProto;
+        c = { localName: 'canvas', width: width | 0, height: height | 0 };
+        if (proto) { c.getContext = proto.getContext; c.toDataURL = proto.toDataURL; }
+      }
+      c.width = width | 0; c.height = height | 0;
       Object.defineProperty(this, '__ptO', { value: { c, w: width | 0, h: height | 0 } });
     }
     get width() { return this.__ptO.w; }
@@ -1948,6 +1958,14 @@
     return /^[a-z][a-z0-9]*(-[a-z0-9]+)+$/.test(tag) ? __htmlProto : __ifaceProto.get('HTMLUnknownElement');
   };
   globalThis.__pt_setPendingTag = (tag) => { __pendingTag = String(tag || 'div'); };
+  // Ссылка на прототип холста переживает обрезку глобалей воркерной области:
+  // OffscreenCanvas берёт методы отсюда, когда документа нет.
+  try {
+    Object.defineProperty(globalThis, '__pt_canvasProto', {
+      value: globalThis.HTMLCanvasElement && HTMLCanvasElement.prototype,
+      enumerable: false, configurable: true, writable: true,
+    });
+  } catch (e) {}
   // SVG — своя лестница, и она глубже HTML: `<path>` это SVGPathElement →
   // SVGGeometryElement → SVGGraphicsElement → SVGElement → Element. У нас любой
   // `createElementNS('…/svg', 'path')` был HTMLUnknownElement, и виджет, который

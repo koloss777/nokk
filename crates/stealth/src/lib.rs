@@ -3654,7 +3654,20 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
     const rectVerbs = (x, y, w, h) => { const X = +x || 0, Y = +y || 0, W2 = +w || 0, H2 = +h || 0; return [0, X, Y, 1, X + W2, Y, 1, X + W2, Y + H2, 1, X, Y + H2, 4]; };
 
-    return maskProto(Object.assign(Object.create(globalThis.CanvasRenderingContext2D.prototype), {
+    // Холст без документа — offscreen, и контекст у него свой интерфейс:
+    // в воркере `CanvasRenderingContext2D` не существует вовсе, там есть
+    // OffscreenCanvasRenderingContext2D, как и у браузера.
+    const C2D = (canvas && canvas.ownerDocument && globalThis.CanvasRenderingContext2D)
+      || globalThis.OffscreenCanvasRenderingContext2D
+      || globalThis.CanvasRenderingContext2D;
+    // Заглушка интерфейса могла приехать без своего имени — тогда ставим его,
+    // иначе контекст называет себя [object Object].
+    try {
+      if (C2D && !Object.getOwnPropertyDescriptor(C2D.prototype, Symbol.toStringTag)) {
+        Object.defineProperty(C2D.prototype, Symbol.toStringTag, { value: C2D.name, configurable: true });
+      }
+    } catch (e) {}
+    return maskProto(Object.assign(Object.create(C2D ? C2D.prototype : Object.prototype), {
       canvas,
       fillStyle: '#000000', strokeStyle: '#000000', font: '10px sans-serif',
       globalAlpha: 1.0, lineWidth: 1.0, textBaseline: 'alphabetic', textAlign: 'start',

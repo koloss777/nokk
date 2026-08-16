@@ -330,6 +330,7 @@ async fn main() -> Result<()> {
             if std::env::var("NOKK_TRACE_HOOKS").is_ok() {
                 let hook = r#"(() => {
                   try { console.error('[hook] installed'); } catch (e) {}
+                  globalThis.__pt_streamHooks = __STREAM__;
                   // Собранный отпечаток уходит через JSON.stringify до того, как
                   // его сожмут и зашифруют — это единственная точка, где видно,
                   // что именно мы про себя рассказали.
@@ -426,6 +427,7 @@ async fn main() -> Result<()> {
                           try { who = describe(r); } catch (e) {}
                           misses.push(who + '.' + p);
                           if (misses.length > 60) misses.shift();
+                          if (globalThis.__pt_streamHooks) { try { console.error('[m] ' + who + '.' + p); } catch (e) {} }
                         }
                         return Reflect.get(t, p, r);
                       },
@@ -450,7 +452,12 @@ async fn main() -> Result<()> {
                     misses.length = 0;
                   } catch (e) { console.error('[vm] miss-sink failed: ' + e); }
                   const recent = [];
-                  const remember = (s) => { recent.push(s); if (recent.length > 24) recent.shift(); };
+                  const stream = !!globalThis.__pt_streamHooks;
+                  const remember = (s) => {
+                    recent.push(s);
+                    if (recent.length > 24) recent.shift();
+                    if (stream) { try { console.error('[t] ' + String(s).slice(0, 150)); } catch (e) {} }
+                  };
                   globalThis.__pt_recent = () => recent.join(' → ');
                   // Вторая стадия сбора у них ставится таймером и молчит, если
                   // внутри что-то бросило: браузер такое печатает, мы — нет.
@@ -580,8 +587,12 @@ async fn main() -> Result<()> {
                     } catch (e) {}
                   }
                 })();"#;
-                c.add_frame_init_script(hook.to_string());
-                c.add_init_script(hook.to_string());
+                // Потоковый лог событий: включается NOKK_TRACE_STREAM=1, иначе
+                // кольцо печатается только при броске.
+                let stream = std::env::var("NOKK_TRACE_STREAM").is_ok();
+                let hook = hook.replace("__STREAM__", if stream { "true" } else { "false" });
+                c.add_frame_init_script(hook.clone());
+                c.add_init_script(hook);
             }
             c.navigate(url).await?;
             let title = c.evaluate("document.title").await.unwrap_or_default();

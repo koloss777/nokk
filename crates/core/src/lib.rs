@@ -6140,6 +6140,51 @@ mod tests {
         assert_eq!(out["highEntropy"], "x86");
     }
 
+    /// A collector that wants a canvas fingerprint from a worker has exactly one
+    /// way to get it: `new OffscreenCanvas(…).getContext('2d')`. Ours was built
+    /// on `document.createElement('canvas')`, and a worker has no document — so
+    /// the context came back null and the worker fell silent. In a worker the
+    /// context is an OffscreenCanvasRenderingContext2D; `CanvasRenderingContext2D`
+    /// does not exist there at all, which is what the old code reached for.
+    #[tokio::test]
+    async fn a_worker_can_draw_on_an_offscreen_canvas() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><body><script>
+                globalThis.__log = { done: false };
+                const src = `
+                  const c = new OffscreenCanvas(24, 12);
+                  const g = c.getContext('2d');
+                  let drawn = 'no context';
+                  if (g) {
+                    g.fillStyle = '#204080';
+                    g.fillRect(2, 2, 8, 6);
+                    g.fillText('nokk', 2, 10);
+                    drawn = Object.prototype.toString.call(g) + '|' + g.getImageData(0, 0, 24, 12).data.length;
+                  }
+                  postMessage(drawn + '|' + c.width + 'x' + c.height);
+                `;
+                const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+                w.onmessage = (e) => { globalThis.__log = { done: true, said: e.data }; };
+              </script></body></html>"#,
+        )
+        .await
+        .unwrap();
+
+        let out = pump_until(&ctx, "__ptJSON.stringify(__log)", 40).await;
+        let said = out.as_str().unwrap_or("");
+        assert!(said.contains("\"done\":true"), "the worker answered: {said}");
+        assert!(
+            said.contains("[object OffscreenCanvasRenderingContext2D]"),
+            "and its context is the interface a worker has: {said}"
+        );
+        assert!(said.contains("|1152|"), "with pixels behind it: {said}");
+        assert!(said.contains("24x12"), "and the size it was given: {said}");
+    }
+
     /// `about:blank` is not an address a browser fetches: it is the same initial
     /// empty document a src-less frame gets, and its realm is ready the moment
     /// the frame is in the document. We treated it as a URL, so
