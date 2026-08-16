@@ -6140,6 +6140,64 @@ mod tests {
         assert_eq!(out["highEntropy"], "x86");
     }
 
+    /// `document.styleSheets` was a list of literals with an empty `cssRules`.
+    /// Cloudflare's collector reads it hundreds of times at the start of its
+    /// second stage — rules, selectors, `cssText` — and an empty list is not a
+    /// page that has any style. Serialisation follows Chrome: a bare `0` in a
+    /// length property becomes `0px`, selector combinators get their spaces, and
+    /// an @media condition gets one after the colon.
+    #[tokio::test]
+    async fn a_style_element_is_a_stylesheet_with_rules() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<html><head><style media=\"screen\">a{color:red;font-weight:bold}.b .c>d{margin:0 1px}             @media (min-width:1px){e{top:0}}</style></head><body></body></html>",
+        )
+        .await
+        .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const tag = (v) => Object.prototype.toString.call(v);
+            const ss = document.styleSheets, s0 = ss[0], r0 = s0.cssRules[0];
+            return __ptJSON.stringify({
+              list: tag(ss), len: ss.length, own: Object.getOwnPropertyNames(ss),
+              sheet: tag(s0), media: s0.media.mediaText, owner: s0.ownerNode.localName,
+              same: s0.cssRules === s0.rules, rulesTag: tag(s0.cssRules),
+              rule: tag(r0), type: r0.type, selector: r0.selectorText,
+              styleTag: tag(r0.style), styleLen: r0.style.length, color: r0.style.color,
+              texts: [...s0.cssRules].map((r) => r.cssText),
+              stable: document.styleSheets[0] === document.styleSheets[0],
+            });
+        })()"#).await;
+
+        assert_eq!(out["list"], "[object StyleSheetList]");
+        assert_eq!(out["len"], 1);
+        assert_eq!(out["own"], serde_json::json!(["0"]), "own properties are the indices, nothing else");
+        assert_eq!(out["sheet"], "[object CSSStyleSheet]");
+        assert_eq!(out["media"], "screen");
+        assert_eq!(out["owner"], "style");
+        assert_eq!(out["same"], true, "cssRules and rules are the same list");
+        assert_eq!(out["rulesTag"], "[object CSSRuleList]");
+        assert_eq!(out["rule"], "[object CSSStyleRule]");
+        assert_eq!(out["type"], 1);
+        assert_eq!(out["selector"], "a");
+        assert_eq!(out["styleTag"], "[object CSSStyleDeclaration]");
+        assert_eq!(out["styleLen"], 2);
+        assert_eq!(out["color"], "red");
+        assert_eq!(
+            out["texts"],
+            serde_json::json!([
+                "a { color: red; font-weight: bold; }",
+                ".b .c > d { margin: 0px 1px; }",
+                "@media (min-width: 1px) { e { top: 0px; } }"
+            ]),
+            "serialised the way Chrome serialises them"
+        );
+        assert_eq!(out["stable"], true, "and the sheet is the same object each time");
+    }
+
     /// A collector that wants a canvas fingerprint from a worker has exactly one
     /// way to get it: `new OffscreenCanvas(…).getContext('2d')`. Ours was built
     /// on `document.createElement('canvas')`, and a worker has no document — so

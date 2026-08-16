@@ -53,7 +53,7 @@
     __link('HTMLCollection', __collectionProto);
     const list = Object.create(__collectionProto);
     for (let i = 0; i < arr.length; i++) list[i] = arr[i];
-    Object.defineProperty(list, 'length', { value: arr.length, enumerable: false, configurable: true });
+    Object.defineProperty(list, '__ptLen', { value: arr.length, enumerable: false, configurable: true });
     return list;
   }
   // `querySelectorAll` отдаёт NodeList — не живой, как у childNodes, а слепок;
@@ -62,7 +62,7 @@
     __link('NodeList', __nodeListProto);
     const list = Object.create(__nodeListProto);
     for (let i = 0; i < arr.length; i++) list[i] = arr[i];
-    Object.defineProperty(list, 'length', { value: arr.length, enumerable: false, configurable: true });
+    Object.defineProperty(list, '__ptLen', { value: arr.length, enumerable: false, configurable: true });
     return list;
   }
   // childNodes отдаёт NodeList, а не массив: `Array.isArray(node.childNodes)`
@@ -77,10 +77,10 @@
       list = Object.create(__nodeListProto);
       Object.defineProperty(node, '__ptList', { value: list, enumerable: false, writable: true });
     }
-    const kids = node.__ptKids, prev = list.length | 0;
+    const kids = node.__ptKids, prev = list.__ptLen | 0;
     for (let i = 0; i < kids.length; i++) list[i] = kids[i];
     for (let i = kids.length; i < prev; i++) delete list[i];
-    Object.defineProperty(list, 'length', { value: kids.length, enumerable: false, configurable: true });
+    Object.defineProperty(list, '__ptLen', { value: kids.length, enumerable: false, configurable: true });
     return list;
   }
   // Прототип связывается со своим интерфейсом при первом обращении: интерфейсы
@@ -102,6 +102,9 @@
   };
   const __nodeListProto = {
     get [Symbol.toStringTag]() { return 'NodeList'; },
+    // `length` у браузера на прототипе: собственные свойства списка — индексы
+    // и только они, и это видно первым же getOwnPropertyNames.
+    get length() { return this.__ptLen | 0; },
     item(i) { return this[i] != null ? this[i] : null; },
     forEach(fn, thisArg) { for (let i = 0; i < this.length; i++) fn.call(thisArg, this[i], i, this); },
     *entries() { for (let i = 0; i < this.length; i++) yield [i, this[i]]; },
@@ -112,6 +115,7 @@
 
   const __collectionProto = {
     get [Symbol.toStringTag]() { return 'HTMLCollection'; },
+    get length() { return this.__ptLen | 0; },
     item(i) { return this[i] != null ? this[i] : null; },
     namedItem(n) {
       for (let i = 0; i < this.length; i++) {
@@ -149,6 +153,7 @@
   }
   const __namedNodeMapProto = {
     get [Symbol.toStringTag]() { return 'NamedNodeMap'; },
+    get length() { return this.__ptLen | 0; },
     item(i) { return this[i] != null ? this[i] : null; },
     getNamedItem(n) { const k = String(n).toLowerCase();
       for (let i = 0; i < this.length; i++) if (this[i].name === k) return this[i];
@@ -168,7 +173,7 @@
     const map = Object.create(__namedNodeMapProto);
     let i = 0;
     for (const [name, value] of el.__ptAttrs) map[i++] = __attr(el, name, value);
-    Object.defineProperty(map, 'length', { value: i, enumerable: false, configurable: true });
+    Object.defineProperty(map, '__ptLen', { value: i, enumerable: false, configurable: true });
     Object.defineProperty(map, '__ptOwner', { value: el });
     return map;
   }
@@ -1083,11 +1088,8 @@
     }
     get anchors() { return __collection(__docTags(this, 'a').filter(e => e.hasAttribute('name'))); }
     get styleSheets() {
-      return __collection(__docTags(this, 'style')
-        .concat(__docTags(this, 'link').filter(e => /stylesheet/i.test(e.getAttribute('rel') || '')))
-        .map(owner => ({ ownerNode: owner, href: owner.getAttribute('href') || null,
-                         type: 'text/css', disabled: false, media: owner.getAttribute('media') || '',
-                         title: owner.getAttribute('title') || null, cssRules: [], rules: [] })));
+      return __styleSheetList(__docTags(this, 'style')
+        .concat(__docTags(this, 'link').filter((e) => /stylesheet/i.test(e.getAttribute('rel') || ''))));
     }
     // Кодировка — объявленная, а не всегда UTF-8: страница без объявления
     // разбирается как windows-1252, и Chrome именно это и сообщает. Отвечать
@@ -1487,6 +1489,306 @@
       toString: () => get().join(' '),
     };
   }
+  // ---- CSSOM ---------------------------------------------------------------
+  // Настоящие таблицы стилей: `document.styleSheets` был списком литералов с
+  // пустым `cssRules`, а сборщик Cloudflare читает его сотнями обращений в
+  // начале второй стадии — правила, селекторы, cssText. Формы интерфейсов и
+  // сериализация сняты с Chrome 148.
+  //
+  // Значения приводятся так же, как приводит браузер там, где это видно
+  // невооружённым глазом: `0` в свойстве длины становится `0px`, комбинаторы
+  // селектора разделяются пробелами, после двоеточия в условии @media — пробел.
+  const CSS_LENGTH_PROPS = new Set([
+    'width', 'height', 'min-width', 'min-height', 'max-width', 'max-height',
+    'top', 'right', 'bottom', 'left', 'margin', 'margin-top', 'margin-right',
+    'margin-bottom', 'margin-left', 'padding', 'padding-top', 'padding-right',
+    'padding-bottom', 'padding-left', 'border-width', 'border-top-width',
+    'border-right-width', 'border-bottom-width', 'border-left-width',
+    'border-radius', 'font-size', 'letter-spacing', 'word-spacing', 'text-indent',
+    'outline-width', 'column-gap', 'row-gap', 'gap', 'inset',
+  ]);
+  const __cssValue = (prop, value) => {
+    const v = String(value).trim().replace(/\s+/g, ' ');
+    if (!CSS_LENGTH_PROPS.has(prop)) return v;
+    return v.replace(/(^|[\s(])(-?\d+(?:\.\d+)?)(?=$|[\s)])/g, (m, pre, num) => pre + num + 'px');
+  };
+  const __cssSelector = (sel) => String(sel).trim()
+    .replace(/\s+/g, ' ')
+    .replace(/\s*([>+~])\s*/g, ' $1 ')
+    .replace(/\s*,\s*/g, ', ');
+  const __cssPrelude = (p) => String(p).trim().replace(/\s+/g, ' ').replace(/:\s*/g, ': ');
+
+  // Разбор: пролог до `{` или `;`, затем тело со счётом вложенности. Строки и
+  // комментарии не считаются — иначе `content: "}"` рвёт правило пополам.
+  function __cssParse(text) {
+    const out = [];
+    const n = text.length;
+    let i = 0;
+    while (i < n) {
+      while (i < n && /\s/.test(text[i])) i++;
+      if (i >= n) break;
+      if (text.startsWith('/*', i)) { const e = text.indexOf('*/', i + 2); i = e < 0 ? n : e + 2; continue; }
+      const start = i;
+      let depth = 0, q = null;
+      while (i < n) {
+        const c = text[i];
+        if (q) { if (c === q && text[i - 1] !== '\\') q = null; i++; continue; }
+        if (c === '"' || c === "'") { q = c; i++; continue; }
+        if (c === '(') depth++;
+        else if (c === ')') depth--;
+        else if (depth === 0 && (c === '{' || c === ';')) break;
+        i++;
+      }
+      const prelude = text.slice(start, i).trim();
+      if (i >= n) { if (prelude) out.push({ prelude, statement: true }); break; }
+      if (text[i] === ';') { i++; if (prelude) out.push({ prelude, statement: true }); continue; }
+      i++;                                    // за '{'
+      const bodyStart = i;
+      let d = 1;
+      q = null;
+      while (i < n && d > 0) {
+        const c = text[i];
+        if (q) { if (c === q && text[i - 1] !== '\\') q = null; i++; continue; }
+        if (c === '"' || c === "'") { q = c; i++; continue; }
+        if (c === '{') d++;
+        else if (c === '}') d--;
+        i++;
+      }
+      out.push({ prelude, body: text.slice(bodyStart, d === 0 ? i - 1 : i) });
+    }
+    return out;
+  }
+
+  function __cssDecls(body) {
+    const map = new Map();
+    let i = 0;
+    const n = body.length;
+    while (i < n) {
+      const start = i;
+      let depth = 0, q = null;
+      while (i < n) {
+        const c = body[i];
+        if (q) { if (c === q && body[i - 1] !== '\\') q = null; i++; continue; }
+        if (c === '"' || c === "'") { q = c; i++; continue; }
+        if (c === '(') depth++;
+        else if (c === ')') depth--;
+        else if (c === ';' && depth === 0) break;
+        i++;
+      }
+      const decl = body.slice(start, i).trim();
+      i++;
+      if (!decl) continue;
+      const colon = decl.indexOf(':');
+      if (colon <= 0) continue;
+      const prop = decl.slice(0, colon).trim().toLowerCase();
+      if (prop) map.set(prop, __cssValue(prop, decl.slice(colon + 1)));
+    }
+    return map;
+  }
+
+  // Блок объявлений правила: тот же интерфейс, что у `el.style`, но за ним
+  // стоит карта правила, а не атрибут элемента.
+  function __cssDeclaration(map) {
+    const dash = (p) => String(p).replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
+    const target = Object.assign(Object.create(__styleProto()), {
+      getPropertyValue: (p) => map.get(String(p).toLowerCase()) || '',
+      getPropertyPriority: () => '',
+      setProperty: (p, v) => { map.set(dash(String(p)).toLowerCase(), __cssValue(dash(String(p)).toLowerCase(), v)); },
+      removeProperty: (p) => { const k = dash(String(p)).toLowerCase(); const had = map.get(k) || ''; map.delete(k); return had; },
+      item: (i) => [...map.keys()][i] || '',
+      get length() { return map.size; },
+      get cssText() { return [...map].map(([k, v]) => k + ': ' + v + ';').join(' '); },
+      get parentRule() { return null; },
+      [Symbol.iterator]: function* () { for (const k of map.keys()) yield k; },
+    });
+    return new Proxy(target, {
+      get: (t, p) => {
+        if (typeof p === 'string' && !(p in t)) return map.get(dash(p).toLowerCase()) || '';
+        const v = t[p];
+        return typeof v === 'function' ? v.bind(t) : v;
+      },
+      set: (t, p, v) => {
+        if (typeof p === 'string' && !(p in t)) { const k = dash(p).toLowerCase(); map.set(k, __cssValue(k, v)); return true; }
+        t[p] = v; return true;
+      },
+    });
+  }
+
+  const __ruleListProto = {
+    get [Symbol.toStringTag]() { return 'CSSRuleList'; },
+    get length() { return this.__ptLen | 0; },
+    item(i) { return this[i] != null ? this[i] : null; },
+    [Symbol.iterator]() { let i = 0; const self = this;
+      return { next: () => i < self.length ? { value: self[i++], done: false } : { value: undefined, done: true } }; },
+  };
+  function __cssRuleList(arr) {
+    __link('CSSRuleList', __ruleListProto);
+    const list = Object.create(__ruleListProto);
+    for (let i = 0; i < arr.length; i++) list[i] = arr[i];
+    Object.defineProperty(list, '__ptLen', { value: arr.length, enumerable: false, configurable: true });
+    return list;
+  }
+
+  const __mediaListProto = {
+    get [Symbol.toStringTag]() { return 'MediaList'; },
+    get mediaText() { return this.__ptMedia.join(', '); },
+    set mediaText(v) { this.__ptMedia = String(v).split(',').map((s) => s.trim()).filter(Boolean); },
+    get length() { return this.__ptMedia.length; },
+    item(i) { return this.__ptMedia[i] != null ? this.__ptMedia[i] : null; },
+    appendMedium(m) { if (!this.__ptMedia.includes(String(m))) this.__ptMedia.push(String(m)); },
+    deleteMedium(m) { this.__ptMedia = this.__ptMedia.filter((x) => x !== String(m)); },
+    toString() { return this.mediaText; },
+  };
+  function __mediaList(text) {
+    __link('MediaList', __mediaListProto);
+    const m = Object.create(__mediaListProto);
+    Object.defineProperty(m, '__ptMedia', {
+      value: String(text || '').split(',').map((s) => s.trim()).filter(Boolean),
+      writable: true, enumerable: false,
+    });
+    return m;
+  }
+
+  // Правила. Числа типов — те же, что у CSSRule в браузере.
+  const RULE_TYPE = { style: 1, charset: 2, import: 3, media: 4, 'font-face': 5,
+                      page: 6, keyframes: 7, keyframe: 8, supports: 12 };
+  const __ruleProtos = new Map();
+  const __ruleProto = (name) => {
+    let p = __ruleProtos.get(name);
+    if (p) return p;
+    const base = globalThis[name] && globalThis[name].prototype;
+    p = base || Object.prototype;
+    try {
+      if (base && !Object.getOwnPropertyDescriptor(base, Symbol.toStringTag)) {
+        Object.defineProperty(base, Symbol.toStringTag, { value: name, configurable: true });
+      }
+    } catch (e) {}
+    __ruleProtos.set(name, p);
+    return p;
+  };
+  function __makeRule(parsed, sheet, parent) {
+    const prelude = parsed.prelude || '';
+    const at = prelude.charCodeAt(0) === 64 ? prelude.split(/[\s({]/)[0].toLowerCase() : '';
+    const own = (r, props) => { for (const k of Object.keys(props)) Object.defineProperty(r, k, { value: props[k], enumerable: true, configurable: true }); return r; };
+    const common = (r, type) => own(r, {
+      type, parentStyleSheet: sheet, parentRule: parent || null,
+    });
+
+    if (at === '@import') {
+      const href = (/url\(\s*["']?([^"')]*)["']?\s*\)|["']([^"']*)["']/.exec(prelude) || [])
+        .slice(1).find((x) => x !== undefined) || '';
+      const r = common(Object.create(__ruleProto('CSSImportRule')), RULE_TYPE.import);
+      return own(r, { href, layerName: null, supportsText: null, styleSheet: null,
+                      media: __mediaList(''), cssText: '@import url("' + href + '");' });
+    }
+    if (at === '@media' || at === '@supports') {
+      const name = at === '@media' ? 'CSSMediaRule' : 'CSSSupportsRule';
+      const r = common(Object.create(__ruleProto(name)), at === '@media' ? RULE_TYPE.media : RULE_TYPE.supports);
+      const cond = __cssPrelude(prelude.slice(at.length).trim());
+      const kids = __cssParse(parsed.body || '').map((p) => __makeRule(p, sheet, r));
+      own(r, { cssRules: __cssRuleList(kids), conditionText: cond });
+      if (at === '@media') own(r, { media: __mediaList(cond) });
+      return own(r, { cssText: at + ' ' + cond + ' { ' + kids.map((k) => k.cssText).join(' ') + ' }' });
+    }
+    if (at === '@keyframes' || at === '@-webkit-keyframes') {
+      const r = common(Object.create(__ruleProto('CSSKeyframesRule')), RULE_TYPE.keyframes);
+      const kids = __cssParse(parsed.body || '').map((p) => {
+        const k = common(Object.create(__ruleProto('CSSKeyframeRule')), RULE_TYPE.keyframe);
+        const decls = __cssDecls(p.body || '');
+        return own(k, { keyText: __cssPrelude(p.prelude), style: __cssDeclaration(decls),
+                        cssText: __cssPrelude(p.prelude) + ' { ' + [...decls].map(([a2, b2]) => a2 + ': ' + b2 + ';').join(' ') + ' }' });
+      });
+      const name = prelude.slice(at.length).trim();
+      return own(r, { name, length: kids.length, cssRules: __cssRuleList(kids),
+                      appendRule() {}, deleteRule() {}, findRule() { return null; },
+                      cssText: '@keyframes ' + name + ' { ' + kids.map((k) => k.cssText).join(' ') + ' }' });
+    }
+    if (at === '@font-face') {
+      const r = common(Object.create(__ruleProto('CSSFontFaceRule')), RULE_TYPE['font-face']);
+      const decls = __cssDecls(parsed.body || '');
+      return own(r, { style: __cssDeclaration(decls),
+                      cssText: '@font-face { ' + [...decls].map(([a2, b2]) => a2 + ': ' + b2 + ';').join(' ') + ' }' });
+    }
+    if (at) {
+      const r = common(Object.create(__ruleProto('CSSRule')), RULE_TYPE.charset);
+      return own(r, { cssText: prelude + (parsed.statement ? ';' : ' { }') });
+    }
+    const r = common(Object.create(__ruleProto('CSSStyleRule')), RULE_TYPE.style);
+    const decls = __cssDecls(parsed.body || '');
+    const sel = __cssSelector(prelude);
+    const body = [...decls].map(([k, v]) => k + ': ' + v + ';').join(' ');
+    return own(r, { selectorText: sel, style: __cssDeclaration(decls),
+                    cssRules: __cssRuleList([]), insertRule() { return 0; }, deleteRule() {},
+                    cssText: sel + ' { ' + (body ? body + ' ' : '') + '}' });
+  }
+
+  const __sheetProto = {
+    get [Symbol.toStringTag]() { return 'CSSStyleSheet'; },
+    get rules() { return this.cssRules; },
+    insertRule(text, index) {
+      const parsed = __cssParse(String(text))[0];
+      if (!parsed) return 0;
+      const arr = [...this.cssRules];
+      const at = index === undefined ? 0 : Math.min(index | 0, arr.length);
+      arr.splice(at, 0, __makeRule(parsed, this, null));
+      Object.defineProperty(this, 'cssRules', { value: __cssRuleList(arr), enumerable: true, configurable: true });
+      return at;
+    },
+    deleteRule(index) {
+      const arr = [...this.cssRules];
+      arr.splice(index | 0, 1);
+      Object.defineProperty(this, 'cssRules', { value: __cssRuleList(arr), enumerable: true, configurable: true });
+    },
+    addRule(sel, decl, index) { return this.insertRule(sel + ' { ' + (decl || '') + ' }', index), -1; },
+    removeRule(index) { this.deleteRule(index); },
+    replaceSync(text) {
+      const rules = __cssParse(String(text)).map((p) => __makeRule(p, this, null));
+      Object.defineProperty(this, 'cssRules', { value: __cssRuleList(rules), enumerable: true, configurable: true });
+    },
+    replace(text) { this.replaceSync(text); return Promise.resolve(this); },
+  };
+  // Таблица живёт на своём элементе: страницы сравнивают
+  // `document.styleSheets[0] === document.styleSheets[0]`, и правила
+  // пересобираются только когда сменился текст.
+  function __sheetFor(owner) {
+    __link('CSSStyleSheet', __sheetProto);
+    const text = owner.__ptLocal === 'style' ? String(owner.textContent || '') : '';
+    let sheet = owner.__ptSheet;
+    if (!sheet) {
+      sheet = Object.create(__sheetProto);
+      Object.defineProperty(owner, '__ptSheet', { value: sheet, writable: true, enumerable: false });
+      const href = owner.__ptLocal === 'link' ? (owner.href || null) : null;
+      Object.defineProperty(sheet, 'ownerNode', { value: owner, enumerable: true, configurable: true });
+      Object.defineProperty(sheet, 'href', { value: href, enumerable: true, configurable: true });
+      Object.defineProperty(sheet, 'type', { value: 'text/css', enumerable: true, configurable: true });
+      Object.defineProperty(sheet, 'disabled', { value: false, writable: true, enumerable: true, configurable: true });
+      Object.defineProperty(sheet, 'title', { value: owner.getAttribute('title'), enumerable: true, configurable: true });
+      Object.defineProperty(sheet, 'media', { value: __mediaList(owner.getAttribute('media') || ''), enumerable: true, configurable: true });
+      Object.defineProperty(sheet, 'parentStyleSheet', { value: null, enumerable: true, configurable: true });
+      Object.defineProperty(sheet, 'ownerRule', { value: null, enumerable: true, configurable: true });
+    }
+    if (sheet.__ptText !== text) {
+      Object.defineProperty(sheet, '__ptText', { value: text, writable: true, enumerable: false, configurable: true });
+      const rules = __cssParse(text).map((p) => __makeRule(p, sheet, null));
+      Object.defineProperty(sheet, 'cssRules', { value: __cssRuleList(rules), enumerable: true, configurable: true });
+    }
+    return sheet;
+  }
+  const __sheetListProto = {
+    get [Symbol.toStringTag]() { return 'StyleSheetList'; },
+    get length() { return this.__ptLen | 0; },
+    item(i) { return this[i] != null ? this[i] : null; },
+    [Symbol.iterator]() { let i = 0; const self = this;
+      return { next: () => i < self.length ? { value: self[i++], done: false } : { value: undefined, done: true } }; },
+  };
+  function __styleSheetList(owners) {
+    __link('StyleSheetList', __sheetListProto);
+    const list = Object.create(__sheetListProto);
+    for (let i = 0; i < owners.length; i++) list[i] = __sheetFor(owners[i]);
+    Object.defineProperty(list, '__ptLen', { value: owners.length, enumerable: false, configurable: true });
+    return list;
+  }
+
   function makeDataset(el) {
     const target = {};
     for (const k of el.getAttributeNames()) if (k.startsWith('data-'))
