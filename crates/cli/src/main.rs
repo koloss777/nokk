@@ -417,16 +417,7 @@ async fn main() -> Result<()> {
                 if let Ok(serde_json::Value::String(t)) = ctx
                     .evaluate_in_frame(
                         f.id,
-                        "(() => { const seen = []; const walk = (root) => {                            for (const el of root.querySelectorAll('*')) {                              const tag = el.localName;                              if (tag === 'input' || tag === 'button' || el.getAttribute('role'))                                seen.push(tag + (el.type ? '[' + el.type + ']' : '') +                                          (el.getAttribute('role') ? '{' + el.getAttribute('role') + '}' : ''));                              if (el.shadowRoot) walk(el.shadowRoot); } };                          try { walk(document); } catch (e) {}                          return JSON.stringify({controls: seen.slice(0, 12), \
-                           body: !!document.body, \
-                           bodyKids: document.body ? document.body.childNodes.length : -1, \
-                           iframes: document.getElementsByTagName('iframe').length, \
-                           shadows: Array.prototype.filter.call(document.querySelectorAll('*'), (e) => e.shadowRoot).length, \
-                           htmlLen: (document.documentElement ? document.documentElement.outerHTML : '').length, \
-                           view: [innerWidth, innerHeight, document.documentElement.clientWidth, document.documentElement.clientHeight], \
-                           vis: [document.visibilityState, document.hidden, document.readyState], \
-                           box: (() => { const b = document.body.getBoundingClientRect(); return [b.width, b.height]; })(), \
-                           text: (document.body ? document.body.textContent : '').trim().slice(0, 60)}); })()",
+                        "(() => { const seen = []; const walk = (root) => {                            for (const el of root.querySelectorAll('*')) {                              const tag = el.localName;                              if (tag === 'input' || tag === 'button' || el.getAttribute('role'))                                seen.push(tag + (el.type ? '[' + el.type + ']' : '') +                                          (el.getAttribute('role') ? '{' + el.getAttribute('role') + '}' : ''));                              const sr = el.shadowRoot || el.__ptShadow; if (sr) walk(sr); } };                          const root = document.body && (document.body.shadowRoot || document.body.__ptShadow);                          try { walk(document); if (root) walk(root); } catch (e) {}                          return JSON.stringify({controls: seen.slice(0, 12),                            bodyShadow: !!root,                            shadowKids: root ? root.childNodes.length : -1,                            shadowText: root ? String(root.textContent || '').trim().slice(0, 60) : '',                            bodyKids: document.body ? document.body.childNodes.length : -1,                            view: [innerWidth, innerHeight],                            html: (document.documentElement ? document.documentElement.outerHTML : '').length}); })()",
                     )
                     .await
                 {
