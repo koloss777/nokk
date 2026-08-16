@@ -1889,6 +1889,22 @@ const WEB_BODIES_TEMPLATE: &str = r##"(() => {
   }
 
   if (globalThis.screen) rebrand(screen.orientation, 'ScreenOrientation', ET);
+
+  // Второй проход по форме интерфейсов: Storage, SpeechSynthesis и звук
+  // объявляются позже DOM-слоя, и в первый раз их ещё нет.
+  try { if (globalThis.__pt_fillShapes) __pt_fillShapes(); } catch (e) {}
+
+  // `speechSynthesis` голосов не отдаёт (их и в headless-Chrome нет), но
+  // интерфейсом быть обязан: сборщик идёт по прототипу.
+  const SS = rebrand(globalThis.speechSynthesis, 'SpeechSynthesis', ET);
+  if (SS) {
+    defg(SS.prototype, 'paused', function () { return false; });
+    defg(SS.prototype, 'pending', function () { return false; });
+    defg(SS.prototype, 'speaking', function () { return false; });
+    try { Object.defineProperty(SS.prototype, 'onvoiceschanged', { value: null, writable: true, enumerable: true, configurable: true }); } catch (e) {}
+    meth(SS.prototype, 'getVoices', function () { return []; });
+    for (const m of ['speak', 'cancel', 'pause', 'resume']) meth(SS.prototype, m, function () {});
+  }
 })();"##;
 
 const WEB_SURFACE_TEMPLATE: &str = r##"(() => {
@@ -4365,16 +4381,34 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // --- extra Web APIs so real sites' scripts run (and their trackers fire) --
   // A bare V8 has none of these; their absence makes analytics/framework code
   // throw before it does anything (incl. its network beacons).
+  // `localStorage` — интерфейс Storage, а не литерал: страница читает
+  // `Object.prototype.toString.call(localStorage)` наравне со всем остальным.
+  const StorageData = new WeakMap();
+  const Storage = function Storage() { throw new TypeError('Illegal constructor'); };
+  {
+    const P = Storage.prototype, data = (o) => StorageData.get(o) || new Map();
+    const put = (name, f) => {
+      try { Object.defineProperty(f, 'name', { value: name, configurable: true }); } catch (e) {}
+      Object.defineProperty(P, name, { value: mask(f, name), writable: true, enumerable: true, configurable: true });
+    };
+    put('getItem', function (k) { const m = data(this); return m.has(String(k)) ? m.get(String(k)) : null; });
+    put('setItem', function (k, v) { data(this).set(String(k), String(v)); });
+    put('removeItem', function (k) { data(this).delete(String(k)); });
+    put('clear', function () { data(this).clear(); });
+    put('key', function (i) { const ks = [...data(this).keys()]; return i < ks.length ? ks[i] : null; });
+    Object.defineProperty(P, 'length', {
+      get: mask(function length() { return data(this).size; }, 'get length'),
+      enumerable: true, configurable: true,
+    });
+    Object.defineProperty(P, Symbol.toStringTag, { value: 'Storage', configurable: true });
+    globalThis.Storage = mask(Storage, 'Storage');
+  }
   const makeStorage = () => {
     const m = new Map();
-    const api = {
-      getItem: (k) => (m.has(String(k)) ? m.get(String(k)) : null),
-      setItem: (k, v) => { m.set(String(k), String(v)); },
-      removeItem: (k) => { m.delete(String(k)); },
-      clear: () => m.clear(),
-      key: (i) => [...m.keys()][i] ?? null,
-      get length() { return m.size; },
-    };
+    // У самого хранилища собственных свойств нет — только ключи страницы;
+    // всё остальное на прототипе, как в браузере.
+    const api = Object.create(Storage.prototype);
+    StorageData.set(api, m);
     return new Proxy(api, {
       get: (t, p) => (p in t ? t[p] : (m.has(String(p)) ? m.get(String(p)) : undefined)),
       set: (t, p, v) => { if (p in t) return true; m.set(String(p), String(v)); return true; },

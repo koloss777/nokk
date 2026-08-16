@@ -50,7 +50,17 @@
   // Страницы читают `.length` и перебирают — этого достаточно, а `Array.isArray`
   // на настоящей коллекции ложен, как и должно быть.
   function __collection(arr) {
+    __link('HTMLCollection', __collectionProto);
     const list = Object.create(__collectionProto);
+    for (let i = 0; i < arr.length; i++) list[i] = arr[i];
+    Object.defineProperty(list, 'length', { value: arr.length, enumerable: false, configurable: true });
+    return list;
+  }
+  // `querySelectorAll` отдаёт NodeList — не живой, как у childNodes, а слепок;
+  // это разные вещи в браузере и разные ответы на `Object.prototype.toString`.
+  function __staticNodeList(arr) {
+    __link('NodeList', __nodeListProto);
+    const list = Object.create(__nodeListProto);
     for (let i = 0; i < arr.length; i++) list[i] = arr[i];
     Object.defineProperty(list, 'length', { value: arr.length, enumerable: false, configurable: true });
     return list;
@@ -61,7 +71,7 @@
   // `a.childNodes === a.childNodes`, — поэтому он кэшируется на узле, а индексы
   // пересобираются при каждом обращении.
   function __nodeList(node) {
-    __linkNodeList();
+    __link('NodeList', __nodeListProto);
     let list = node.__ptList;
     if (!list) {
       list = Object.create(__nodeListProto);
@@ -73,19 +83,21 @@
     Object.defineProperty(list, 'length', { value: kids.length, enumerable: false, configurable: true });
     return list;
   }
-  // Прототип связывается с интерфейсом NodeList при первом обращении: сам
-  // интерфейс появляется позже этого файла, а список создаётся уже на странице.
-  const __linkNodeList = () => {
-    const I = globalThis.NodeList;
-    if (!I || __nodeListProto.__ptLinked) return;
-    __nodeListProto.__ptLinked = true;
-    for (const k of Reflect.ownKeys(__nodeListProto)) {
+  // Прототип связывается со своим интерфейсом при первом обращении: интерфейсы
+  // объявляются позже этого файла, а список создаётся уже на странице. Члены
+  // переезжают на `Iface.prototype`, а наш объект становится его наследником —
+  // так `list instanceof NodeList` истинно, и `constructor` тот, что нужно.
+  const __link = (name, proto) => {
+    const I = globalThis[name];
+    if (!I || proto.__ptLinked) return;
+    proto.__ptLinked = true;
+    for (const k of Reflect.ownKeys(proto)) {
       if (k === '__ptLinked') continue;
-      Object.defineProperty(I.prototype, k, Object.getOwnPropertyDescriptor(__nodeListProto, k));
+      Object.defineProperty(I.prototype, k, Object.getOwnPropertyDescriptor(proto, k));
     }
-    Object.setPrototypeOf(__nodeListProto, I.prototype);
-    for (const k of Reflect.ownKeys(__nodeListProto)) {
-      if (k !== '__ptLinked') delete __nodeListProto[k];
+    Object.setPrototypeOf(proto, I.prototype);
+    for (const k of Reflect.ownKeys(proto)) {
+      if (k !== '__ptLinked') delete proto[k];
     }
   };
   const __nodeListProto = {
@@ -99,6 +111,7 @@
   };
 
   const __collectionProto = {
+    get [Symbol.toStringTag]() { return 'HTMLCollection'; },
     item(i) { return this[i] != null ? this[i] : null; },
     namedItem(n) {
       for (let i = 0; i < this.length; i++) {
@@ -109,6 +122,108 @@
     },
     [Symbol.iterator]() { let i = 0; const self = this; return { next: () => i < self.length ? { value: self[i++], done: false } : { value: undefined, done: true } }; },
   };
+
+  // `el.attributes` — NamedNodeMap из Attr, а не массив объектов: сборщик
+  // отпечатка читает и `Object.prototype.toString`, и цепочку прототипов, и
+  // массив там виден сразу.
+  const __attrProto = {
+    get [Symbol.toStringTag]() { return 'Attr'; },
+    get localName() { return this.__ptName; },
+    get name() { return this.__ptName; },
+    get nodeName() { return this.__ptName; },
+    get value() { return this.__ptValue; },
+    get nodeValue() { return this.__ptValue; },
+    get textContent() { return this.__ptValue; },
+    get namespaceURI() { return null; },
+    get prefix() { return null; },
+    get specified() { return true; },
+    get ownerElement() { return this.__ptOwner; },
+  };
+  function __attr(el, name, value) {
+    __link('Attr', __attrProto);
+    const a = Object.create(__attrProto);
+    Object.defineProperty(a, '__ptName', { value: name });
+    Object.defineProperty(a, '__ptValue', { value: value });
+    Object.defineProperty(a, '__ptOwner', { value: el });
+    return a;
+  }
+  const __namedNodeMapProto = {
+    get [Symbol.toStringTag]() { return 'NamedNodeMap'; },
+    item(i) { return this[i] != null ? this[i] : null; },
+    getNamedItem(n) { const k = String(n).toLowerCase();
+      for (let i = 0; i < this.length; i++) if (this[i].name === k) return this[i];
+      return null; },
+    getNamedItemNS(_ns, n) { return this.getNamedItem(n); },
+    setNamedItem(a) { if (a && this.__ptOwner) this.__ptOwner.setAttribute(a.name, a.value); return null; },
+    setNamedItemNS(a) { return this.setNamedItem(a); },
+    removeNamedItem(n) { const a = this.getNamedItem(n);
+      if (!a) throw new Error("Failed to execute 'removeNamedItem' on 'NamedNodeMap': No item with name '" + n + "' was found.");
+      this.__ptOwner.removeAttribute(a.name); return a; },
+    removeNamedItemNS(_ns, n) { return this.removeNamedItem(n); },
+    [Symbol.iterator]() { let i = 0; const self = this;
+      return { next: () => i < self.length ? { value: self[i++], done: false } : { value: undefined, done: true } }; },
+  };
+  function __namedNodeMap(el) {
+    __link('NamedNodeMap', __namedNodeMapProto);
+    const map = Object.create(__namedNodeMapProto);
+    let i = 0;
+    for (const [name, value] of el.__ptAttrs) map[i++] = __attr(el, name, value);
+    Object.defineProperty(map, 'length', { value: i, enumerable: false, configurable: true });
+    Object.defineProperty(map, '__ptOwner', { value: el });
+    return map;
+  }
+
+  // `classList` — DOMTokenList: живой, пишет обратно в атрибут, и это интерфейс,
+  // а не литерал с методами.
+  const __tokenListProto = {
+    get [Symbol.toStringTag]() { return 'DOMTokenList'; },
+    get value() { return this.__ptEl.getAttribute('class') || ''; },
+    set value(v) { this.__ptEl.setAttribute('class', String(v)); },
+    get length() { return this.__ptTokens().length; },
+    item(i) { const t = this.__ptTokens(); return i >= 0 && i < t.length ? t[i] : null; },
+    contains(c) { return this.__ptTokens().includes(String(c)); },
+    add(...cs) { const t = this.__ptTokens();
+      for (const c of cs) if (!t.includes(String(c))) t.push(String(c));
+      this.__ptEl.setAttribute('class', t.join(' ')); },
+    remove(...cs) { const drop = cs.map(String);
+      this.__ptEl.setAttribute('class', this.__ptTokens().filter((c) => !drop.includes(c)).join(' ')); },
+    toggle(c, force) { const t = this.__ptTokens(), has = t.includes(String(c));
+      if (force === true || (force === undefined && !has)) {
+        if (!has) t.push(String(c));
+        this.__ptEl.setAttribute('class', t.join(' '));
+        return true;
+      }
+      this.__ptEl.setAttribute('class', t.filter((x) => x !== String(c)).join(' '));
+      return false; },
+    replace(from, to) { const t = this.__ptTokens(), i = t.indexOf(String(from));
+      if (i < 0) return false;
+      t[i] = String(to); this.__ptEl.setAttribute('class', t.join(' ')); return true; },
+    supports() { throw new TypeError("Failed to execute 'supports' on 'DOMTokenList': DOMTokenList has no supported tokens."); },
+    forEach(fn, thisArg) { this.__ptTokens().forEach((v, i) => fn.call(thisArg, v, i, this)); },
+    *entries() { const t = this.__ptTokens(); for (let i = 0; i < t.length; i++) yield [i, t[i]]; },
+    *keys() { const t = this.__ptTokens(); for (let i = 0; i < t.length; i++) yield i; },
+    *values() { yield* this.__ptTokens(); },
+    [Symbol.iterator]() { return this.values(); },
+    toString() { return this.value; },
+  };
+  function __tokenList(el) {
+    __link('DOMTokenList', __tokenListProto);
+    let list = el.__ptTokenList;
+    if (!list) {
+      list = Object.create(__tokenListProto);
+      Object.defineProperty(list, '__ptEl', { value: el });
+      Object.defineProperty(list, '__ptTokens', {
+        value: () => (el.getAttribute('class') || '').split(/\s+/).filter(Boolean),
+      });
+      Object.defineProperty(el, '__ptTokenList', { value: list, enumerable: false, writable: true });
+    }
+    // Индексы — собственные свойства, как у браузера: `list[0]` работает.
+    const t = list.__ptTokens(), prev = list.__ptCount | 0;
+    for (let i = 0; i < t.length; i++) list[i] = t[i];
+    for (let i = t.length; i < prev; i++) delete list[i];
+    Object.defineProperty(list, '__ptCount', { value: t.length, configurable: true });
+    return list;
+  }
 
   // ---- Node -----------------------------------------------------------------
   class Node {
@@ -387,6 +502,7 @@
       this.__ptMode = mode;
       this.ownerDocument = host.ownerDocument;
     }
+    get [Symbol.toStringTag]() { return 'ShadowRoot'; }
     get host() { return this.__ptHost; }
     get mode() { return this.__ptMode; }
     get nodeName() { return '#document-fragment'; }
@@ -408,10 +524,10 @@
     get adoptedStyleSheets() { return this.__ptAdopted || (this.__ptAdopted = []); }
     set adoptedStyleSheets(v) { this.__ptAdopted = v; }
     getElementById(id) { return firstMatch(this, e => e.id === id); }
-    getElementsByTagName(t) { const tag = String(t).toUpperCase(); return collect(this, e => t === '*' || e.tagName === tag); }
-    getElementsByClassName(c) { const cs = String(c).split(/\s+/).filter(Boolean); return collect(this, e => cs.every(x => e.classList.contains(x))); }
+    getElementsByTagName(t) { return __collection(__tags(this, t)); }
+    getElementsByClassName(c) { const cs = String(c).split(/\s+/).filter(Boolean); return __collection(collect(this, e => cs.every(x => e.classList.contains(x)))); }
     querySelector(sel) { return query(this, sel)[0] || null; }
-    querySelectorAll(sel) { return query(this, sel); }
+    querySelectorAll(sel) { return __staticNodeList(query(this, sel)); }
     append(...ns) { for (const n of ns) this.appendChild(typeof n === 'string' ? new Text(n) : n); }
     prepend(...ns) { for (const n of ns.reverse()) this.insertBefore(typeof n === 'string' ? new Text(n) : n, this.firstChild); }
     elementFromPoint() { return null; }
@@ -461,7 +577,7 @@
       __customs.set(name, ctor);
       const doc = globalThis.document;
       if (doc && doc.documentElement) {
-        for (const el of doc.getElementsByTagName(name)) __customUpgrade(el, ctor);
+        for (const el of __docTags(doc, name)) __customUpgrade(el, ctor);
       }
       const pending = __customPending.get(name);
       if (pending) { pending.resolve(ctor); __customPending.delete(name); }
@@ -533,13 +649,13 @@
     }
     hasAttribute(n) { return this.__ptAttrs.has(n.toLowerCase()); }
     getAttributeNames() { return [...this.__ptAttrs.keys()]; }
-    get attributes() { return [...this.__ptAttrs].map(([name, value]) => ({ name, value })); }
+    get attributes() { return __namedNodeMap(this); }
 
     get id() { return this.getAttribute('id') || ''; }
     set id(v) { this.setAttribute('id', v); }
     get className() { return this.getAttribute('class') || ''; }
     set className(v) { this.setAttribute('class', v); }
-    get classList() { return makeClassList(this); }
+    get classList() { return __tokenList(this); }
     get dataset() { return makeDataset(this); }
 
     // URL-valued attributes reflect as *absolute* URLs, exactly as in a browser.
@@ -638,7 +754,7 @@
     get defer() { return this.hasAttribute('defer'); }
     set defer(v) { v ? this.setAttribute('defer', '') : this.removeAttribute('defer'); }
 
-    get children() { return this.__ptKids.filter(n => n.nodeType === ELEMENT_NODE); }
+    get children() { return __collection(this.__ptKids.filter(n => n.nodeType === ELEMENT_NODE)); }
     get childElementCount() { return this.children.length; }
     get firstElementChild() { return this.children[0] || null; }
     get lastElementChild() { const c = this.children; return c[c.length - 1] || null; }
@@ -650,10 +766,10 @@
 
     // Queries (scoped to this subtree)
     getElementById(id) { return firstMatch(this, e => e.id === id); }
-    getElementsByTagName(t) { const tag = t.toUpperCase(); return collect(this, e => t === '*' || e.tagName === tag); }
-    getElementsByClassName(c) { const cs = c.split(/\s+/).filter(Boolean); return collect(this, e => cs.every(x => e.classList.contains(x))); }
+    getElementsByTagName(t) { return __collection(__tags(this, t)); }
+    getElementsByClassName(c) { const cs = String(c).split(/\s+/).filter(Boolean); return __collection(collect(this, e => cs.every(x => e.classList.contains(x)))); }
     querySelector(sel) { return query(this, sel)[0] || null; }
-    querySelectorAll(sel) { return query(this, sel); }
+    querySelectorAll(sel) { return __staticNodeList(query(this, sel)); }
     closest(sel) { for (let e = this; e; e = e.parentNode) if (e.nodeType === ELEMENT_NODE && matchesSelector(e, sel)) return e; return null; }
     matches(sel) { return matchesSelector(this, sel); }
 
@@ -906,11 +1022,11 @@
     elementFromPoint(x, y) { return __elementFromPoint(x, y); }
     elementsFromPoint(x, y) { const e = __elementFromPoint(x, y); return e ? [e] : []; }
     get nodeName() { return '#document'; }
-    get head() { return this.documentElement && this.documentElement.getElementsByTagName('head')[0] || null; }
-    get body() { return this.documentElement && this.documentElement.getElementsByTagName('body')[0] || null; }
-    get title() { const t = this.getElementsByTagName('title')[0]; return t ? t.textContent.trim() : ''; }
+    get head() { return this.documentElement && __tags(this.documentElement, 'head')[0] || null; }
+    get body() { return this.documentElement && __tags(this.documentElement, 'body')[0] || null; }
+    get title() { const t = this.documentElement ? __tags(this.documentElement, 'title')[0] : null; return t ? t.textContent.trim() : ''; }
     set title(v) {
-      let t = this.getElementsByTagName('title')[0];
+      let t = this.documentElement ? __tags(this.documentElement, 'title')[0] : null;
       if (!t) { t = this.createElement('title'); (this.head || this.documentElement || this).appendChild(t); }
       t.textContent = String(v);
     }
@@ -923,20 +1039,20 @@
     // Коллекции документа — это HTMLCollection, а не массив: `Array.isArray`
     // на них ложен, а сборщик отпечатка кладёт массив в корзину по его
     // строковому значению, из-за чего пустой список выглядел как пустая строка.
-    get scripts() { return __collection(this.getElementsByTagName('script')); }
-    get forms() { return __collection(this.getElementsByTagName('form')); }
-    get images() { return __collection(this.getElementsByTagName('img')); }
-    get embeds() { return __collection(this.getElementsByTagName('embed')); }
-    get plugins() { return __collection(this.getElementsByTagName('embed')); }
+    get scripts() { return __collection(__docTags(this, 'script')); }
+    get forms() { return __collection(__docTags(this, 'form')); }
+    get images() { return __collection(__docTags(this, 'img')); }
+    get embeds() { return __collection(__docTags(this, 'embed')); }
+    get plugins() { return __collection(__docTags(this, 'embed')); }
     // `links` is `<a>`/`<area>` *with an href*, and `anchors` is `<a>` with a name.
     get links() {
-      return __collection(this.getElementsByTagName('a').concat(this.getElementsByTagName('area'))
+      return __collection(__docTags(this, 'a').concat(__docTags(this, 'area'))
         .filter(e => e.hasAttribute('href')));
     }
-    get anchors() { return __collection(this.getElementsByTagName('a').filter(e => e.hasAttribute('name'))); }
+    get anchors() { return __collection(__docTags(this, 'a').filter(e => e.hasAttribute('name'))); }
     get styleSheets() {
-      return __collection(this.getElementsByTagName('style')
-        .concat(this.getElementsByTagName('link').filter(e => /stylesheet/i.test(e.getAttribute('rel') || '')))
+      return __collection(__docTags(this, 'style')
+        .concat(__docTags(this, 'link').filter(e => /stylesheet/i.test(e.getAttribute('rel') || '')))
         .map(owner => ({ ownerNode: owner, href: owner.getAttribute('href') || null,
                          type: 'text/css', disabled: false, media: owner.getAttribute('media') || '',
                          title: owner.getAttribute('title') || null, cssRules: [], rules: [] })));
@@ -946,7 +1062,7 @@
     // «UTF-8» на документ, который ничего не объявил, — заметная разница.
     get characterSet() {
       if (this.__ptCharset) return this.__ptCharset;
-      for (const m of this.getElementsByTagName('meta')) {
+      for (const m of __docTags(this, 'meta')) {
         const c = m.getAttribute('charset');
         if (c) return __normEncoding(c);
         if (/^content-type$/i.test(m.getAttribute('http-equiv') || '')) {
@@ -1020,17 +1136,25 @@
       e.ownerDocument = this;
       return e;
     }
-    createElementNS(_ns, tag) { return this.createElement(tag); }
+    createElementNS(ns, tag) {
+      const e = this.createElement(tag);
+      if (String(ns) === 'http://www.w3.org/2000/svg' && globalThis.__pt_svgProto) {
+        const proto = __pt_svgProto(String(tag));
+        // Имя тега в SVG регистрозависимо: `clipPath`, не `clippath`.
+        if (proto) { try { Object.setPrototypeOf(e, proto); e.__ptNS = String(ns); e.__ptLocal = String(tag); } catch (x) {} }
+      }
+      return e;
+    }
     createTextNode(t) { const n = new Text(t); n.ownerDocument = this; return n; }
     createComment(t) { const n = new Comment(t); n.ownerDocument = this; return n; }
     createDocumentFragment() { const f = new Node(DOCUMENT_FRAGMENT_NODE); f.ownerDocument = this; return f; }
     createEvent() { return new Event(''); }
 
     getElementById(id) { return this.documentElement ? this.documentElement.getElementById(id) : null; }
-    getElementsByTagName(t) { return this.documentElement ? this.documentElement.getElementsByTagName(t) : []; }
+    getElementsByTagName(t) { return __collection(this.documentElement ? __tags(this.documentElement, t) : []); }
     getElementsByClassName(c) { return this.documentElement ? this.documentElement.getElementsByClassName(c) : []; }
     querySelector(s) { return this.documentElement ? this.documentElement.querySelector(s) : null; }
-    querySelectorAll(s) { return this.documentElement ? this.documentElement.querySelectorAll(s) : []; }
+    querySelectorAll(s) { return __staticNodeList(this.documentElement ? query(this.documentElement, s) : []); }
 
     // document.write inserts parsed markup at the position of the script that
     // called it (tracked as `currentScript`), matching in-parse behaviour for the
@@ -1338,6 +1462,17 @@
   // `el.style.width`, а `el.style.width = …` не доходил до атрибута. Отсюда же
   // и кадр, который не знал своего размера: раскладка читает одно, страница
   // пишет другое.
+  // Инлайновый стиль тоже CSSStyleDeclaration: `el.style` в браузере и
+  // `getComputedStyle(el)` — один интерфейс, и сборщик читает его имя.
+  const __styleProto = () => {
+    const proto = (globalThis.CSSStyleDeclaration && CSSStyleDeclaration.prototype) || Object.prototype;
+    try {
+      if (proto !== Object.prototype && !Object.getOwnPropertyDescriptor(proto, Symbol.toStringTag)) {
+        Object.defineProperty(proto, Symbol.toStringTag, { value: 'CSSStyleDeclaration', configurable: true });
+      }
+    } catch (e) {}
+    return proto;
+  };
   function makeStyle(el) {
     let cachedText = null, cachedMap = new Map();
     const read = () => {
@@ -1360,15 +1495,19 @@
       if (el && el.setAttribute) el.setAttribute('style', text);
       __markDirty();
     };
-    return new Proxy({
+    return new Proxy(Object.assign(Object.create(__styleProto()), {
       getPropertyValue: (p) => read().get(String(p).toLowerCase()) || '',
+      getPropertyPriority: () => '',
+      get parentRule() { return null; },
+      get cssFloat() { return read().get('float') || ''; },
+      set cssFloat(v) { const m = read(); m.set('float', String(v)); write(m); },
       setProperty: (p, v) => { const m = read(); m.set(String(p).toLowerCase(), String(v)); write(m); },
       removeProperty: (p) => { const m = read(); const had = m.get(String(p).toLowerCase()) || ''; m.delete(String(p).toLowerCase()); write(m); return had; },
       get cssText() { return [...read()].map(([k, v]) => `${k}: ${v}`).join('; '); },
       set cssText(v) { if (el && el.setAttribute) el.setAttribute('style', String(v)); cachedText = null; __markDirty(); },
       get length() { return read().size; },
       item: (i) => [...read().keys()][i] || '',
-    }, {
+    }), {
       get: (t, p) => {
         if (typeof p === 'string' && !(p in t)) return read().get(dash(p)) || '';
         const v = t[p];
@@ -1382,6 +1521,12 @@
   }
 
   // ---- tree walking ---------------------------------------------------------
+  // Внутри движка нужен массив (concat/filter), наружу — коллекция.
+  function __docTags(doc, t) { return doc.documentElement ? __tags(doc.documentElement, t) : []; }
+  function __tags(root, t) {
+    const tag = String(t).toUpperCase();
+    return collect(root, (e) => t === '*' || e.tagName === tag);
+  }
   function collect(root, pred) {
     const out = []; walk(root, e => { if (pred(e)) out.push(e); });
     out.item = (i) => out[i] || null; return out;
@@ -1768,6 +1913,34 @@
     return /^[a-z][a-z0-9]*(-[a-z0-9]+)+$/.test(tag) ? __htmlProto : __ifaceProto.get('HTMLUnknownElement');
   };
   globalThis.__pt_setPendingTag = (tag) => { __pendingTag = String(tag || 'div'); };
+  // SVG — своя лестница, и она глубже HTML: `<path>` это SVGPathElement →
+  // SVGGeometryElement → SVGGraphicsElement → SVGElement → Element. У нас любой
+  // `createElementNS('…/svg', 'path')` был HTMLUnknownElement, и виджет, который
+  // рисует свою галочку из path/line/circle, отдавал сборщику чужие имена.
+  // Цепочки сняты с Chrome 148.
+  const SVG_CHAIN = {"svg":["SVGSVGElement","SVGGraphicsElement","SVGElement"],"path":["SVGPathElement","SVGGeometryElement","SVGGraphicsElement","SVGElement"],"line":["SVGLineElement","SVGGeometryElement","SVGGraphicsElement","SVGElement"],"circle":["SVGCircleElement","SVGGeometryElement","SVGGraphicsElement","SVGElement"],"g":["SVGGElement","SVGGraphicsElement","SVGElement"],"rect":["SVGRectElement","SVGGeometryElement","SVGGraphicsElement","SVGElement"],"text":["SVGTextElement","SVGTextPositioningElement","SVGTextContentElement","SVGGraphicsElement","SVGElement"],"tspan":["SVGTSpanElement","SVGTextPositioningElement","SVGTextContentElement","SVGGraphicsElement","SVGElement"],"defs":["SVGDefsElement","SVGGraphicsElement","SVGElement"],"use":["SVGUseElement","SVGGraphicsElement","SVGElement"],"polygon":["SVGPolygonElement","SVGGeometryElement","SVGGraphicsElement","SVGElement"],"polyline":["SVGPolylineElement","SVGGeometryElement","SVGGraphicsElement","SVGElement"],"ellipse":["SVGEllipseElement","SVGGeometryElement","SVGGraphicsElement","SVGElement"],"image":["SVGImageElement","SVGGraphicsElement","SVGElement"],"clipPath":["SVGClipPathElement","SVGElement"],"mask":["SVGMaskElement","SVGElement"],"pattern":["SVGPatternElement","SVGElement"],"filter":["SVGFilterElement","SVGElement"],"marker":["SVGMarkerElement","SVGElement"],"symbol":["SVGSymbolElement","SVGGraphicsElement","SVGElement"],"title":["SVGTitleElement","SVGElement"],"desc":["SVGDescElement","SVGElement"],"style":["SVGStyleElement","SVGElement"],"a":["SVGAElement","SVGGraphicsElement","SVGElement"],"foreignObject":["SVGForeignObjectElement","SVGGraphicsElement","SVGElement"],"linearGradient":["SVGLinearGradientElement","SVGGradientElement","SVGElement"],"radialGradient":["SVGRadialGradientElement","SVGGradientElement","SVGElement"],"stop":["SVGStopElement","SVGElement"],"animate":["SVGAnimateElement","SVGAnimationElement","SVGElement"],"textPath":["SVGTextPathElement","SVGTextContentElement","SVGGraphicsElement","SVGElement"],"switch":["SVGSwitchElement","SVGGraphicsElement","SVGElement"],"metadata":["SVGMetadataElement","SVGElement"],"view":["SVGViewElement","SVGElement"],"set":["SVGSetElement","SVGAnimationElement","SVGElement"],"script":["SVGScriptElement","SVGElement"]};
+  {
+    const svgProto = new Map();
+    // Строим снизу вверх: каждая ступень наследует следующей за ней в цепочке.
+    const protoFor = (chain, i) => {
+      const name = chain[i];
+      if (svgProto.has(name)) return svgProto.get(name);
+      const parent = i + 1 < chain.length ? protoFor(chain, i + 1) : Element.prototype;
+      const proto = __mkIface(name, parent);
+      svgProto.set(name, proto);
+      return proto;
+    };
+    for (const chain of Object.values(SVG_CHAIN)) protoFor(chain, 0);
+    // Промежуточные интерфейсы, которых нет первым звеном ни у одного тега.
+    for (const n of ['SVGGeometryElement', 'SVGGraphicsElement', 'SVGElement',
+                     'SVGTextPositioningElement', 'SVGTextContentElement',
+                     'SVGGradientElement', 'SVGAnimationElement', 'SVGComponentTransferFunctionElement']) {
+      if (!svgProto.has(n)) svgProto.set(n, __mkIface(n, svgProto.get('SVGElement') || Element.prototype));
+    }
+    globalThis.__pt_svgProto = (tag) => svgProto.get((SVG_CHAIN[tag] || [])[0]) ||
+                                        svgProto.get('SVGElement') || null;
+  }
+
 
   // `hidden` — отражаемый атрибут HTMLElement: мы его читали внутри себя, но
   // наружу не отдавали вовсе, хотя в браузере он есть у каждого элемента.
@@ -1810,6 +1983,58 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
   }
 
+  // Форма интерфейсов, снятая с Chrome 148: имя → категория → имена членов.
+  // `Element.prototype` у нас нёс 47 имён против 151, `HTMLElement` — 16 против
+  // 141, у SVGElement не было ни одного. Сборщик отпечатка идёт по цепочке
+  // прототипов перечислимыми ключами, так что каждая недостающая ступень видна
+  // ему сразу. Заполняем только то, чего нет: реализованное не трогаем.
+  const CHROME_IFACE_SHAPE = {"AudioContext":{"N":["close","createMediaElementSource","createMediaStreamDestination","createMediaStreamSource","getOutputTimestamp","resume","suspend","setSinkId"],"x":["baseLatency","outputLatency","onerror","playbackStats","sinkId","onsinkchange"]},"BaseAudioContext":{"N":["createAnalyser","createBiquadFilter","createBuffer","createBufferSource","createChannelMerger","createChannelSplitter","createConstantSource","createConvolver","createDelay","createDynamicsCompressor","createGain","createIIRFilter","createOscillator","createPanner","createPeriodicWave","createScriptProcessor","createStereoPanner","createWaveShaper","decodeAudioData"],"x":["destination","sampleRate","currentTime","listener","state","onstatechange","audioWorklet"]},"CSSStyleDeclaration":{"#0":["length"],"N":["getPropertyPriority","getPropertyValue","item","removeProperty","setProperty"],"e":["cssText","cssFloat"],"x":["parentRule"]},"DOMTokenList":{"#2":["length"],"N":["entries","keys","values","forEach","add","contains","item","remove","replace","supports","toggle","toString"],"s:a b":["value"]},"Element":{"#0":["scrollTop","scrollLeft","clientTop","clientLeft"],"#1":["childElementCount","currentCSSZoom"],"#18":["scrollHeight","clientHeight"],"#764":["scrollWidth","clientWidth"],"N":["after","animate","append","attachShadow","before","checkVisibility","closest","computedStyleMap","getAnimations","getAttribute","getAttributeNS","getAttributeNames","getAttributeNode","getAttributeNodeNS","getBoundingClientRect","getClientRects","getElementsByClassName","getElementsByTagName","getElementsByTagNameNS","getHTML","hasAttribute","hasAttributeNS","hasAttributes","hasPointerCapture","insertAdjacentElement","insertAdjacentHTML","insertAdjacentText","matches","moveBefore","prepend","querySelector","querySelectorAll","releasePointerCapture","remove","removeAttribute","removeAttributeNS","removeAttributeNode","replaceChildren","replaceWith","requestFullscreen","requestPointerLock","scroll","scrollBy","scrollIntoView","scrollIntoViewIfNeeded","scrollTo","setAttribute","setAttributeNS","setAttributeNode","setAttributeNodeNS","setHTMLUnsafe","setPointerCapture","toggleAttribute","webkitMatchesSelector","webkitRequestFullScreen","webkitRequestFullscreen","ariaNotify","setHTML","startViewTransition"],"e":["slot","elementTiming"],"o":["classList","attributes","part","children","firstElementChild","lastElementChild","nextElementSibling","customElementRegistry"],"s:<div id=\"d\" class=\"a b\"><span>x</span></div>":["outerHTML"],"s:<span>x</span>":["innerHTML"],"s:DIV":["tagName"],"s:a b":["className"],"s:d":["id"],"s:div":["localName"],"s:http://www.w3.org/1999/xhtml":["namespaceURI"],"x":["prefix","shadowRoot","assignedSlot","onbeforecopy","onbeforecut","onbeforepaste","onsearch","onfullscreenchange","onfullscreenerror","onwebkitfullscreenchange","onwebkitfullscreenerror","role","ariaAtomic","ariaAutoComplete","ariaBusy","ariaBrailleLabel","ariaBrailleRoleDescription","ariaChecked","ariaColCount","ariaColIndex","ariaColSpan","ariaCurrent","ariaDescription","ariaDisabled","ariaExpanded","ariaHasPopup","ariaHidden","ariaInvalid","ariaKeyShortcuts","ariaLabel","ariaLevel","ariaLive","ariaModal","ariaMultiLine","ariaMultiSelectable","ariaOrientation","ariaPlaceholder","ariaPosInSet","ariaPressed","ariaReadOnly","ariaRelevant","ariaRequired","ariaRoleDescription","ariaRowCount","ariaRowIndex","ariaRowSpan","ariaSelected","ariaSetSize","ariaSort","ariaValueMax","ariaValueMin","ariaValueNow","ariaValueText","previousElementSibling","activeViewTransition","ariaColIndexText","ariaRowIndexText","ariaActiveDescendantElement","ariaControlsElements","ariaDescribedByElements","ariaDetailsElements","ariaErrorMessageElements","ariaFlowToElements","ariaLabelledByElements"]},"HTMLCanvasElement":{"#150":["height"],"#300":["width"],"N":["captureStream","getContext","toBlob","toDataURL","transferControlToOffscreen"]},"HTMLCollection":{"#1":["length"],"N":["item","namedItem"]},"HTMLElement":{"#-1":["tabIndex"],"#18":["offsetHeight"],"#764":["offsetWidth"],"#8":["offsetTop","offsetLeft"],"F":["hidden","inert","draggable","isContentEditable","autofocus"],"N":["attachInternals","blur","click","focus","hidePopover","showPopover","togglePopover"],"T":["translate","spellcheck"],"e":["title","lang","dir","accessKey","autocapitalize","enterKeyHint","inputMode","virtualKeyboardPolicy","nonce"],"o":["offsetParent","dataset","style","attributeStyleMap"],"s:inherit":["contentEditable"],"s:true":["writingSuggestions"],"s:x":["innerText","outerText"],"x":["editContext","popover","onabort","onbeforeinput","onbeforematch","onbeforetoggle","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncuechange","ondblclick","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onload","onloadeddata","onloadedmetadata","onloadstart","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onpause","onplay","onplaying","onprogress","onratechange","onreset","onresize","onscroll","onscrollend","onsecuritypolicyviolation","onseeked","onseeking","onselect","onslotchange","onstalled","onsubmit","onsuspend","ontimeupdate","ontoggle","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkittransitionend","onwheel","onauxclick","ongotpointercapture","onlostpointercapture","onpointerdown","onpointermove","onpointerup","onpointercancel","onpointerover","onpointerout","onpointerenter","onpointerleave","onselectstart","onselectionchange","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","ontransitionrun","ontransitionstart","ontransitionend","ontransitioncancel","onbeforexrselect","oncopy","oncut","onpaste","onscrollsnapchange","onscrollsnapchanging","onpointerrawupdate"]},"NamedNodeMap":{"#2":["length"],"N":["getNamedItem","getNamedItemNS","item","removeNamedItem","removeNamedItemNS","setNamedItem","setNamedItemNS"]},"NodeList":{"#1":["length"],"N":["entries","keys","values","forEach","item"]},"OfflineAudioContext":{"N":["resume","startRendering","suspend"],"x":["oncomplete","length"]},"Performance":{"#0":["interactionCount"],"#1786865974979.1":["timeOrigin"],"N":["clearMarks","clearMeasures","clearResourceTimings","getEntries","getEntriesByName","getEntriesByType","mark","measure","setResourceTimingBufferSize","toJSON","now"],"o":["timing","navigation","memory","eventCounts"],"x":["onresourcetimingbufferfull"]},"SVGAnimatedLength":{"x":["baseVal","animVal"]},"SVGAnimatedRect":{"x":["baseVal","animVal"]},"SVGAnimatedString":{"x":["baseVal","animVal"]},"SVGAnimatedTransformList":{"x":["baseVal","animVal"]},"SVGCircleElement":{"o":["cx","cy","r"]},"SVGElement":{"#-1":["tabIndex"],"F":["autofocus"],"N":["blur","focus"],"e":["nonce"],"o":["className","ownerSVGElement","viewportElement","dataset","style","attributeStyleMap"],"x":["onabort","onbeforeinput","onbeforematch","onbeforetoggle","onblur","oncancel","oncanplay","oncanplaythrough","onchange","onclick","onclose","oncommand","oncontentvisibilityautostatechange","oncontextlost","oncontextmenu","oncontextrestored","oncuechange","ondblclick","ondrag","ondragend","ondragenter","ondragleave","ondragover","ondragstart","ondrop","ondurationchange","onemptied","onended","onerror","onfocus","onformdata","oninput","oninvalid","onkeydown","onkeypress","onkeyup","onload","onloadeddata","onloadedmetadata","onloadstart","onmousedown","onmouseenter","onmouseleave","onmousemove","onmouseout","onmouseover","onmouseup","onmousewheel","onpause","onplay","onplaying","onprogress","onratechange","onreset","onresize","onscroll","onscrollend","onsecuritypolicyviolation","onseeked","onseeking","onselect","onslotchange","onstalled","onsubmit","onsuspend","ontimeupdate","ontoggle","onvolumechange","onwaiting","onwebkitanimationend","onwebkitanimationiteration","onwebkitanimationstart","onwebkittransitionend","onwheel","onauxclick","ongotpointercapture","onlostpointercapture","onpointerdown","onpointermove","onpointerup","onpointercancel","onpointerover","onpointerout","onpointerenter","onpointerleave","onselectstart","onselectionchange","onanimationcancel","onanimationend","onanimationiteration","onanimationstart","ontransitionrun","ontransitionstart","ontransitionend","ontransitioncancel","onbeforexrselect","oncopy","oncut","onpaste","onscrollsnapchange","onscrollsnapchanging","onpointerrawupdate"]},"SVGGeometryElement":{"N":["getPointAtLength","getTotalLength","isPointInFill","isPointInStroke"],"o":["pathLength"]},"SVGGraphicsElement":{"N":["getBBox","getCTM","getScreenCTM"],"o":["transform","nearestViewportElement","farthestViewportElement","requiredExtensions","systemLanguage"]},"SVGLength":{"N":["convertToSpecifiedUnits","newValueSpecifiedUnits"],"u":["SVG_LENGTHTYPE_UNKNOWN","SVG_LENGTHTYPE_NUMBER","SVG_LENGTHTYPE_PERCENTAGE","SVG_LENGTHTYPE_EMS","SVG_LENGTHTYPE_EXS","SVG_LENGTHTYPE_PX","SVG_LENGTHTYPE_CM","SVG_LENGTHTYPE_MM","SVG_LENGTHTYPE_IN","SVG_LENGTHTYPE_PT","SVG_LENGTHTYPE_PC"],"x":["unitType","value","valueInSpecifiedUnits","valueAsString"]},"SVGLineElement":{"o":["x1","y1","x2","y2"]},"SVGMatrix":{"N":["flipX","flipY","inverse","multiply","rotate","rotateFromVector","scale","scaleNonUniform","skewX","skewY","translate"],"x":["a","b","c","d","e","f"]},"SVGPoint":{"N":["matrixTransform"],"x":["x","y"]},"SVGPointList":{"N":["appendItem","clear","getItem","initialize","insertItemBefore","removeItem","replaceItem"],"x":["length","numberOfItems"]},"SVGRect":{"x":["x","y","width","height"]},"SVGRectElement":{"o":["x","y","width","height","rx","ry"]},"SVGSVGElement":{"#0":["SVG_ZOOMANDPAN_UNKNOWN"],"#1":["currentScale","SVG_ZOOMANDPAN_DISABLE"],"#2":["zoomAndPan","SVG_ZOOMANDPAN_MAGNIFY"],"N":["animationsPaused","checkEnclosure","checkIntersection","createSVGAngle","createSVGLength","createSVGMatrix","createSVGNumber","createSVGPoint","createSVGRect","createSVGTransform","createSVGTransformFromMatrix","deselectAll","forceRedraw","getCurrentTime","getElementById","getEnclosureList","getIntersectionList","pauseAnimations","setCurrentTime","suspendRedraw","unpauseAnimations","unsuspendRedraw","unsuspendRedrawAll"],"o":["x","y","width","height","currentTranslate","viewBox","preserveAspectRatio"]},"SVGStringList":{"N":["appendItem","clear","getItem","initialize","insertItemBefore","removeItem","replaceItem"],"x":["length","numberOfItems"]},"SVGTransformList":{"N":["appendItem","clear","consolidate","createSVGTransformFromMatrix","getItem","initialize","insertItemBefore","removeItem","replaceItem"],"x":["length","numberOfItems"]},"ShadowRoot":{"F":["delegatesFocus","serializable","clonable"],"N":["elementFromPoint","elementsFromPoint","getAnimations","getHTML","getSelection","setHTMLUnsafe","setHTML"],"a":["adoptedStyleSheets"],"e":["innerHTML"],"o":["host","styleSheets","customElementRegistry"],"s:named":["slotAssignment"],"s:open":["mode"],"x":["onslotchange","activeElement","pointerLockElement","fullscreenElement","pictureInPictureElement"]},"SpeechSynthesis":{"F":["pending","speaking","paused"],"N":["cancel","getVoices","pause","resume","speak"],"x":["onvoiceschanged"]},"Storage":{"#0":["length"],"N":["clear","getItem","key","removeItem","setItem"]}};
+  globalThis.__pt_fillShapes = () => {
+    const native = globalThis.__pt_native || ((f) => f);
+    const stub = (name, cat) => {
+      if (cat === 'N') {
+        const f = function () {};
+        try { Object.defineProperty(f, 'name', { value: name, configurable: true }); } catch (e) {}
+        return native(f);
+      }
+      if (cat === 'x') return null;
+      if (cat === 'u') return undefined;
+      if (cat === 'T') return true;
+      if (cat === 'F') return false;
+      if (cat === 'e') return '';
+      if (cat === 'o') return {};
+      if (cat === 'a') return [];
+      if (cat === 'p') { const q = Promise.resolve(); q.catch(() => {}); return q; }
+      if (cat.charCodeAt(0) === 35) return Number(cat.slice(1));      // '#12' → 12
+      if (cat.charCodeAt(0) === 115 && cat[1] === ':') return cat.slice(2);   // 's:auto'
+      return undefined;
+    };
+    for (const iface of Object.keys(CHROME_IFACE_SHAPE)) {
+      const C = globalThis[iface];
+      const proto = C && C.prototype;
+      if (!proto) continue;
+      // "Уже есть" — значит есть на самом интерфейсе или ниже по цепочке DOM,
+      // а не унаследовано от Object.prototype.
+      const has = (name) => {
+        for (let o = proto; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
+          if (Object.prototype.hasOwnProperty.call(o, name)) return true;
+        }
+        return false;
+      };
+      for (const cat of Object.keys(CHROME_IFACE_SHAPE[iface])) {
+        for (const name of CHROME_IFACE_SHAPE[iface][cat]) {
+          if (has(name)) continue;
+          try {
+            Object.defineProperty(proto, name, {
+              value: stub(name, cat), writable: true, enumerable: true, configurable: true,
+            });
+          } catch (e) {}
+        }
+      }
+    }
+  };
+  __pt_fillShapes();
+
   globalThis.ShadowRoot = ShadowRoot;
   globalThis.Text = Text;
   globalThis.Comment = Comment;
@@ -1836,12 +2061,12 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       root = document.createElement('html');
       for (const n of nodes) root.appendChild(n);
     }
-    if (!root.getElementsByTagName('head')[0]) root.insertBefore(document.createElement('head'), root.firstChild);
-    let body = root.getElementsByTagName('body')[0];
+    if (!__tags(root, 'head')[0]) root.insertBefore(document.createElement('head'), root.firstChild);
+    let body = __tags(root, 'body')[0];
     if (!body) {
       body = document.createElement('body');
       // Всё, что разметка положила мимо head, — содержимое тела.
-      const head = root.getElementsByTagName('head')[0];
+      const head = __tags(root, 'head')[0];
       for (const n of root.childNodes.slice ? root.childNodes.slice() : Array.from(root.childNodes)) {
         if (n !== head) { root.removeChild(n); body.appendChild(n); }
       }
@@ -1853,7 +2078,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     document.documentElement = root;
     document.readyState = 'complete';
     // Скрипты разметки исполняются здесь и сейчас, в этом окне.
-    for (const el of root.getElementsByTagName('script')) {
+    for (const el of __tags(root, 'script')) {
       try { el.__ptRunScript(); } catch (e) {}
     }
     return document;
@@ -1889,7 +2114,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       document.appendChild(html);
       document.documentElement = html;
     }
-    scriptNodes = document.getElementsByTagName('script') || [];
+    scriptNodes = __docTags(document, 'script');
     // Пока идут собственные скрипты документа, браузер отвечает 'loading', и
     // код это читает: «если не loading — запускайся сразу, иначе жди
     // DOMContentLoaded». Мы отвечали 'interactive' с самого начала, то есть
