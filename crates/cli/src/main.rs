@@ -324,6 +324,36 @@ async fn main() -> Result<()> {
                 }
                 None => engine.new_context().await?,
             };
+            // Наблюдение за крючками челленджа: программа, пришедшая с сервера,
+            // зовёт виджет через его же таблицу колбэков, и увидеть, какие из
+            // них она позвала, — единственный способ прочитать её решение.
+            if std::env::var("NOKK_TRACE_HOOKS").is_ok() {
+                let hook = r#"(() => {
+                  const wrap = (obj, label) => {
+                    for (const k of Object.keys(obj)) {
+                      const v = obj[k];
+                      if (typeof v !== 'function') continue;
+                      obj[k] = function () {
+                        try { console.error('[hook] ' + label + '.' + k); } catch (e) {}
+                        return v.apply(this, arguments);
+                      };
+                    }
+                    return obj;
+                  };
+                  for (const name of ['RItcy2', 'HuCI0']) {
+                    let store;
+                    try {
+                      Object.defineProperty(globalThis, name, {
+                        configurable: true,
+                        get() { return store; },
+                        set(v) { store = (v && typeof v === 'object') ? wrap(v, name) : v; },
+                      });
+                    } catch (e) {}
+                  }
+                })();"#;
+                c.add_frame_init_script(hook.to_string());
+                c.add_init_script(hook.to_string());
+            }
             c.navigate(url).await?;
             let title = c.evaluate("document.title").await.unwrap_or_default();
             let challenged =
@@ -410,6 +440,11 @@ async fn main() -> Result<()> {
                 .await
             {
                 dump(format!("worker {url}"), v);
+            }
+            // То же — про саму страницу: интерстишал рисует свой интерфейс в
+            // закрытом shadow root не хуже виджета.
+            if let Ok(serde_json::Value::String(t)) = ctx.evaluate("(() => { const seen = []; const walk = (root) => {                            for (const el of root.querySelectorAll('*')) {                              const tag = el.localName;                              if (tag === 'input' || tag === 'button' || el.getAttribute('role'))                                seen.push(tag + (el.type ? '[' + el.type + ']' : '') +                                          (el.getAttribute('role') ? '{' + el.getAttribute('role') + '}' : ''));                              const sr = el.shadowRoot || el.__ptShadow; if (sr) walk(sr); } };                          const root = document.body && (document.body.shadowRoot || document.body.__ptShadow);                          try { walk(document); if (root) walk(root); } catch (e) {}                          return JSON.stringify({controls: seen.slice(0, 12),                            bodyShadow: !!root,                            shadowKids: root ? root.childNodes.length : -1,                            shadowText: root ? String(root.textContent || '').trim().slice(0, 60) : '',                            bodyKids: document.body ? document.body.childNodes.length : -1,                            view: [innerWidth, innerHeight],                            html: (document.documentElement ? document.documentElement.outerHTML : '').length}); })()").await {
+                eprintln!("# page widget: {t}");
             }
             // Что виджет в итоге нарисовал: интерактивный контрол — то, чего
             // движок ждёт от него, и его отсутствие видно только так.
