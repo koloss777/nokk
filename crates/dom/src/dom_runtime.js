@@ -1245,7 +1245,13 @@
   }
   // Пометить событие как пришедшее от движка. Страница до этого не дотянется:
   // имя __pt-скрыто из любого перечисления, а слепок делается один раз.
-  const __ptTrust = (ev) => { if (ev && ev.__ptE) ev.__ptE.isTrusted = true; return ev; };
+  const __ptTrust = (ev) => {
+    if (ev && ev.__ptE) ev.__ptE.isTrusted = true;
+    else if (ev) { try { Object.defineProperty(ev, 'isTrusted', { value: true, configurable: true }); } catch (e) {} }
+    return ev;
+  };
+  // Воркерная область объявляется отдельным скриптом и метит свои доставки этим.
+  try { Object.defineProperty(globalThis, '__pt_trustEvent', { value: __ptTrust, enumerable: false, configurable: true }); } catch (e) {}
 
   evtAccessors(Event, ['type', 'bubbles', 'cancelable', 'defaultPrevented', 'target',
     'currentTarget', 'eventPhase', 'timeStamp', 'isTrusted']);
@@ -1370,7 +1376,8 @@
     if (!W || W.closed) return;
     let data = null;
     try { data = __ptJSON.parse(json); } catch (e) {}
-    const ev = new MessageEvent('message', { data });
+    const ev = __ptTrust(new MessageEvent('message', { data, origin: '', source: null }));
+    try { ev.target = W.worker; ev.currentTarget = W.worker; } catch (e) {}
     try { if (typeof W.onmessage === 'function') W.onmessage.call(W.worker, ev); } catch (e) {}
     for (const h of (W.listeners.message || [])) { try { h.call(W.worker, ev); } catch (e) {} }
   };

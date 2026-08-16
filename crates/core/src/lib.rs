@@ -1767,7 +1767,7 @@ impl BrowserContext {
                         );
                     }
                     tracing::debug!(url = %url, bytes = source.len(),
-                                    head = %&source[..source.len().min(64)], "worker started");
+                                    head = %&source[..source.len().min(400)], "worker started");
                     let code = format!("{source}\n//# sourceURL={url}");
                     if let Err(e) = self.eval_in(child, &code).await {
                         tracing::debug!(error = %e, "worker script threw");
@@ -1785,11 +1785,15 @@ impl BrowserContext {
                         .lock()
                         .ok()
                         .and_then(|w| w.get(&key).map(|s| s.index));
-                    if let Some(child) = child {
-                        let data = op["data"].as_str().unwrap_or("null");
-                        let _ = self
-                            .eval_in(child, &format!("__pt_workerDeliver({})", js_str(data)))
-                            .await;
+                    match child {
+                        Some(child) => {
+                            let data = op["data"].as_str().unwrap_or("null");
+                            tracing::debug!(owner = index, worker = id, bytes = data.len(), "worker post");
+                            let _ = self
+                                .eval_in(child, &format!("__pt_workerDeliver({})", js_str(data)))
+                                .await;
+                        }
+                        None => tracing::debug!(owner = index, worker = id, "worker post: no such worker"),
                     }
                 }
                 "close" => {
@@ -6138,6 +6142,43 @@ mod tests {
         assert_eq!(out["layout"], serde_json::json!(["[object KeyboardLayoutMap]", 48, "q"]));
         assert_eq!(out["decoding"], true);
         assert_eq!(out["highEntropy"], "x86");
+    }
+
+    /// Cloudflare's collector worker is 291 bytes and runs its task under one
+    /// condition: `e.isTrusted && '' === e.origin && null === e.source`. An event
+    /// the engine delivers is the browser's own and is trusted; ours was not, so
+    /// the worker took its message, checked the first of the three, and did
+    /// nothing at all — no error, no reply, and the widget waited for it forever.
+    #[tokio::test]
+    async fn a_message_the_engine_delivers_is_trusted() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><body><script>
+                globalThis.__log = { done: false };
+                const src = "onmessage = function (e) {" +
+                  "  postMessage('trusted=' + e.isTrusted + ' origin=[' + e.origin + '] source=' + e.source +" +
+                  "    ' data=' + e.data + ' gate=' + !!(e.isTrusted && '' === e.origin && null === e.source));" +
+                  "};";
+                const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+                w.onmessage = (e) => { globalThis.__log = { done: true, said: e.data, replyTrusted: e.isTrusted }; };
+                w.postMessage('task');
+              </script></body></html>"#,
+        )
+        .await
+        .unwrap();
+
+        let out = pump_until(&ctx, "__ptJSON.stringify(__log)", 40).await;
+        let said = out.as_str().unwrap_or("");
+        assert!(said.contains(r#""done":true"#), "the worker answered: {said}");
+        assert!(said.contains("trusted=true"), "its message was trusted: {said}");
+        assert!(said.contains("origin=[]"), "with an empty origin: {said}");
+        assert!(said.contains("source=null"), "and no source: {said}");
+        assert!(said.contains("data=task"), "carrying what was sent: {said}");
+        assert!(said.contains("gate=true"), "so the collector's own gate opens: {said}");
+        assert!(said.contains(r#""replyTrusted":true"#), "and the answer home is trusted too: {said}");
     }
 
     /// `document.styleSheets` was a list of literals with an empty `cssRules`.

@@ -427,7 +427,11 @@ async fn main() -> Result<()> {
                           try { who = describe(r); } catch (e) {}
                           misses.push(who + '.' + p);
                           if (misses.length > 60) misses.shift();
-                          if (globalThis.__pt_streamHooks) { try { console.error('[m] ' + who + '.' + p); } catch (e) {} }
+                          // Индексы и `toJSON` — шум сериализации, десятки тысяч
+                          // строк за прогон; в кольце они остаются, в поток не идут.
+                          if (globalThis.__pt_streamHooks && !/^(-?\d+|toJSON)$/.test(p)) {
+                            try { console.error('[m] ' + who + '.' + p); } catch (e) {}
+                          }
                         }
                         return Reflect.get(t, p, r);
                       },

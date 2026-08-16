@@ -1451,6 +1451,11 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
       ev = {{ type: 'message', data, origin: '', lastEventId: '', source: null, ports: [] }};
     }}
     try {{ ev.target = globalThis; ev.currentTarget = globalThis; }} catch (e) {{}}
+    // Событие доставляет движок, а движок здесь — браузер: оно доверенное.
+    // Сборщик Cloudflare исполняет присланное задание только под условием
+    // `e.isTrusted && '' === e.origin && null === e.source`, и без первого
+    // из трёх воркер молча ничего не делал.
+    try {{ if (globalThis.__pt_trustEvent) __pt_trustEvent(ev); else ev.isTrusted = true; }} catch (e) {{}}
     // Одна доставка, а не две: `dispatchEvent` сам зовёт и слушателей, и
     // `onmessage`. Звать обоих — значит выполнить обработчик дважды, чего в
     // браузере не бывает и что ломает любой счётчик внутри воркера.
@@ -1703,6 +1708,47 @@ const WEB_BODIES_TEMPLATE: &str = r##"(() => {
     meth(C.prototype, 'toJSON', function () { return VAL.get(this); });
   }
 
+  let sinksInstalled = false;
+  const installTrustedSinks = () => {
+    if (sinksInstalled) return;
+    sinksInstalled = true;
+    try {
+      const realEval = globalThis.eval;
+      if (typeof realEval === 'function') {
+        const W = function eval(x) {
+          if (x !== null && typeof x === 'object' && isTrustedScript(x)) return realEval(String(x));
+          return realEval.apply(this, arguments);
+        };
+        try { Object.defineProperty(W, 'length', { value: 1, configurable: true }); } catch (e) {}
+        Object.defineProperty(globalThis, 'eval', {
+          value: native(W), writable: true, enumerable: false, configurable: true,
+        });
+      }
+    } catch (e) {}
+    // Те же ворота у отложенного исполнения строки: с Trusted Types туда кладут
+    // TrustedScript, и браузер его принимает.
+    for (const name of ['setTimeout', 'setInterval']) {
+      try {
+        const real = globalThis[name];
+        if (typeof real !== 'function') continue;
+        const W = function (handler) {
+          if (handler !== null && typeof handler === 'object' && isTrustedScript(handler)) {
+            const args = Array.prototype.slice.call(arguments);
+            args[0] = String(handler);
+            return real.apply(this, args);
+          }
+          return real.apply(this, arguments);
+        };
+        try { Object.defineProperty(W, 'name', { value: name, configurable: true }); } catch (e) {}
+        try { Object.defineProperty(W, 'length', { value: real.length, configurable: true }); } catch (e) {}
+        Object.defineProperty(globalThis, name, {
+          value: native(W), writable: true, enumerable: true, configurable: true,
+        });
+      } catch (e) {}
+    }
+  };
+
+  const isTrustedScript = (v) => { try { return v instanceof TrustedScript; } catch (e) { return false; } };
   const POL = new WeakMap();
   const TrustedTypePolicy = iface('TrustedTypePolicy');
   defg(TrustedTypePolicy.prototype, 'name', function () { const p = POL.get(this); return p ? p.name : ''; });
@@ -1728,6 +1774,11 @@ const WEB_BODIES_TEMPLATE: &str = r##"(() => {
     const p = Object.create(TrustedTypePolicy.prototype);
     POL.set(p, { name: String(name), rules: rules || {} });
     if (String(name) === 'default') defaultPolicy = p;
+    // Ворота для кода открываются только теперь: пока политики нет, ни один
+    // TrustedScript существовать не может, а `eval` остаётся тем самым
+    // интринсиком — со своей областью видимости у прямого вызова. Страница,
+    // которая Trusted Types не трогает, ничего не теряет.
+    installTrustedSinks();
     return p;
   });
   defg(TTF, 'emptyHTML', function () { return emptyHTML; });
@@ -1771,44 +1822,6 @@ const WEB_BODIES_TEMPLATE: &str = r##"(() => {
   // локальных имён (становится косвенным). Наши собственные скрипты страницы и
   // так выполняются через `(0, eval)`, а платформенное поведение с
   // TrustedScript важнее этого редкого случая.
-  try {
-    const realEval = globalThis.eval;
-    const TT = globalThis.trustedTypes;
-    if (typeof realEval === 'function' && TT) {
-      const W = function eval(x) {
-        if (x !== null && typeof x === 'object' && TT.isScript(x)) return realEval(String(x));
-        return realEval.apply(this, arguments);
-      };
-      try { Object.defineProperty(W, 'length', { value: 1, configurable: true }); } catch (e) {}
-      Object.defineProperty(globalThis, 'eval', {
-        value: native(W), writable: true, enumerable: false, configurable: true,
-      });
-    }
-  } catch (e) {}
-
-  // Те же ворота у отложенного исполнения строки: с Trusted Types туда кладут
-  // TrustedScript, и браузер его принимает.
-  for (const name of ['setTimeout', 'setInterval']) {
-    try {
-      const real = globalThis[name];
-      const TT = globalThis.trustedTypes;
-      if (typeof real !== 'function' || !TT) continue;
-      const W = function (handler) {
-        if (handler !== null && typeof handler === 'object' && TT.isScript(handler)) {
-          const args = Array.prototype.slice.call(arguments);
-          args[0] = String(handler);
-          return real.apply(this, args);
-        }
-        return real.apply(this, arguments);
-      };
-      try { Object.defineProperty(W, 'name', { value: name, configurable: true }); } catch (e) {}
-      try { Object.defineProperty(W, 'length', { value: real.length, configurable: true }); } catch (e) {}
-      Object.defineProperty(globalThis, name, {
-        value: native(W), writable: true, enumerable: true, configurable: true,
-      });
-    } catch (e) {}
-  }
-
   // ── navigator.* ──────────────────────────────────────────────────────────
   const nav = globalThis.navigator;
   if (nav) {
