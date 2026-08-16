@@ -494,7 +494,7 @@
       this.__ptTag = String(tag).toUpperCase();
       this.__ptLocal = String(tag).toLowerCase();
       this.__ptAttrs = new Map();
-      this.__ptStyle = makeStyle();
+      this.__ptStyle = makeStyle(this);
     }
     get nodeName() { return this.tagName; }
     get tagName() { return this.__ptTag; }
@@ -755,10 +755,15 @@
       }
       const id = __nextFrameId++;
       Object.defineProperty(this, '__ptFrameId', { value: id, configurable: true, enumerable: false });
+      // Размер элемента едет вместе с запросом: контекст кадра должен знать своё
+      // окно до того, как в нём выполнится первая строка. Спрашивать раскладку
+      // здесь нельзя — вставка идёт посреди разбора, и построенная в этот момент
+      // раскладка застынет недостроенной; берём заявленный размер.
+      const box = JSON.parse(globalThis.__pt_frameBoxOf ? __pt_frameBoxOf(this) : '[300,150]');
       const st = { el: this, ready: false, sameOrigin: false, win: null, doc: null, pending: [] };
       st.win = __frameWindow(id, st);
       __frames.set(id, st);
-      __frameOps.push({ op: 'open', id, src });
+      __frameOps.push({ op: 'open', id, src, w: box[0] || 300, h: box[1] || 150 });
     }
 
     // Shadow DOM. A widget that draws itself into a shadow root — Cloudflare's
@@ -1323,16 +1328,51 @@
   }
   const camel = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
   const dash = (s) => s.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
-  function makeStyle() {
-    const map = new Map();
+  // `el.style` и атрибут `style` — два вида на одно и то же. У нас это были два
+  // независимых хранилища: `setAttribute('style','width:300px')` не доходил до
+  // `el.style.width`, а `el.style.width = …` не доходил до атрибута. Отсюда же
+  // и кадр, который не знал своего размера: раскладка читает одно, страница
+  // пишет другое.
+  function makeStyle(el) {
+    let cachedText = null, cachedMap = new Map();
+    const read = () => {
+      const text = String((el && el.getAttribute && el.getAttribute('style')) || '');
+      if (text === cachedText) return cachedMap;
+      const m = new Map();
+      for (const part of text.split(';')) {
+        const i = part.indexOf(':');
+        if (i < 0) continue;
+        const k = part.slice(0, i).trim().toLowerCase();
+        const v = part.slice(i + 1).trim();
+        if (k) m.set(k, v);
+      }
+      cachedText = text; cachedMap = m;
+      return m;
+    };
+    const write = (m) => {
+      const text = [...m].map(([k, v]) => `${k}: ${v}`).join('; ');
+      cachedText = text; cachedMap = m;
+      if (el && el.setAttribute) el.setAttribute('style', text);
+      __markDirty();
+    };
     return new Proxy({
-      getPropertyValue: (p) => map.get(p) || '',
-      setProperty: (p, v) => { map.set(p, v); __markDirty(); },
-      removeProperty: (p) => { map.delete(p); __markDirty(); },
-      get cssText() { return [...map].map(([k, v]) => `${k}: ${v}`).join('; '); },
+      getPropertyValue: (p) => read().get(String(p).toLowerCase()) || '',
+      setProperty: (p, v) => { const m = read(); m.set(String(p).toLowerCase(), String(v)); write(m); },
+      removeProperty: (p) => { const m = read(); const had = m.get(String(p).toLowerCase()) || ''; m.delete(String(p).toLowerCase()); write(m); return had; },
+      get cssText() { return [...read()].map(([k, v]) => `${k}: ${v}`).join('; '); },
+      set cssText(v) { if (el && el.setAttribute) el.setAttribute('style', String(v)); cachedText = null; __markDirty(); },
+      get length() { return read().size; },
+      item: (i) => [...read().keys()][i] || '',
     }, {
-      get: (t, p) => p in t ? t[p] : (map.get(dash(String(p))) || ''),
-      set: (t, p, v) => { map.set(dash(String(p)), String(v)); __markDirty(); return true; },
+      get: (t, p) => {
+        if (typeof p === 'string' && !(p in t)) return read().get(dash(p)) || '';
+        const v = t[p];
+        return typeof v === 'function' ? v.bind(t) : v;
+      },
+      set: (t, p, v) => {
+        if (p === 'cssText') { t.cssText = v; return true; }
+        const m = read(); m.set(dash(String(p)), String(v)); write(m); return true;
+      },
     });
   }
 
@@ -1933,6 +1973,25 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // click-point computation, and (b) a reversible point→element mapping so an
   // Input mouse event at a computed coordinate hits the intended element.
   const LAYOUT = { W: 1280, H: 720, ROW: 20 };
+  // Окно кадра — это его собственный `<iframe>`, а не страница: у виджета
+  // Turnstile внутри 300×65, и он этот размер читает. Движок сообщает его сюда
+  // сразу после создания контекста.
+  globalThis.__pt_setViewport = (w, h) => {
+    w = Math.max(0, Math.round(Number(w) || 0));
+    h = Math.max(0, Math.round(Number(h) || 0));
+    if (!w || !h) return;
+    LAYOUT.W = w; LAYOUT.H = h;
+    for (const [name, value] of [['innerWidth', w], ['innerHeight', h]]) {
+      try {
+        const d = Object.getOwnPropertyDescriptor(globalThis, name);
+        Object.defineProperty(globalThis, name, {
+          value, writable: d ? d.writable !== false : true,
+          enumerable: d ? d.enumerable : true, configurable: true,
+        });
+      } catch (e) {}
+    }
+    __layoutBuilt = -1;   // пересчитать коробки под новый размер
+  };
   let __layoutSeq = 0;      // bumped on every DOM mutation
   let __layoutBuilt = -1;   // __layoutSeq the current boxes were built at
   let __rows = [];          // row index → element occupying it
@@ -2061,6 +2120,25 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   };
 
   globalThis.__pt_drainFrameQueue = () => __frameOps.splice(0);
+  // Коробка элемента кадра на момент запроса: при вставке раскладки ещё нет, а
+  // движок спрашивает уже после разбора документа.
+  globalThis.__pt_frameBoxOf = (el) => {
+    // Заданный размер важнее посчитанного: у виджета он стоит в стиле или в
+    // атрибутах, а раскладка к моменту вопроса может быть ещё прошлой.
+    const px = (v) => { const n = parseFloat(v); return Number.isFinite(n) && n > 0 ? Math.round(n) : 0; };
+    let w = 0, h = 0;
+    try { w = px(el.style && el.style.width) || px(el.getAttribute('width')); } catch (e) {}
+    try { h = px(el.style && el.style.height) || px(el.getAttribute('height')); } catch (e) {}
+    // Только заявленный размер: спросить раскладку значит построить её прямо
+    // сейчас, посреди загрузки, и заморозить в недостроенном виде — страница
+    // потом получала нулевые коробки. Не заявлен — размер по умолчанию, как у
+    // браузера для кадра без размеров.
+    return JSON.stringify([w || 300, h || 150]);
+  };
+  globalThis.__pt_frameBox = (id) => {
+    const st = __frames.get(id);
+    return st && st.el ? __pt_frameBoxOf(st.el) : '[300,150]';
+  };
 
   // --- dynamically inserted <script src> -----------------------------------
   // The element cannot fetch; the engine can. Each insertion becomes an op the

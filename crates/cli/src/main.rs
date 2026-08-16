@@ -411,6 +411,28 @@ async fn main() -> Result<()> {
             {
                 dump(format!("worker {url}"), v);
             }
+            // Что виджет в итоге нарисовал: интерактивный контрол — то, чего
+            // движок ждёт от него, и его отсутствие видно только так.
+            for f in ctx.frame_list() {
+                if let Ok(serde_json::Value::String(t)) = ctx
+                    .evaluate_in_frame(
+                        f.id,
+                        "(() => { const seen = []; const walk = (root) => {                            for (const el of root.querySelectorAll('*')) {                              const tag = el.localName;                              if (tag === 'input' || tag === 'button' || el.getAttribute('role'))                                seen.push(tag + (el.type ? '[' + el.type + ']' : '') +                                          (el.getAttribute('role') ? '{' + el.getAttribute('role') + '}' : ''));                              if (el.shadowRoot) walk(el.shadowRoot); } };                          try { walk(document); } catch (e) {}                          return JSON.stringify({controls: seen.slice(0, 12), \
+                           body: !!document.body, \
+                           bodyKids: document.body ? document.body.childNodes.length : -1, \
+                           iframes: document.getElementsByTagName('iframe').length, \
+                           shadows: Array.prototype.filter.call(document.querySelectorAll('*'), (e) => e.shadowRoot).length, \
+                           htmlLen: (document.documentElement ? document.documentElement.outerHTML : '').length, \
+                           view: [innerWidth, innerHeight, document.documentElement.clientWidth, document.documentElement.clientHeight], \
+                           vis: [document.visibilityState, document.hidden, document.readyState], \
+                           box: (() => { const b = document.body.getBoundingClientRect(); return [b.width, b.height]; })(), \
+                           text: (document.body ? document.body.textContent : '').trim().slice(0, 60)}); })()",
+                    )
+                    .await
+                {
+                    eprintln!("# widget frame {}: {t}", f.id);
+                }
+            }
             // Ключи челленджа этого прогона: без них ответ сервера не расшифровать
             // задним числом (ключ выводится из ray самого виджета).
             for f in ctx.frame_list() {

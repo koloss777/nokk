@@ -801,6 +801,11 @@ struct FrameState {
     index: usize,
     url: String,
     origin: String,
+    /// The viewport last handed to the child. A frame's window is the size of
+    /// its `<iframe>`, and the element gets its size from styles that are not
+    /// applied yet when the frame is first connected — so it is re-checked as
+    /// the page settles, the way a browser resizes a frame that changed.
+    viewport: (f64, f64),
 }
 
 /// A live worker: its own V8 context on the page's worker thread, and the URL its
@@ -2032,6 +2037,29 @@ impl BrowserContext {
                     let _ = self
                         .eval_in(index, &format!("__pt_markAsFrame({id});"))
                         .await;
+                    // И своё окно: у кадра оно размером с его `<iframe>`, а не со
+                    // страницей. Виджет Turnstile живёт в 300×65 и этот размер
+                    // читает; наши кадры отвечали размером окна страницы.
+                    let (mut fw, mut fh) = (
+                        op["w"].as_f64().unwrap_or(300.0),
+                        op["h"].as_f64().unwrap_or(150.0),
+                    );
+                    // Элемент мог получить размер уже после вставки (стили
+                    // разбираются позже) — спрашиваем родителя ещё раз, сейчас.
+                    let raw = self.eval_in(self.index, &format!("__pt_frameBox({id})")).await;
+                    tracing::debug!(?raw, "frame box from parent");
+                    if let Ok(Value::String(box_)) = raw {
+                        if let Ok(v) = serde_json::from_str::<Vec<f64>>(&box_) {
+                            if v.len() == 2 && v[0] > 0.0 && v[1] > 0.0 {
+                                fw = v[0];
+                                fh = v[1];
+                            }
+                        }
+                    }
+                    tracing::debug!(frame = id, w = fw, h = fh, "frame viewport");
+                    let _ = self
+                        .eval_in(index, &format!("__pt_setViewport({fw}, {fh});"))
+                        .await;
                     // Init scripts run before the frame's document, as they do for
                     // a page — that is how a client instruments a frame at all,
                     // since a frame's own scripts run the moment it is built.
@@ -2053,6 +2081,7 @@ impl BrowserContext {
                                 index,
                                 url: url.clone(),
                                 origin: origin.clone(),
+                                viewport: (fw, fh),
                             },
                         );
                     }
@@ -2305,6 +2334,37 @@ impl BrowserContext {
             };
             let base = self.frame_base(id);
             self.log_console(&format!("frame {id}"), &queues);
+
+            // Кадр узнаёт свой размер не один раз: стили доезжают позже вставки,
+            // и элемент может измениться. Браузер в этом случае меняет окно
+            // кадра — делаем то же, пока размер не устоится.
+            if let Ok(Value::String(text)) = self
+                .eval_in(self.index, &format!("__pt_frameBox({id})"))
+                .await
+            {
+                if let Ok(v) = serde_json::from_str::<Vec<f64>>(&text) {
+                    if v.len() == 2 && v[0] > 0.0 && v[1] > 0.0 {
+                        let changed = self
+                            .frames
+                            .lock()
+                            .ok()
+                            .and_then(|mut f| {
+                                f.get_mut(&id).map(|st| {
+                                    let now = (v[0], v[1]);
+                                    let changed = st.viewport != now;
+                                    st.viewport = now;
+                                    changed
+                                })
+                            })
+                            .unwrap_or(false);
+                        if changed {
+                            let _ = self
+                                .eval_in(index, &format!("__pt_setViewport({}, {});", v[0], v[1]))
+                                .await;
+                        }
+                    }
+                }
+            }
 
             // A frame is a document like any other: its `fetch`/XHR has to reach
             // the network, resolved against *its* URL. Draining this queue and
