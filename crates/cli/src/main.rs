@@ -458,6 +458,18 @@ async fn main() -> Result<()> {
                     if (recent.length > 24) recent.shift();
                     if (stream) { try { console.error('[t] ' + String(s).slice(0, 150)); } catch (e) {} }
                   };
+                  // Разговор с воркером сбора: кто кому и что послал.
+                  try {
+                    const WP = Worker.prototype.postMessage;
+                    Worker.prototype.postMessage = function (data) {
+                      let d = '?';
+                      try { d = typeof data === 'string' ? 'str' + data.length : Object.prototype.toString.call(data); } catch (e) {}
+                      remember('worker.postMessage ' + d);
+                      return WP.apply(this, arguments);
+                    };
+                    const WA = Worker.prototype.addEventListener;
+                    Worker.prototype.addEventListener = function (t) { remember('worker.on ' + t); return WA.apply(this, arguments); };
+                  } catch (e) {}
                   globalThis.__pt_recent = () => recent.join(' → ');
                   // Вторая стадия сбора у них ставится таймером и молчит, если
                   // внутри что-то бросило: браузер такое печатает, мы — нет.
