@@ -385,6 +385,70 @@ async fn main() -> Result<()> {
                   // Что VM успела потрогать перед броском. Стек внутри их
                   // интерпретатора ничего не говорит: там один диспетчер опкодов,
                   // а вот последние обращения к хостовым таблицам — говорят.
+                  // Каждое чтение свойства, которого нет: их интерпретатор
+                  // падает на `fn.call(obj, …)`, где fn — метод, взятый с
+                  // хостового объекта, и имя этого метода больше взять негде.
+                  // Дно цепочки прототипов — единственное место, где промах
+                  // виден: ставим туда Proxy и записываем, что спросили.
+                  // Снимок глобалей до первого скрипта: всё сверх него объявил
+                  // сам челлендж, и сравнение с Chrome показывает, чья ступень
+                  // у нас не отработала.
+                  let baseGlobals = [];
+                  try { baseGlobals = Object.getOwnPropertyNames(globalThis); } catch (e) {}
+                  const addedGlobals = () => {
+                    try {
+                      const b = new Set(baseGlobals);
+                      return Object.getOwnPropertyNames(globalThis)
+                        .filter((n) => !b.has(n) && n.lastIndexOf('__pt', 0) !== 0)
+                        .map((n) => { let t = '?'; try { t = typeof globalThis[n]; } catch (e) {} return n + ':' + t; })
+                        .join(' ');
+                    } catch (e) { return '(failed)'; }
+                  };
+                  const misses = [];
+                  try {
+                    const toStr = Object.prototype.toString;
+                    const describe = (r) => {
+                      if (r === globalThis) return 'window';
+                      if (r === document) return 'document';
+                      const t = toStr.call(r).slice(8, -1);
+                      let extra = '';
+                      try {
+                        if (r && ('nodeType' in r) && r.nodeType === 1) extra = '<' + String(r.localName) + (r.id ? '#' + r.id : '') + '>';
+                      } catch (e) {}
+                      return t + extra;
+                    };
+                    // Object.prototype неизменяем, поэтому ловушку ставим
+                    // ступенью выше — между корневым интерфейсом и им.
+                    const sink = () => new Proxy(Object.prototype, {
+                      get(t, p, r) {
+                        if (typeof p === 'string' && !(p in t) && p.lastIndexOf('__pt', 0) !== 0) {
+                          let who = '?';
+                          try { who = describe(r); } catch (e) {}
+                          misses.push(who + '.' + p);
+                          if (misses.length > 60) misses.shift();
+                        }
+                        return Reflect.get(t, p, r);
+                      },
+                    });
+                    let hooked = 0;
+    for (const name of ['EventTarget', 'Navigator', 'Screen', 'Location', 'History',
+                                        'Performance', 'Crypto', 'Storage', 'CSSStyleDeclaration',
+                                        'DOMTokenList', 'NodeList', 'HTMLCollection', 'NamedNodeMap',
+                                        'PerformanceEntry', 'MessagePort', 'Event', 'URL',
+                                        'Function', 'Array', 'String', 'Number', 'Boolean', 'Symbol',
+                                        'Error', 'Date', 'RegExp', 'Map', 'Set', 'WeakMap', 'WeakSet',
+                                        'Promise', 'ArrayBuffer', 'DataView', 'Uint8Array', 'Blob',
+                                        'Worker', 'MessageEvent', 'XMLHttpRequest', 'Response', 'Headers']) {
+                      const C = globalThis[name], proto = C && C.prototype;
+                      if (proto && Object.getPrototypeOf(proto) === Object.prototype) {
+                        Object.setPrototypeOf(proto, sink());
+                        hooked++;
+                      }
+                    }
+                    void document.__pt_sinkSelfTest;
+                    console.error('[vm] miss-sink on ' + hooked + ' roots, self-test ' + (misses.length > 0));
+                    misses.length = 0;
+                  } catch (e) { console.error('[vm] miss-sink failed: ' + e); }
                   const recent = [];
                   const remember = (s) => { recent.push(s); if (recent.length > 24) recent.shift(); };
                   globalThis.__pt_recent = () => recent.join(' → ');
@@ -455,6 +519,18 @@ async fn main() -> Result<()> {
                               console.error('[vm] threw after ' + (Date.now() - t1) + 'ms: ' +
                                             String((e && e.stack) || e).split('\n').join(' | '));
                               try { console.error('[vm] before the throw: ' + recent.join(' → ')); } catch (e2) {}
+                              try {
+                                const g = addedGlobals();
+                                for (let i = 0; i < g.length; i += 220) {
+                                  console.error('[vm] globals ' + i + ': ' + g.slice(i, i + 220));
+                                }
+                              } catch (e2) {}
+                              try {
+                                const tail = misses.slice(-24);
+                                for (let i = 0; i < tail.length; i += 6) {
+                                  console.error('[vm] missed reads ' + i + ': ' + tail.slice(i, i + 6).join(' '));
+                                }
+                              } catch (e2) {}
                               throw e;
                             }
                           };

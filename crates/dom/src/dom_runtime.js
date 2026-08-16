@@ -671,6 +671,20 @@
       if (this.__ptConnectFrame) this.__ptConnectFrame();
       if (this.__ptRunScript) this.__ptRunScript();
     }
+    // `script.text` — тот же текст, что и textContent, и присвоение ему
+    // запускает скрипт. Мы его молча проглатывали: у нас это было обычное
+    // свойство, а `s.text = <исходник>; head.appendChild(s)` — как раз то, чем
+    // челлендж объявляет свои функции верхнего уровня. Одна такая пропажа
+    // роняла его интерпретатор на вызове несуществующей глобали.
+    get text() {
+      const t = this.tagName;
+      if (t === 'SCRIPT' || t === 'TITLE' || t === 'OPTION' || t === 'A') return this.textContent || '';
+      return this.getAttribute('text');
+    }
+    set text(v) {
+      this.textContent = String(v);
+      if (this.__ptLocal === 'script' && this.isConnected && this.__ptRunScript) this.__ptRunScript();
+    }
     // `srcdoc` — документ, написанный прямо в атрибуте: у него нет адреса, и
     // отражается он как есть. Присвоение после вставки в документ означает
     // новый документ в этом окне, как навигация.
