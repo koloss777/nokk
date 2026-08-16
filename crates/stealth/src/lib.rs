@@ -1060,6 +1060,9 @@ pub fn probe_tracer_script() -> String {
     .sort((a, b) => b[1].n - a[1].n)
     .map(([k, v]) => [k, v.n, v.last]));
   globalThis.__pt_probeTail = (n) => __ptJSON.stringify(tail.slice(-(n || 60)));
+  // Метка в самой ленте: без неё непонятно, где начинается и где обрывается
+  // чужая программа, а сравнивать надо именно её отрезок.
+  globalThis.__pt_probeMark = (text) => { note('== ' + text, ''); };
   globalThis.__pt_probeHead = (n) => __ptJSON.stringify(head.slice(0, n || 40000));
 
   const native = globalThis.__pt_native || ((f) => f);
@@ -1743,6 +1746,56 @@ const WEB_BODIES_TEMPLATE: &str = r##"(() => {
       value: Object.create(TTF), writable: true, enumerable: true, configurable: true,
     });
   } catch (e) {}
+
+  // Trusted Types и eval: `eval(trustedScript)` браузер исполняет, а голый
+  // движок — нет. По спецификации PerformEval возвращает аргумент нетронутым,
+  // если это не примитивная строка, — молча, без ошибки. Именно так виджет
+  // Turnstile объявляет свой XOR-хелпер: политика делает TrustedScript, он идёт
+  // в eval, в Chrome появляется глобальная функция, а у нас не появлялось
+  // ничего, и следующая же строка их интерпретатора падала на вызове undefined.
+  //
+  // Цена обёртки известна и принята: `eval` перестаёт быть тем самым
+  // интринсиком, поэтому прямой eval внутри функции больше не видит её
+  // локальных имён (становится косвенным). Наши собственные скрипты страницы и
+  // так выполняются через `(0, eval)`, а платформенное поведение с
+  // TrustedScript важнее этого редкого случая.
+  try {
+    const realEval = globalThis.eval;
+    const TT = globalThis.trustedTypes;
+    if (typeof realEval === 'function' && TT) {
+      const W = function eval(x) {
+        if (x !== null && typeof x === 'object' && TT.isScript(x)) return realEval(String(x));
+        return realEval.apply(this, arguments);
+      };
+      try { Object.defineProperty(W, 'length', { value: 1, configurable: true }); } catch (e) {}
+      Object.defineProperty(globalThis, 'eval', {
+        value: native(W), writable: true, enumerable: false, configurable: true,
+      });
+    }
+  } catch (e) {}
+
+  // Те же ворота у отложенного исполнения строки: с Trusted Types туда кладут
+  // TrustedScript, и браузер его принимает.
+  for (const name of ['setTimeout', 'setInterval']) {
+    try {
+      const real = globalThis[name];
+      const TT = globalThis.trustedTypes;
+      if (typeof real !== 'function' || !TT) continue;
+      const W = function (handler) {
+        if (handler !== null && typeof handler === 'object' && TT.isScript(handler)) {
+          const args = Array.prototype.slice.call(arguments);
+          args[0] = String(handler);
+          return real.apply(this, args);
+        }
+        return real.apply(this, arguments);
+      };
+      try { Object.defineProperty(W, 'name', { value: name, configurable: true }); } catch (e) {}
+      try { Object.defineProperty(W, 'length', { value: real.length, configurable: true }); } catch (e) {}
+      Object.defineProperty(globalThis, name, {
+        value: native(W), writable: true, enumerable: true, configurable: true,
+      });
+    } catch (e) {}
+  }
 
   // ── navigator.* ──────────────────────────────────────────────────────────
   const nav = globalThis.navigator;

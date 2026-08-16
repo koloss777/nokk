@@ -6045,6 +6045,48 @@ mod tests {
         assert_eq!(out["worker"], "started", "the worker takes the trusted url");
     }
 
+    /// `eval(trustedScript)` is a browser behaviour, not a JavaScript one: the
+    /// language returns a non-string argument untouched — silently, no error —
+    /// and Trusted Types is what makes the browser stringify and run it. The
+    /// Turnstile widget declares its XOR helper exactly this way, and with the
+    /// declaration missing the next line of its interpreter called `undefined`.
+    #[tokio::test]
+    async fn a_trusted_script_is_code_to_eval_and_to_a_timer() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const p = trustedTypes.createPolicy('nokk-eval', { createScript: (s) => s });
+            const code = p.createScript('function __declared(){ return 42 }');
+            eval(code);
+            let timer = 'no';
+            try { setTimeout(p.createScript('globalThis.__fromTimer = 1'), 0); timer = 'accepted'; }
+            catch (e) { timer = 'THREW ' + e.name; }
+            return __ptJSON.stringify({
+              kind: Object.prototype.toString.call(code),
+              declared: typeof globalThis.__declared,
+              value: typeof globalThis.__declared === 'function' ? __declared() : null,
+              // Строка остаётся строкой: обычный eval работает как работал.
+              plain: (eval('1 + 1')),
+              native: /native code/.test(Function.prototype.toString.call(eval)),
+              enumerable: Object.keys(globalThis).indexOf('eval') >= 0,
+              timer,
+            });
+        })()"#).await;
+
+        assert_eq!(out["kind"], "[object TrustedScript]");
+        assert_eq!(out["declared"], "function", "the declaration reached the global scope");
+        assert_eq!(out["value"], 42);
+        assert_eq!(out["plain"], 2, "a plain string still evaluates");
+        assert_eq!(out["native"], true, "and eval still reads as the browser's own");
+        assert_eq!(out["enumerable"], false);
+        assert_eq!(out["timer"], "accepted");
+    }
+
     /// Names without bodies: the graph table gave `navigator.gpu` and its
     /// neighbours the right names and left them as `{}`, so the first call threw
     /// and the prototype chain a collector walks was empty where Chrome has an
@@ -6096,6 +6138,39 @@ mod tests {
         assert_eq!(out["layout"], serde_json::json!(["[object KeyboardLayoutMap]", 48, "q"]));
         assert_eq!(out["decoding"], true);
         assert_eq!(out["highEntropy"], "x86");
+    }
+
+    /// `about:blank` is not an address a browser fetches: it is the same initial
+    /// empty document a src-less frame gets, and its realm is ready the moment
+    /// the frame is in the document. We treated it as a URL, so
+    /// `f.src = 'about:blank'; body.appendChild(f); f.contentWindow.eval(…)` —
+    /// the ordinary way to reach untouched built-ins — found no window at all.
+    #[tokio::test]
+    async fn an_about_blank_frame_has_its_realm_at_once() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const f = document.createElement('iframe');
+            f.src = 'about:blank';
+            document.body.appendChild(f);
+            const w = f.contentWindow;
+            return __ptJSON.stringify({
+              window: typeof w,
+              document: typeof f.contentDocument,
+              eval: w ? String(w.eval('2 + 2')) : 'no window',
+              parentIsUs: w ? w.parent === window : false,
+            });
+        })()"#).await;
+
+        assert_eq!(out["window"], "object");
+        assert_eq!(out["document"], "object");
+        assert_eq!(out["eval"], "4", "the realm answers straight away");
+        assert_eq!(out["parentIsUs"], true);
     }
 
     /// `const u = URL.createObjectURL(b); new Worker(u); URL.revokeObjectURL(u)`

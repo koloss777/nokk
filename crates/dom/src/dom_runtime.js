@@ -525,7 +525,13 @@
     set adoptedStyleSheets(v) { this.__ptAdopted = v; }
     getElementById(id) { return firstMatch(this, e => e.id === id); }
     getElementsByTagName(t) { return __collection(__tags(this, t)); }
-    getElementsByClassName(c) { const cs = String(c).split(/\s+/).filter(Boolean); return __collection(collect(this, e => cs.every(x => e.classList.contains(x)))); }
+    getElementsByClassName(c) {
+      const cs = String(c).split(/\s+/).filter(Boolean);
+      return __collection(collect(this, (e) => {
+        const own = (e.__ptAttrs.get('class') || '').split(/\s+/);
+        return cs.every((x) => own.indexOf(x) >= 0);
+      }));
+    }
     querySelector(sel) { return query(this, sel)[0] || null; }
     querySelectorAll(sel) { return __staticNodeList(query(this, sel)); }
     append(...ns) { for (const n of ns) this.appendChild(typeof n === 'string' ? new Text(n) : n); }
@@ -781,7 +787,13 @@
     // Queries (scoped to this subtree)
     getElementById(id) { return firstMatch(this, e => e.id === id); }
     getElementsByTagName(t) { return __collection(__tags(this, t)); }
-    getElementsByClassName(c) { const cs = String(c).split(/\s+/).filter(Boolean); return __collection(collect(this, e => cs.every(x => e.classList.contains(x)))); }
+    getElementsByClassName(c) {
+      const cs = String(c).split(/\s+/).filter(Boolean);
+      return __collection(collect(this, (e) => {
+        const own = (e.__ptAttrs.get('class') || '').split(/\s+/);
+        return cs.every((x) => own.indexOf(x) >= 0);
+      }));
+    }
     querySelector(sel) { return query(this, sel)[0] || null; }
     querySelectorAll(sel) { return __staticNodeList(query(this, sel)); }
     closest(sel) { for (let e = this; e; e = e.parentNode) if (e.nodeType === ELEMENT_NODE && matchesSelector(e, sel)) return e; return null; }
@@ -882,10 +894,16 @@
     __ptConnectFrame() {
       if (this.__ptFrameId || this.__ptLocal !== 'iframe') return;
       const src = this.getAttribute('src');
-      if (!src) {
+      // `about:blank` — не адрес, за которым идут в сеть: у браузера это тот же
+      // начальный пустой документ, что и у кадра без src, и реалм в нём готов
+      // сразу. Отличать их — значит ронять `f.src='about:blank';
+      // body.appendChild(f); f.contentWindow.eval(…)`, а это штатный способ
+      // взять нетронутые встроенные функции, которым челленджи и пользуются.
+      const blank = !src || /^about:blank(\?|#|$)/.test(src.trim());
+      if (blank) {
         // Кадр с `srcdoc` грузится сам, как только попал в документ, — ждать,
         // пока кто-нибудь прочитает `contentWindow`, браузер не заставляет.
-        if (this.getAttribute('srcdoc') !== null) { try { this.__ptRealmWindow(); } catch (e) {} }
+        if (src || this.getAttribute('srcdoc') !== null) { try { this.__ptRealmWindow(); } catch (e) {} }
         return;
       }
       const id = __nextFrameId++;
@@ -1538,8 +1556,11 @@
   // Внутри движка нужен массив (concat/filter), наружу — коллекция.
   function __docTags(doc, t) { return doc.documentElement ? __tags(doc.documentElement, t) : []; }
   function __tags(root, t) {
-    const tag = String(t).toUpperCase();
-    return collect(root, (e) => t === '*' || e.tagName === tag);
+    // По внутреннему имени, не через `tagName`: свой обход не должен ходить
+    // через акцессоры, которые страница видит (и может подменить), — иначе
+    // один `document.body` оставляет в её ленте десяток чужих чтений.
+    const local = String(t).toLowerCase();
+    return collect(root, (e) => t === '*' || e.__ptLocal === local);
   }
   function collect(root, pred) {
     const out = []; walk(root, e => { if (pred(e)) out.push(e); });

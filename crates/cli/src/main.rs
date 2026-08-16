@@ -511,14 +511,32 @@ async fn main() -> Result<()> {
                           if (typeof fn !== 'function') return fn;
                           return function () {
                             const t1 = Date.now();
+                            try { globalThis.__pt_probeMark && __pt_probeMark('program start ' + ((src && src.length) || 0)); } catch (e) {}
                             try {
                               const out = fn.apply(this, arguments);
+                              try { globalThis.__pt_probeMark && __pt_probeMark('program end'); } catch (e) {}
                               console.error('[vm] ran ' + (Date.now() - t1) + 'ms → ' + typeof out);
                               return out;
                             } catch (e) {
+                              try { globalThis.__pt_probeMark && __pt_probeMark('program threw'); } catch (e2) {}
                               console.error('[vm] threw after ' + (Date.now() - t1) + 'ms: ' +
                                             String((e && e.stack) || e).split('\n').join(' | '));
-                              try { console.error('[vm] before the throw: ' + recent.join(' → ')); } catch (e2) {}
+                              try {
+                                const line = recent.join(' → ');
+                                for (let i = 0; i < line.length; i += 200) {
+                                  console.error('[vm] before ' + i + ': ' + line.slice(i, i + 200));
+                                }
+                              } catch (e2) {}
+                              try {
+                                const ss = document.scripts;
+                                let sizes = [];
+                                for (let i = 0; i < ss.length; i++) {
+                                  sizes.push((ss[i].src ? 'src:' + String(ss[i].src).slice(-24) : 'inline') +
+                                             '=' + String(ss[i].text || '').length);
+                                }
+                                console.error('[vm] scripts: ' + sizes.join(' ') +
+                                              ' | doc ' + document.documentElement.outerHTML.length);
+                              } catch (e2) {}
                               try {
                                 const g = addedGlobals();
                                 for (let i = 0; i < g.length; i += 220) {
