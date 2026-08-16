@@ -342,6 +342,23 @@ async fn main() -> Result<()> {
                     };
                   } catch (e) {}
                   try {
+                    // Их сериализация не идёт через JSON — но строка где-то
+                    // собирается: из массива, конкатенацией или из кодов.
+                    let seen = 0;
+                    const J = Array.prototype.join;
+                    Array.prototype.join = function (sep) {
+                      const out = J.apply(this, arguments);
+                      if (typeof out === 'string' && out.length > 1500 && seen++ < 3) {
+                        try { console.error('[join ' + out.length + '] ' + out.slice(0, 700)); } catch (e) {}
+                      }
+                      return out;
+                    };
+                    const FCC = String.fromCharCode;
+                    let fccBuf = 0;
+                    String.fromCharCode = function () { fccBuf += arguments.length; return FCC.apply(this, arguments); };
+                    globalThis.__pt_fccCount = () => fccBuf;
+                  } catch (e) {}
+                  try {
                     let n = 0, biggest = '';
                     const S = JSON.stringify;
                     JSON.stringify = function (v) {
