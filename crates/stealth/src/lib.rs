@@ -551,6 +551,15 @@ fn fast_timers() -> bool {
 /// [`bootstrap_script`]. Kept as a raw string so the JS reads naturally without
 /// brace-escaping.
 const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
+  // Снимок JSON, снятый до единой строки страницы: движок сериализует свои
+  // очереди сам, и через `JSON.stringify` страницы делать это нельзя — страница,
+  // подменив его, увидела бы внутренности эмулятора. Имя `__pt`-скрыто.
+  if (!globalThis.__ptJSON) {
+    Object.defineProperty(globalThis, "__ptJSON", {
+      value: { stringify: JSON.stringify, parse: JSON.parse },
+      enumerable: false, configurable: true, writable: true,
+    });
+  }
   const win = globalThis;
 
   // Host objects the Chrome way: their properties live on a constructor's
@@ -684,7 +693,7 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
     try {
       if (typeof v === 'string') return v;
       if (v instanceof Error) return String(v.stack || v.message || v);
-      if (typeof v === 'object' && v !== null) { try { return JSON.stringify(v); } catch (e) { return String(v); } }
+      if (typeof v === 'object' && v !== null) { try { return __ptJSON.stringify(v); } catch (e) { return String(v); } }
       return String(v);
     } catch (e) { return '?'; }
   };
@@ -1047,11 +1056,11 @@ pub fn probe_tracer_script() -> String {
     tail.push([Date.now() - t0, name, e.last]);
     return v;
   };
-  globalThis.__pt_probeLog = () => JSON.stringify([...log]
+  globalThis.__pt_probeLog = () => __ptJSON.stringify([...log]
     .sort((a, b) => b[1].n - a[1].n)
     .map(([k, v]) => [k, v.n, v.last]));
-  globalThis.__pt_probeTail = (n) => JSON.stringify(tail.slice(-(n || 60)));
-  globalThis.__pt_probeHead = (n) => JSON.stringify(head.slice(0, n || 6000));
+  globalThis.__pt_probeTail = (n) => __ptJSON.stringify(tail.slice(-(n || 60)));
+  globalThis.__pt_probeHead = (n) => __ptJSON.stringify(head.slice(0, n || 6000));
 
   const native = globalThis.__pt_native || ((f) => f);
   const rename = (f, name) => {
@@ -1403,12 +1412,12 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
   const outbox = [];
   globalThis.__pt_drainWorkerOut = () => outbox.splice(0);
   globalThis.postMessage = native(function postMessage(data) {{
-    try {{ outbox.push(JSON.stringify(data === undefined ? null : data)); }} catch (e) {{ outbox.push('null'); }}
+    try {{ outbox.push(__ptJSON.stringify(data === undefined ? null : data)); }} catch (e) {{ outbox.push('null'); }}
   }});
   globalThis.close = native(function close() {{ globalThis.__ptClosed = true; }});
   globalThis.__pt_workerDeliver = (json) => {{
     let data = null;
-    try {{ data = JSON.parse(json); }} catch (e) {{}}
+    try {{ data = __ptJSON.parse(json); }} catch (e) {{}}
     // У выделенного воркера `origin` пустой, а `source` — null: сообщение
     // пришло по порту, а не от окна.
     let ev;
@@ -1739,7 +1748,7 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   globalThis.__pt_noteResources = (json) => {
     let list;
     const fresh = [];
-    try { list = JSON.parse(json); } catch (e) { return 0; }
+    try { list = __ptJSON.parse(json); } catch (e) { return 0; }
     for (const r of list) {
       const Ctor = r.entryType === 'navigation' ? PerformanceNavigationTiming : PerformanceResourceTiming;
       const e = new Ctor();
@@ -2102,7 +2111,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
   };
 
   // Rust hooks -------------------------------------------------------------
-  globalThis.__pt_drainFetchQueue = () => { const q = queue.splice(0); return JSON.stringify(q); };
+  globalThis.__pt_drainFetchQueue = () => { const q = queue.splice(0); return __ptJSON.stringify(q); };
   globalThis.__pt_pendingFetches = () => pending.size;
 
   globalThis.__pt_fetchResolve = (id, status, statusText, headers, body, finalUrl) => {
@@ -2119,7 +2128,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         keys: () => Object.keys(lower),
       },
       text() { this.bodyUsed = true; return Promise.resolve(this._body); },
-      json() { this.bodyUsed = true; return Promise.resolve(JSON.parse(this._body)); },
+      json() { this.bodyUsed = true; return Promise.resolve(__ptJSON.parse(this._body)); },
       arrayBuffer() { this.bodyUsed = true; return Promise.resolve(new TextEncoder().encode(this._body).buffer); },
       clone() { return Object.assign({}, this); },
     };
@@ -2210,7 +2219,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
           r.headers.forEach((v, k) => { this._respHeaders[k] = v; });
           this._set(2); this._set(3);
           this.responseText = await r.text();
-          try { this.response = this.responseType === 'json' ? JSON.parse(this.responseText || 'null') : this.responseText; }
+          try { this.response = this.responseType === 'json' ? __ptJSON.parse(this.responseText || 'null') : this.responseText; }
           catch (e) { this.response = null; }
           this._set(4);
           this._fire('progress', { lengthComputable: true, loaded: this.responseText.length, total: this.responseText.length });
@@ -2462,7 +2471,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         Object.defineProperty(this, '__body', { value: body == null ? '' : body, enumerable: false });
       }
       static error() { const r = new globalThis.Response(null, { status: 0 }); r.type = 'error'; return r; }
-      static json(data, init) { return new globalThis.Response(JSON.stringify(data), init); }
+      static json(data, init) { return new globalThis.Response(__ptJSON.stringify(data), init); }
       clone() { return new globalThis.Response(this.__body, { status: this.status, statusText: this.statusText, headers: this.headers }); }
       text() { this.bodyUsed = true; return Promise.resolve(String(this.__body)); }
       json() { return this.text().then(JSON.parse); }

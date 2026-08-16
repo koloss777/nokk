@@ -1702,7 +1702,7 @@ impl BrowserContext {
                                 index,
                                 &format!(
                                     "(() => {{ const m = globalThis.__pt_blobs; const b = m && m.get({}); \
-                                       return JSON.stringify({{ known: !!b, blobs: m ? m.size : -1, \
+                                       return __ptJSON.stringify({{ known: !!b, blobs: m ? m.size : -1, \
                                          kind: b && b.constructor && b.constructor.name, \
                                          size: b && b.size }}); }})()",
                                     js_str(raw)
@@ -1836,7 +1836,7 @@ impl BrowserContext {
             let out = self
                 .eval_in(
                     child,
-                    "JSON.stringify({out: __pt_drainWorkerOut(), closed: !!globalThis.__ptClosed})",
+                    "__ptJSON.stringify({out: __pt_drainWorkerOut(), closed: !!globalThis.__ptClosed})",
                 )
                 .await?;
             let drained: Value = out
@@ -2825,8 +2825,8 @@ static REQUEST_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// One round trip that empties both JS-side I/O queues. Written as an expression
 /// so a bare context (no stealth bootstrap, as in some tests) answers with empty
 /// queues instead of throwing.
-const DRAIN_IO: &str = "JSON.stringify({\
-    fetch: typeof __pt_drainFetchQueue === 'function' ? JSON.parse(__pt_drainFetchQueue()) : [],\
+const DRAIN_IO: &str = "__ptJSON.stringify({\
+    fetch: typeof __pt_drainFetchQueue === 'function' ? __ptJSON.parse(__pt_drainFetchQueue()) : [],\
     ws: typeof __pt_drainWsQueue === 'function' ? __pt_drainWsQueue() : [],\
     frames: typeof __pt_drainFrameQueue === 'function' ? __pt_drainFrameQueue() : [],\
     scripts: typeof __pt_drainScriptQueue === 'function' ? __pt_drainScriptQueue() : [],\
@@ -3279,7 +3279,7 @@ mod tests {
         let out = probe(&ctx, r#"(() => {
             const walk = (o) => { const n = []; for (; o; o = Object.getPrototypeOf(o)) n.push(...Object.keys(o)); return n; };
             const kids = document.body.childNodes;
-            return JSON.stringify({
+            return __ptJSON.stringify({
               // NodeList, not Array: the collector buckets an array under its own
               // category, and `Array.isArray(node.childNodes)` is false on the platform.
               kidsArray: Array.isArray(kids),
@@ -3369,7 +3369,7 @@ mod tests {
 
         let p = probe(
             &ctx,
-            r#"JSON.stringify({
+            r#"__ptJSON.stringify({
               bodyOwn: Object.getOwnPropertyNames(document.body),
               btnOwn: Object.getOwnPropertyNames(document.getElementById('btn')),
               inpOwn: (() => { const i = document.getElementById('inp');
@@ -3489,7 +3489,7 @@ mod tests {
 
         let p = probe(
             &ctx,
-            r#"JSON.stringify({
+            r#"__ptJSON.stringify({
               own: Object.getOwnPropertyNames(performance),
               timingOwn: Object.getOwnPropertyNames(performance.timing),
               tag: Object.prototype.toString.call(performance),
@@ -3608,7 +3608,7 @@ mod tests {
         .await
         .unwrap();
         ctx.run_event_loop().await.ok();
-        let p = probe(&ctx, "JSON.stringify(__t)").await;
+        let p = probe(&ctx, "__ptJSON.stringify(__t)").await;
 
         assert!(p.get("err").is_none(), "WebCrypto threw: {:?}", p["err"]);
 
@@ -3688,7 +3688,7 @@ mod tests {
               const blank = mk(() => {});
               const filled = a.getContext('2d').getImageData(5, 5, 1, 1).data;
               const untouched = a.getContext('2d').getImageData(199, 49, 1, 1).data;
-              return JSON.stringify({
+              return __ptJSON.stringify({
                 differ: a.toDataURL() !== b.toDataURL(),
                 blankDiffers: blank.toDataURL() !== a.toDataURL(),
                 stable: a.toDataURL() === again.toDataURL(),
@@ -3775,7 +3775,7 @@ mod tests {
               const red = mk(1, 0, 0), blue = mk(0, 0, 1), red2 = mk(1, 0, 0);
               const blank = document.createElement('canvas'); blank.width = 64; blank.height = 64;
               const dbg = red.gl.getExtension('WEBGL_debug_renderer_info');
-              return JSON.stringify({
+              return __ptJSON.stringify({
                 redPixels: red.px.slice(0, 4),
                 differ: red.px.join() !== blue.px.join(),
                 stable: red.px.join() === red2.px.join(),
@@ -3885,7 +3885,7 @@ mod tests {
         })()"#;
         ctx.evaluate(setup).await.unwrap();
         ctx.run_event_loop().await.ok();
-        let p = probe(&ctx, "JSON.stringify(globalThis.__audio || null)").await;
+        let p = probe(&ctx, "__ptJSON.stringify(globalThis.__audio || null)").await;
         assert!(!p.is_null(), "audio render promise never resolved");
 
         // The property a fingerprinter checks: different graphs → different hash.
@@ -4700,7 +4700,7 @@ mod tests {
                 if (d[i + 3] > 0) { opaque++; if (d[i] > 100 && d[i + 1] < 80) red++; }
             }
             const w = g.measureText('nokk').width;
-            return JSON.stringify({ opaque, red, w: Math.round(w) });
+            return __ptJSON.stringify({ opaque, red, w: Math.round(w) });
         })()"#;
         let out = match ctx.evaluate(probe).await.unwrap() {
             Value::String(s) => s,
@@ -4741,7 +4741,7 @@ mod tests {
             const at = (x, y) => d[(y * 40 + x) * 4 + 3]; // alpha
             let green = 0;
             for (let i = 0; i < d.length; i += 4) if (d[i + 1] > 100 && d[i + 3] > 0) green++;
-            return JSON.stringify({ center: at(20, 20), corner: at(1, 1), green });
+            return __ptJSON.stringify({ center: at(20, 20), corner: at(1, 1), green });
         })()"#;
         let out = match ctx.evaluate(probe).await.unwrap() {
             Value::String(s) => s,
@@ -4782,7 +4782,7 @@ mod tests {
             const d = g.getImageData(0, 0, 60, 8).data;
             const px = (x) => { const i = (4 * 60 + x) * 4; return [d[i], d[i + 2], d[i + 3]]; };
             const l = px(2), r = px(57);
-            return JSON.stringify({ l, r });
+            return __ptJSON.stringify({ l, r });
         })()"#;
         let out = match ctx.evaluate(probe).await.unwrap() {
             Value::String(s) => s,
@@ -4836,7 +4836,7 @@ mod tests {
             gl.readPixels(0, 0, 32, 32, gl.RGBA, gl.UNSIGNED_BYTE, px);
             const center = 4 * (16 * 32 + 16);
             const compiled = native ? gl.getShaderParameter(vs, gl.COMPILE_STATUS) : true;
-            return JSON.stringify({ native, compiled, cg: px[center + 1], ca: px[center + 3] });
+            return __ptJSON.stringify({ native, compiled, cg: px[center + 1], ca: px[center + 3] });
         })()"#;
         let out = match ctx.evaluate(probe).await.unwrap() {
             Value::String(s) => s,
@@ -4904,7 +4904,7 @@ mod tests {
             gl.readPixels(0, 0, 16, 16, gl.RGBA, gl.UNSIGNED_BYTE, px);
             const i = 4 * (8 * 16 + 8);
             gl.deleteTexture(tex);
-            return JSON.stringify({ native, isTex, r: px[i], g: px[i + 1], b: px[i + 2] });
+            return __ptJSON.stringify({ native, isTex, r: px[i], g: px[i + 1], b: px[i + 2] });
         })()"#;
         let out = match ctx.evaluate(probe).await.unwrap() {
             Value::String(s) => s,
@@ -4961,7 +4961,7 @@ mod tests {
             const it = document.createNodeIterator(document.body, NodeFilter.SHOW_ELEMENT, null);
             let iterated = 0;
             while (it.nextNode()) iterated++;
-            return JSON.stringify({
+            return __ptJSON.stringify({
               tags, links, iterated,
               scripts: document.scripts.length, forms: document.forms.length,
               images: document.images.length, docLinks: document.links.length,
@@ -5030,7 +5030,7 @@ mod tests {
             f.setAttribute('width', '300'); f.setAttribute('height', '65');
             sr.appendChild(f);
             const r = f.getBoundingClientRect();
-            return JSON.stringify({
+            return __ptJSON.stringify({
               w: Math.round(r.width), h: Math.round(r.height),
               connected: f.isConnected, offset: [f.offsetWidth, f.offsetHeight],
             });
@@ -5065,7 +5065,7 @@ mod tests {
             const byStyle = mk(e => { e.style.width = '300px'; e.style.height = '65px'; });
             const plain = mk(() => {});
             const box = (e) => { const r = e.getBoundingClientRect(); return [Math.round(r.width), Math.round(r.height)]; };
-            return JSON.stringify({
+            return __ptJSON.stringify({
               attr: box(byAttr), style: box(byStyle),
               offset: [byAttr.offsetWidth, byAttr.offsetHeight],
               plainHasBox: box(plain)[0] > 0 && box(plain)[1] > 0,
@@ -5215,8 +5215,8 @@ mod tests {
             const f = document.createElement('iframe');
             document.body.appendChild(f);
             const w = f.contentWindow;
-            if (!w) return JSON.stringify({ ok: false });
-            return JSON.stringify({
+            if (!w) return __ptJSON.stringify({ ok: false });
+            return __ptJSON.stringify({
               ok: true,
               evaluated: w.eval('1 + 1'),
               ownRealm: w.Object !== Object && w.Function !== Function,
@@ -5311,7 +5311,7 @@ mod tests {
         .unwrap();
         ctx.run_event_loop().await.unwrap();
 
-        let out = match ctx.evaluate("JSON.stringify(out)").await.unwrap() {
+        let out = match ctx.evaluate("__ptJSON.stringify(out)").await.unwrap() {
             Value::String(s) => serde_json::from_str::<Value>(&s).unwrap(),
             v => panic!("expected the result, got {v:?}"),
         };
@@ -5408,7 +5408,7 @@ mod tests {
             "an iframe inserted inside a subtree — here a closed shadow root — is \
              still a browsing context"
         );
-        let state = match ctx.evaluate("JSON.stringify(__s)").await.unwrap() {
+        let state = match ctx.evaluate("__ptJSON.stringify(__s)").await.unwrap() {
             Value::String(s) => serde_json::from_str::<Value>(&s).unwrap_or_default(),
             v => panic!("expected the state object, got {v:?}"),
         };
@@ -5508,7 +5508,7 @@ mod tests {
         let ctx = engine.new_context().await.unwrap();
         ctx.navigate(&url).await.unwrap();
 
-        let out = probe(&ctx, r#"JSON.stringify({
+        let out = probe(&ctx, r#"__ptJSON.stringify({
             text: (document.querySelector('x-boxed') || {}).textContent,
             defined: typeof customElements.get('x-boxed'),
             meta: String(globalThis.__meta || '').split('/').pop(),
@@ -5549,7 +5549,7 @@ mod tests {
         ctx.evaluate("window.location = '/second'").await.unwrap();
         ctx.run_event_loop().await.unwrap();
 
-        let out = probe(&ctx, r#"JSON.stringify({
+        let out = probe(&ctx, r#"__ptJSON.stringify({
             where: location.pathname,
             text: document.body.textContent.trim(),
             isObject: typeof location === 'object' && typeof location.href === 'string',
@@ -5667,7 +5667,7 @@ mod tests {
         })()"#).await.unwrap();
         ctx.run_event_loop().await.unwrap();
 
-        let out = probe(&ctx, "JSON.stringify(globalThis.__fromWorker || {})").await;
+        let out = probe(&ctx, "__ptJSON.stringify(globalThis.__fromWorker || {})").await;
         assert_eq!(out["self"], "[object DedicatedWorkerGlobalScope]", "got: {out}");
         assert_eq!(out["nav"], "[object WorkerNavigator]");
         assert_eq!(out["loc"], "[object WorkerLocation]");
@@ -5729,9 +5729,9 @@ mod tests {
         })()"#).await.unwrap();
         ctx.run_event_loop().await.unwrap();
 
-        let tag = probe(&ctx, "JSON.stringify({t: globalThis.__tag})").await;
+        let tag = probe(&ctx, "__ptJSON.stringify({t: globalThis.__tag})").await;
         assert_eq!(tag["t"], "[object Worker]", "a Worker says what it is");
-        let seen = probe(&ctx, "JSON.stringify(globalThis.__seen || [])").await;
+        let seen = probe(&ctx, "__ptJSON.stringify(globalThis.__seen || [])").await;
         let msgs = seen.as_array().cloned().unwrap_or_default();
         assert_eq!(msgs.len(), 1, "one message posted, one delivered: {seen}");
         let m = &msgs[0];
@@ -5802,7 +5802,7 @@ mod tests {
             };
             for (let w = 0; w < 3; w++) collect(globalThis, '');   // the window graph warms the loop
             const d = collect(document, 'd.');     // and then it answers about the document
-            return JSON.stringify({ cookie: (d.s || []).indexOf('d.cookie') >= 0 });
+            return __ptJSON.stringify({ cookie: (d.s || []).indexOf('d.cookie') >= 0 });
         })()"#).await;
 
         assert_eq!(
@@ -5840,7 +5840,7 @@ mod tests {
 
         let out = probe(
             &ctx,
-            "JSON.stringify({ during: globalThis.__at, dcl: globalThis.__dcl, \
+            "__ptJSON.stringify({ during: globalThis.__at, dcl: globalThis.__dcl, \
              after: document.readyState, active: document.activeElement.tagName })",
         )
         .await;
@@ -5878,7 +5878,7 @@ mod tests {
             const odd = document.createElement('nosuchtag');
             const chain = (o) => { const c = []; o = Object.getPrototypeOf(o);
               while (o) { c.push((o.constructor && o.constructor.name) || '?'); o = Object.getPrototypeOf(o); } return c; };
-            return JSON.stringify({
+            return __ptJSON.stringify({
               distinct: HTMLElement.prototype !== Element.prototype
                      && HTMLCanvasElement.prototype !== HTMLElement.prototype
                      && HTMLDivElement.prototype !== HTMLCanvasElement.prototype,
@@ -5963,7 +5963,7 @@ mod tests {
                 (out[cat] = out[cat] || []).push(prefix + name);
               }
             }
-            return JSON.stringify({
+            return __ptJSON.stringify({
               f: out.f || [], unknown: out['?'] || [], inaccessible: out.i || [],
               native: (out.N || []).length,
             });
@@ -6010,7 +6010,7 @@ mod tests {
         })()"#).await.unwrap();
         ctx.run_event_loop().await.unwrap();
 
-        let out = probe(&ctx, "JSON.stringify(globalThis.__ran || {})").await;
+        let out = probe(&ctx, "__ptJSON.stringify(globalThis.__ran || {})").await;
         assert_eq!(out["ran"], true, "the worker ran from a revoked URL: {out}");
     }
 
@@ -6057,13 +6057,13 @@ mod tests {
             2,
             "the page's worker and the frame's are two workers, not one"
         );
-        let from_page = probe(&ctx, "JSON.stringify(globalThis.__from || {})").await;
+        let from_page = probe(&ctx, "__ptJSON.stringify(globalThis.__from || {})").await;
         assert_eq!(
             from_page["where"], "[object DedicatedWorkerGlobalScope]",
             "the page heard back from its own: {from_page}"
         );
         let out = ctx
-            .evaluate_in_frame(frame, "JSON.stringify(globalThis.__from || {})")
+            .evaluate_in_frame(frame, "__ptJSON.stringify(globalThis.__from || {})")
             .await
             .unwrap();
         let from_frame: Value = out
@@ -6137,7 +6137,7 @@ mod tests {
 
         let names = probe(&ctx, r#"(() => {
             const named = (o) => Object.prototype.toString.call(o);
-            return JSON.stringify([named(window), named(navigator), named(screen), named(location),
+            return __ptJSON.stringify([named(window), named(navigator), named(screen), named(location),
               named(history), named(document), named(document.body),
               named(document.createElement('canvas')), named(document.createTextNode('x'))]);
         })()"#,
@@ -6153,7 +6153,7 @@ mod tests {
             "every interface names itself"
         );
 
-        let timing = probe(&ctx, r#"JSON.stringify({
+        let timing = probe(&ctx, r#"__ptJSON.stringify({
             navigation: performance.getEntriesByType('navigation').length,
             resources: performance.getEntriesByType('resource').length,
             named: Object.prototype.toString.call(performance.getEntries()[0]),
@@ -6179,7 +6179,7 @@ mod tests {
             return 1;
         })()"#).await.unwrap();
         ctx.run_event_loop().await.unwrap();
-        let ice = probe(&ctx, r#"JSON.stringify({
+        let ice = probe(&ctx, r#"__ptJSON.stringify({
             candidates: __ice.filter(Boolean).length,
             ended: __ice.includes(null),
             mdns: __ice.filter(Boolean).every(c => /\.local /.test(c)),
@@ -6232,7 +6232,7 @@ mod tests {
 
         let frame = ctx.frame_list().first().map(|f| f.id).expect("the frame is live");
         let hits = ctx
-            .evaluate_in_frame(frame, "JSON.stringify(globalThis.__hits || [])")
+            .evaluate_in_frame(frame, "__ptJSON.stringify(globalThis.__hits || [])")
             .await
             .unwrap();
         let hits: Value = serde_json::from_str(hits.as_str().unwrap_or("[]")).unwrap();
@@ -6272,7 +6272,7 @@ mod tests {
         let rect = probe(&ctx, r#"(() => {
             const f = document.getElementById('w');
             const r = f.getBoundingClientRect();
-            return JSON.stringify({ x: r.x, y: r.y, w: r.width, h: r.height });
+            return __ptJSON.stringify({ x: r.x, y: r.y, w: r.width, h: r.height });
         })()"#,
         )
         .await;
@@ -6288,7 +6288,7 @@ mod tests {
 
         let frame = ctx.frame_list().first().map(|f| f.id).expect("the frame is live");
         let hits = ctx
-            .evaluate_in_frame(frame, "JSON.stringify(globalThis.__hits || [])")
+            .evaluate_in_frame(frame, "__ptJSON.stringify(globalThis.__hits || [])")
             .await
             .unwrap();
         let hits: Value = serde_json::from_str(hits.as_str().unwrap_or("[]")).unwrap();
@@ -6487,7 +6487,7 @@ mod tests {
         .await
         .unwrap();
 
-        let out = pump_until(&ctx, "JSON.stringify(__log)", 40).await;
+        let out = pump_until(&ctx, "__ptJSON.stringify(__log)", 40).await;
         let log: Value = serde_json::from_str(out.as_str().unwrap()).unwrap();
 
         assert!(
@@ -6515,7 +6515,7 @@ mod tests {
         );
 
         // The close is a round trip of its own, so pump once more for it.
-        let out = pump_until(&ctx, "JSON.stringify(__log)", 20).await;
+        let out = pump_until(&ctx, "__ptJSON.stringify(__log)", 20).await;
         let log: Value = serde_json::from_str(out.as_str().unwrap()).unwrap();
         assert_eq!(log["code"], 1000, "clean close carries the code: {log}");
         assert_eq!(log["clean"], true, "and reports wasClean");
@@ -6553,7 +6553,7 @@ mod tests {
         .await
         .unwrap();
 
-        let out = pump_until(&ctx, "JSON.stringify(__log)", 40).await;
+        let out = pump_until(&ctx, "__ptJSON.stringify(__log)", 40).await;
         let log: Value = serde_json::from_str(out.as_str().unwrap()).unwrap();
         assert_eq!(
             log["events"].as_array().unwrap().len(),

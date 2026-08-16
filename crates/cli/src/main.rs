@@ -330,6 +330,19 @@ async fn main() -> Result<()> {
             if std::env::var("NOKK_TRACE_HOOKS").is_ok() {
                 let hook = r#"(() => {
                   try { console.error('[hook] installed'); } catch (e) {}
+                  // Собранный отпечаток уходит через JSON.stringify до того, как
+                  // его сожмут и зашифруют — это единственная точка, где видно,
+                  // что именно мы про себя рассказали.
+                  try {
+                    const S = JSON.stringify;
+                    JSON.stringify = function (v) {
+                      const out = S.apply(this, arguments);
+                      if (typeof out === 'string' && out.length > 2000) {
+                        try { console.error('[payload ' + out.length + '] ' + out.slice(0, 1500)); } catch (e) {}
+                      }
+                      return out;
+                    };
+                  } catch (e) {}
                   const wrap = (obj, label) => {
                     for (const k of Object.keys(obj)) {
                       const v = obj[k];
