@@ -1087,7 +1087,12 @@ pub fn probe_tracer_script() -> String {
         const get = d.get;
         try {
           Object.defineProperty(obj, key, Object.assign({}, d, {
-            get: rename(function () { return note(prefix + key, get.call(this)); }, 'get ' + key),
+            get: rename(function () {
+              // Бросок из свойства — самое ценное, что может записать прибор: их
+              // VM ловит такие внутри себя, и снаружи виден только обрыв.
+              try { return note(prefix + key, get.call(this)); }
+              catch (e) { note('THROW ' + prefix + key, String((e && e.message) || e)); throw e; }
+            }, 'get ' + key),
           }));
         } catch (e) {}
       } else if (typeof d.value === 'function' && !isConstructor(d.value)) {
@@ -1095,7 +1100,13 @@ pub fn probe_tracer_script() -> String {
         try {
           Object.defineProperty(obj, key, Object.assign({}, d, {
             value: rename(function (...args) {
-              const out = fn.apply(this, args);
+              let out;
+              try { out = fn.apply(this, args); }
+              catch (e) {
+                note('THROW ' + prefix + key + '(' + args.map(show).join(',').slice(0, 30) + ')',
+                     String((e && e.message) || e));
+                throw e;
+              }
               return note(prefix + key + '(' + args.map(show).join(',').slice(0, 40) + ')', out);
             }, key),
           }));

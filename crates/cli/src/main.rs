@@ -334,6 +334,14 @@ async fn main() -> Result<()> {
                   // его сожмут и зашифруют — это единственная точка, где видно,
                   // что именно мы про себя рассказали.
                   try {
+                    const S_ = XMLHttpRequest.prototype.send, O_ = XMLHttpRequest.prototype.open;
+                    XMLHttpRequest.prototype.open = function (m, u) { this.__ptU = String(u); return O_.apply(this, arguments); };
+                    XMLHttpRequest.prototype.send = function (b) {
+                      try { console.error('[send] bytes=' + ((b && b.length) || 0) + ' url=' + String(this.__ptU || '').slice(-40)); } catch (e) {}
+                      return S_.apply(this, arguments);
+                    };
+                  } catch (e) {}
+                  try {
                     let n = 0, biggest = '';
                     const S = JSON.stringify;
                     JSON.stringify = function (v) {
@@ -363,7 +371,14 @@ async fn main() -> Result<()> {
                       if (typeof v !== 'function') continue;
                       obj[k] = function () {
                         try { console.error('[hook] ' + label + '.' + k); } catch (e) {}
-                        return v.apply(this, arguments);
+                        try {
+                          return v.apply(this, arguments);
+                        } catch (err) {
+                          // Их код ловит такие броски сам, и наружу они не выходят —
+                          // а именно они обрывают цепочку на полпути.
+                          try { console.error('[hookerr] ' + label + '.' + k + ': ' + ((err && err.stack) || err)); } catch (e) {}
+                          throw err;
+                        }
                       };
                     }
                     return obj;
