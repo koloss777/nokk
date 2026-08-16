@@ -1209,6 +1209,16 @@ impl BrowserContext {
                 break;
             }
 
+            // 0. Timings first, before anything the page runs this round. A script
+            //    that has just loaded reads the timing of its own <script> the
+            //    moment it starts — Turnstile's loader puts `apiJsResourceTiming`
+            //    into the config it posts to the widget — and flushing after the
+            //    round meant the entry appeared one round too late: the key was
+            //    simply absent from the message, where a browser always has it.
+            if index == self.index {
+                self.flush_resource_timings(index).await;
+            }
+
             // 1. Run timers to (virtual-time) exhaustion on the worker. TIMER_CAP
             //    is a *total* budget across rounds so a runaway `setInterval` is
             //    bounded overall, not merely per round.
@@ -2262,6 +2272,12 @@ impl BrowserContext {
             }
             match self.fetch_text(&url, "script").await {
                 Ok((_, code)) => {
+                    // Скрипт читает тайминг собственного <script> первой же
+                    // строкой — запись должна быть на месте до того, как он
+                    // начнёт, а не в конце круга.
+                    if index == self.index {
+                        self.flush_resource_timings(index).await;
+                    }
                     if op["module"].as_bool().unwrap_or(false) {
                         if let Err(e) = self.run_module(index, &url, code).await {
                             tracing::debug!(url = %url, error = %e, "module threw");

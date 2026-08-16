@@ -390,8 +390,22 @@ async fn main() -> Result<()> {
                   globalThis.__pt_recent = () => recent.join(' → ');
                   try {
                     const D = EventTarget.prototype.dispatchEvent;
+                    const show = (v) => {
+                      if (v === null || v === undefined) return String(v);
+                      if (typeof v === 'string') return 'str(' + v.length + '):' + v.slice(0, 60);
+                      if (typeof v !== 'object') return typeof v + ':' + String(v).slice(0, 30);
+                      try {
+                        return 'obj{' + Object.keys(v).map((k) => {
+                          const x = v[k];
+                          return k + '=' + (typeof x === 'string' ? 's' + x.length + ':' + x.slice(0, 24)
+                                            : x && typeof x === 'object' ? 'o{' + Object.keys(x).slice(0, 4).join(',') + '}'
+                                            : String(x).slice(0, 18));
+                        }).join(' ') + '}';
+                      } catch (x) { return 'obj?'; }
+                    };
                     EventTarget.prototype.dispatchEvent = function (e) {
-                      remember('dispatch:' + (e && e.type));
+                      remember('dispatch:' + (e && e.type) +
+                               (e && e.type === 'message' ? '[' + show(e.data) + ']' : ''));
                       return D.apply(this, arguments);
                     };
                   } catch (e) {}

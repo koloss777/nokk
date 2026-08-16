@@ -1890,6 +1890,17 @@ const WEB_BODIES_TEMPLATE: &str = r##"(() => {
 
   if (globalThis.screen) rebrand(screen.orientation, 'ScreenOrientation', ET);
 
+  // Всё, что стоит на окне до первого скрипта страницы, — браузерное, и
+  // `toString` обязан говорить [native code]. Интерфейсы, объявленные раньше
+  // самого механизма маскировки (XHR и его ступени, Storage), иначе читаются
+  // сборщиком как функции страницы.
+  for (const name of Object.getOwnPropertyNames(globalThis)) {
+    if (name.lastIndexOf('__pt', 0) === 0) continue;
+    let v;
+    try { v = globalThis[name]; } catch (e) { continue; }
+    if (typeof v === 'function') native(v);
+  }
+
   // Второй проход по форме интерфейсов: Storage, SpeechSynthesis и звук
   // объявляются позже DOM-слоя, и в первый раз их ещё нет.
   try { if (globalThis.__pt_fillShapes) __pt_fillShapes(); } catch (e) {}
@@ -2492,66 +2503,146 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     };
   }
 
-  globalThis.XMLHttpRequest = class XMLHttpRequest extends globalThis.EventTarget {
-    constructor() {
-      super();
-      this.readyState = 0; this.status = 0; this.statusText = '';
-      this.responseText = ''; this.response = ''; this.responseType = '';
-      this.responseURL = ''; this.responseXML = null;
-      this.withCredentials = false; this.timeout = 0;
-      this._headers = {}; this._respHeaders = {}; this._aborted = false;
-      this.upload = new globalThis.EventTarget();
-      this.onreadystatechange = null; this.onload = null; this.onerror = null;
-      this.onloadend = null; this.onloadstart = null; this.onprogress = null;
-      this.onabort = null; this.ontimeout = null;
+  // XHR так, как он устроен в браузере: состояние — в скрытой сумке, всё
+  // остальное на прототипе. Держать `readyState`, `response` и методы прямо на
+  // экземпляре — не мелочь: у настоящего XHR собственных свойств нет вовсе, а
+  // код Cloudflare зовёт `XMLHttpRequest.prototype.open.call(x, …)` — это их
+  // штатный обход перехвата. У нас `XMLHttpRequest.prototype.open` было
+  // undefined, и вызов падал внутри их интерпретатора.
+  {
+    const xmask = (f, n) => {
+      if (n) { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} }
+      return globalThis.__pt_native ? __pt_native(f) : f;
+    };
+    const XHRET = function XMLHttpRequestEventTarget() { throw new TypeError('Illegal constructor'); };
+    Object.setPrototypeOf(XHRET.prototype, globalThis.EventTarget.prototype);
+    Object.defineProperty(XHRET.prototype, 'constructor', { value: XHRET, writable: true, configurable: true });
+    Object.defineProperty(XHRET.prototype, Symbol.toStringTag, { value: 'XMLHttpRequestEventTarget', configurable: true });
+    globalThis.XMLHttpRequestEventTarget = xmask(XHRET, 'XMLHttpRequestEventTarget');
+
+    const XHRUpload = function XMLHttpRequestUpload() { throw new TypeError('Illegal constructor'); };
+    Object.setPrototypeOf(XHRUpload.prototype, XHRET.prototype);
+    Object.defineProperty(XHRUpload.prototype, 'constructor', { value: XHRUpload, writable: true, configurable: true });
+    Object.defineProperty(XHRUpload.prototype, Symbol.toStringTag, { value: 'XMLHttpRequestUpload', configurable: true });
+    globalThis.XMLHttpRequestUpload = xmask(XHRUpload, 'XMLHttpRequestUpload');
+
+    const EVENTS = ['abort', 'error', 'load', 'loadend', 'loadstart', 'progress', 'timeout'];
+    // `on…` живут на XMLHttpRequestEventTarget — и у запроса, и у его upload.
+    for (const name of EVENTS) {
+      const key = 'on' + name;
+      Object.defineProperty(XHRET.prototype, key, {
+        get: xmask(function () { const b = this.__ptX; return b ? (b[key] || null) : null; }, 'get ' + key),
+        set: xmask(function (v) { const b = this.__ptX; if (b) b[key] = typeof v === 'function' ? v : null; }, 'set ' + key),
+        enumerable: true, configurable: true,
+      });
     }
-    open(method, url) { this.method = String(method).toUpperCase(); this.url = String(url); this._set(1); }
-    setRequestHeader(k, v) { this._headers[k] = String(v); }
-    overrideMimeType() {}
-    // Каждая строка кончается CRLF, включая последнюю: код, который делит по
-    // '\r\n', в браузере получает пустой хвостовой элемент, а у нас не получал.
-    getAllResponseHeaders() {
-      const rows = Object.entries(this._respHeaders).map(([k, v]) => k + ': ' + v + '\r\n');
-      return rows.join('');
+
+    // Сумка слушателей — то, что заводит конструктор EventTarget; мы его не
+    // зовём (прототип строим руками), поэтому заводим её сами.
+    const seedTarget = (o) => {
+      try { Object.defineProperty(o, '__ptLis', { value: Object.create(null), enumerable: false, writable: true }); } catch (e) {}
+      return o;
+    };
+    const XHR = function XMLHttpRequest() {
+      if (!new.target) throw new TypeError("Failed to construct 'XMLHttpRequest': Please use the 'new' operator.");
+      seedTarget(this);
+      const up = seedTarget(Object.create(XHRUpload.prototype));
+      Object.defineProperty(up, '__ptX', { value: {}, enumerable: false });
+      Object.defineProperty(this, '__ptX', {
+        value: {
+          readyState: 0, status: 0, statusText: '', responseText: '', response: '',
+          responseType: '', responseURL: '', responseXML: null, withCredentials: false,
+          timeout: 0, headers: {}, respHeaders: {}, aborted: false, upload: up,
+          method: 'GET', url: '', onreadystatechange: null,
+        },
+        enumerable: false,
+      });
+    };
+    Object.setPrototypeOf(XHR.prototype, XHRET.prototype);
+    Object.defineProperty(XHR.prototype, 'constructor', { value: XHR, writable: true, configurable: true });
+    Object.defineProperty(XHR.prototype, Symbol.toStringTag, { value: 'XMLHttpRequest', configurable: true });
+    const P = XHR.prototype;
+    const def = (name, get, set) => {
+      const d = { enumerable: true, configurable: true, get: xmask(get, 'get ' + name) };
+      if (set) d.set = xmask(set, 'set ' + name);
+      Object.defineProperty(P, name, d);
+    };
+    const meth = (name, f) => {
+      Object.defineProperty(P, name, { value: xmask(f, name), writable: true, enumerable: true, configurable: true });
+    };
+    for (const [name, value] of [['UNSENT', 0], ['OPENED', 1], ['HEADERS_RECEIVED', 2], ['LOADING', 3], ['DONE', 4]]) {
+      Object.defineProperty(P, name, { value, enumerable: true, configurable: false, writable: false });
+      Object.defineProperty(XHR, name, { value, enumerable: true, configurable: false, writable: false });
     }
-    getResponseHeader(k) { return this._respHeaders[k.toLowerCase()] ?? null; }
-    abort() {
-      this._aborted = true;
-      this.readyState = 4; this.status = 0;
-      this._fire('abort'); this._fire('loadend');
+    for (const name of ['readyState', 'status', 'statusText', 'responseText', 'response',
+                        'responseURL', 'responseXML', 'upload']) {
+      def(name, function () { return this.__ptX[name]; });
     }
-    send(body) {
-      this._fire('loadstart');
-      fetch(this.url, { method: this.method, headers: this._headers, body })
-        .then(async (r) => {
-          if (this._aborted) return;
-          this.status = r.status; this.statusText = r.statusText; this.responseURL = r.url || this.url;
-          r.headers.forEach((v, k) => { this._respHeaders[k] = v; });
-          this._set(2); this._set(3);
-          this.responseText = await r.text();
-          try { this.response = this.responseType === 'json' ? __ptJSON.parse(this.responseText || 'null') : this.responseText; }
-          catch (e) { this.response = null; }
-          this._set(4);
-          this._fire('progress', { lengthComputable: true, loaded: this.responseText.length, total: this.responseText.length });
-          this._fire('load'); this._fire('loadend');
-        })
-        .catch(() => {
-          if (this._aborted) return;
-          this.status = 0; this._set(4);
-          this._fire('error'); this._fire('loadend');
-        });
+    for (const name of ['responseType', 'withCredentials', 'timeout']) {
+      def(name, function () { return this.__ptX[name]; }, function (v) { this.__ptX[name] = v; });
     }
-    // The order matters: `readystatechange` reaches both a property handler and
-    // anything added as a listener, which is the whole point of this class.
-    _set(s) { this.readyState = s; this._fire('readystatechange'); }
-    _fire(type, extra) {
+    def('onreadystatechange',
+        function () { return this.__ptX.onreadystatechange; },
+        function (v) { this.__ptX.onreadystatechange = typeof v === 'function' ? v : null; });
+
+    const fire = (self, type, extra) => {
       const ev = Object.assign({
-        type, target: this, currentTarget: this, isTrusted: true,
+        type, target: self, currentTarget: self, isTrusted: true,
         lengthComputable: false, loaded: 0, total: 0, bubbles: false, cancelable: false,
       }, extra || {});
-      this.dispatchEvent(ev);
-    }
-  };
+      self.dispatchEvent(ev);
+    };
+    // Порядок важен: `readystatechange` доходит и до свойства-обработчика, и до
+    // слушателей, — ради этого класс и существует.
+    const setState = (self, n) => { self.__ptX.readyState = n; fire(self, 'readystatechange'); };
+
+    meth('open', function (method, url) {
+      const b = this.__ptX;
+      b.method = String(method).toUpperCase(); b.url = String(url);
+      setState(this, 1);
+    });
+    meth('setRequestHeader', function (k, v) { this.__ptX.headers[k] = String(v); });
+    meth('overrideMimeType', function () {});
+    meth('setAttributionReporting', function () {});
+    meth('setPrivateToken', function () {});
+    // Каждая строка кончается CRLF, включая последнюю: код, который делит по
+    // '\r\n', в браузере получает пустой хвостовой элемент, а у нас не получал.
+    meth('getAllResponseHeaders', function () {
+      return Object.entries(this.__ptX.respHeaders).map(([k, v]) => k + ': ' + v + '\r\n').join('');
+    });
+    meth('getResponseHeader', function (k) {
+      const v = this.__ptX.respHeaders[String(k).toLowerCase()];
+      return v === undefined ? null : v;
+    });
+    meth('abort', function () {
+      const b = this.__ptX;
+      b.aborted = true; b.readyState = 4; b.status = 0;
+      fire(this, 'abort'); fire(this, 'loadend');
+    });
+    meth('send', function (body) {
+      const self = this, b = this.__ptX;
+      fire(this, 'loadstart');
+      fetch(b.url, { method: b.method, headers: b.headers, body })
+        .then(async (r) => {
+          if (b.aborted) return;
+          b.status = r.status; b.statusText = r.statusText; b.responseURL = r.url || b.url;
+          r.headers.forEach((v, k) => { b.respHeaders[k] = v; });
+          setState(self, 2); setState(self, 3);
+          b.responseText = await r.text();
+          try { b.response = b.responseType === 'json' ? __ptJSON.parse(b.responseText || 'null') : b.responseText; }
+          catch (e) { b.response = null; }
+          setState(self, 4);
+          fire(self, 'progress', { lengthComputable: true, loaded: b.responseText.length, total: b.responseText.length });
+          fire(self, 'load'); fire(self, 'loadend');
+        })
+        .catch(() => {
+          if (b.aborted) return;
+          b.status = 0; setState(self, 4);
+          fire(self, 'error'); fire(self, 'loadend');
+        });
+    });
+    globalThis.XMLHttpRequest = xmask(XHR, 'XMLHttpRequest');
+  }
 
   // Minimal Headers/TextEncoder if missing.
   if (!globalThis.TextEncoder) {
