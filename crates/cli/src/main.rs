@@ -329,6 +329,7 @@ async fn main() -> Result<()> {
             // них она позвала, — единственный способ прочитать её решение.
             if std::env::var("NOKK_TRACE_HOOKS").is_ok() {
                 let hook = r#"(() => {
+                  try { console.error('[hook] installed'); } catch (e) {}
                   const wrap = (obj, label) => {
                     for (const k of Object.keys(obj)) {
                       const v = obj[k];
@@ -443,6 +444,12 @@ async fn main() -> Result<()> {
             }
             // То же — про саму страницу: интерстишал рисует свой интерфейс в
             // закрытом shadow root не хуже виджета.
+            if let Ok(serde_json::Value::String(t)) = ctx
+                .evaluate("(() => { const ids = [];                    for (const el of document.querySelectorAll('*')) if (el.id) ids.push(el.localName + '#' + el.id);                    const root = (globalThis._cf_chl_opt || {}).wTgF5;                    return JSON.stringify({ids: ids.slice(0, 20),                      renderRoot: root ? (root.nodeName || 'shadow') : null,                      rootKids: root && root.childNodes ? root.childNodes.length : -1}); })()")
+                .await
+            {
+                eprintln!("# page ids: {t}");
+            }
             if let Ok(serde_json::Value::String(t)) = ctx.evaluate("(() => { const seen = []; const walk = (root) => {                            for (const el of root.querySelectorAll('*')) {                              const tag = el.localName;                              if (tag === 'input' || tag === 'button' || el.getAttribute('role'))                                seen.push(tag + (el.type ? '[' + el.type + ']' : '') +                                          (el.getAttribute('role') ? '{' + el.getAttribute('role') + '}' : ''));                              const sr = el.shadowRoot || el.__ptShadow; if (sr) walk(sr); } };                          const root = document.body && (document.body.shadowRoot || document.body.__ptShadow);                          try { walk(document); if (root) walk(root); } catch (e) {}                          return JSON.stringify({controls: seen.slice(0, 12),                            bodyShadow: !!root,                            shadowKids: root ? root.childNodes.length : -1,                            shadowText: root ? String(root.textContent || '').trim().slice(0, 60) : '',                            bodyKids: document.body ? document.body.childNodes.length : -1,                            view: [innerWidth, innerHeight],                            html: (document.documentElement ? document.documentElement.outerHTML : '').length}); })()").await {
                 eprintln!("# page widget: {t}");
             }
