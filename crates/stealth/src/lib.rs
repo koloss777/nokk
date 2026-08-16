@@ -1051,7 +1051,7 @@ pub fn probe_tracer_script() -> String {
     const e = log.get(name) || { n: 0, last: '' };
     e.n++; e.last = show(v);
     log.set(name, e);
-    if (head.length < 6000) head.push([Date.now() - t0, name, e.last]);
+    if (head.length < 40000) head.push([Date.now() - t0, name, e.last]);
     if (tail.length >= 400) tail.shift();
     tail.push([Date.now() - t0, name, e.last]);
     return v;
@@ -1060,7 +1060,7 @@ pub fn probe_tracer_script() -> String {
     .sort((a, b) => b[1].n - a[1].n)
     .map(([k, v]) => [k, v.n, v.last]));
   globalThis.__pt_probeTail = (n) => __ptJSON.stringify(tail.slice(-(n || 60)));
-  globalThis.__pt_probeHead = (n) => __ptJSON.stringify(head.slice(0, n || 6000));
+  globalThis.__pt_probeHead = (n) => __ptJSON.stringify(head.slice(0, n || 40000));
 
   const native = globalThis.__pt_native || ((f) => f);
   const rename = (f, name) => {
