@@ -530,6 +530,16 @@ impl HttpClient for FingerprintClient {
         if let Some(body) = req.body {
             rb = rb.body(body);
         }
+        // Что уходит на самом деле — видно только здесь: эмуляция владеет частью
+        // заголовков, страница другой, и спор между ними стоит одного 401.
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let sent: Vec<String> = req
+                .headers
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", &v[..v.len().min(60)]))
+                .collect();
+            tracing::trace!(url = %req.url, method = %req.method, page_headers = %sent.join(" | "), "request");
+        }
         let resp = rb.send().await.map_err(|e| {
             if e.is_timeout() {
                 NetError::Timeout
