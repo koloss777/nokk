@@ -485,7 +485,23 @@ async fn main() -> Result<()> {
                       return WP.apply(this, arguments);
                     };
                     const WA = Worker.prototype.addEventListener;
-                    Worker.prototype.addEventListener = function (t) { remember('worker.on ' + t); return WA.apply(this, arguments); };
+                    const wrapHandler = (h) => (typeof h !== 'function' ? h : function (e) {
+                      let d = '?';
+                      try { d = typeof e.data === 'string' ? 'str' + e.data.length : Object.prototype.toString.call(e.data); } catch (x) {}
+                      remember('worker→frame ' + (e && e.type) + ' ' + d);
+                      return h.apply(this, arguments);
+                    });
+                    Worker.prototype.addEventListener = function (t, h) {
+                      remember('worker.on ' + t);
+                      return WA.call(this, t, wrapHandler(h), arguments[2]);
+                    };
+                    // Ответ воркера приходит и через свойство-обработчик.
+                    const OM = new WeakMap();
+                    Object.defineProperty(Worker.prototype, 'onmessage', {
+                      configurable: true, enumerable: true,
+                      get() { return OM.get(this) || null; },
+                      set(h) { OM.set(this, h); this.addEventListener('message', h); },
+                    });
                   } catch (e) {}
                   globalThis.__pt_recent = () => recent.join(' → ');
                   // Вторая стадия сбора у них ставится таймером и молчит, если
@@ -646,7 +662,9 @@ async fn main() -> Result<()> {
             let mut pressed = 0usize;
             let mut seen_controls = std::collections::HashSet::new();
             loop {
-                ctx.run_event_loop().await.ok();
+                let phase = Instant::now();
+                let worked = ctx.run_event_loop().await.unwrap_or(0);
+                let looped = phase.elapsed();
                 let cleared = ctx.cookies(&[]).iter().any(|c| c.name == "cf_clearance");
                 if cleared {
                     tracing::info!(
@@ -665,6 +683,7 @@ async fn main() -> Result<()> {
                 // One press per control that appears. A widget that ignores it is
                 // not asking to be pressed again — a person would not keep
                 // clicking either, and a flurry of clicks is its own signature.
+                let before_press = Instant::now();
                 if pressed < MAX_PRESSES {
                     if let Ok(Some(what)) = ctx.press_widget_control().await {
                         if seen_controls.insert(what.clone()) {
@@ -674,7 +693,19 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(400)).await;
+                tracing::debug!(
+                    loop_ms = looped.as_millis(),
+                    press_ms = before_press.elapsed().as_millis(),
+                    worked,
+                    "solve turn"
+                );
+                // Пока в странице или её воркерах идёт работа, ждать нечего:
+                // виток кончается по внутреннему пределу ожидания, а не потому
+                // что всё сделано. Сон в 400 мс на каждом витке отдавал сборщику
+                // отпечатка меньше трети реального времени, и он не поспевал за
+                // собственным таймаутом.
+                let idle = worked == 0;
+                tokio::time::sleep(Duration::from_millis(if idle { 250 } else { 20 })).await;
             }
         }
 

@@ -1820,15 +1820,58 @@ impl BrowserContext {
         for (key, state) in workers {
             let (owner, id) = key;
             let child = state.index;
-            let ran = self
-                .engine
-                .pool
-                .dispatch(self.worker, move |iso| {
-                    iso.run_event_loop(child, 200, std::time::Duration::from_millis(50))
-                })
-                .await?
-                .unwrap_or(0);
+            // Пока воркеру есть что делать, даём ещё срез — до четырёх подряд.
+            // Один срез в 50 мс на виток родительского цикла означал, что
+            // секунда работы воркера растягивалась на несколько секунд стены:
+            // сборщик отпечатка отвечал рывками с провалами по три-четыре
+            // секунды, и челлендж успевал объявить себя просроченным.
+            let mut ran = 0u32;
+            let turn_started = std::time::Instant::now();
+            // Пока воркеру есть что делать — или вот-вот будет, — не отдаём его
+            // ход обратно. Бюджет ограничивает жадность: страница и другие
+            // контексты ждать вечно не должны.
+            const WORKER_TURN: std::time::Duration = std::time::Duration::from_millis(500);
+            while turn_started.elapsed() < WORKER_TURN {
+                let slice = self
+                    .engine
+                    .pool
+                    .dispatch(self.worker, move |iso| {
+                        iso.run_event_loop(child, 400, std::time::Duration::from_millis(60))
+                    })
+                    .await?
+                    .unwrap_or(0);
+                ran += slice;
+                if slice > 0 {
+                    continue;
+                }
+                // Ничего не сработало — но, может быть, вот-вот сработает. Сборщик
+                // отпечатка гоняет свою работу цепочкой таймеров по 55 мс, и один
+                // шаг за виток родительского цикла растягивал секунду работы на
+                // десять секунд стены. Ждём ближайший таймер, если он близко, и
+                // даём ещё срез.
+                let next = self
+                    .eval_in(child, "typeof __pt_nextTimerDelay === 'function' ? __pt_nextTimerDelay() : -1")
+                    .await
+                    .ok()
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(-1);
+                // Их сборщик разложен на цепочку таймеров: шаг — колбэк — пауза.
+                // Один шаг за виток родительского цикла превращал секунду работы
+                // в десяток секунд, и челлендж успевал объявить себя просроченным.
+                if next < 0 {
+                    break;
+                }
+                let wait = next.max(1) as u64;
+                if turn_started.elapsed() + std::time::Duration::from_millis(wait) > WORKER_TURN {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+            }
+            let slices_ms = turn_started.elapsed().as_millis();
             work += ran as usize;
+            if ran > 0 || slices_ms > 30 {
+                tracing::debug!(worker = id, ran, slices_ms, "worker turn");
+            }
 
             let qjson = self.eval_in(child, DRAIN_IO).await?;
             let queues: Value = match qjson {
