@@ -782,7 +782,7 @@ async fn main() -> Result<()> {
             }
             // Хвост: чем страница и каждый фрейм занимались последними, по порядку.
             let tail = match std::env::var("NOKK_TRACE_HEAD") {
-                Ok(_) => "typeof __pt_probeHead === 'function' ? __pt_probeHead(40000) : ''",
+                Ok(_) => "typeof __pt_probeHead === 'function' ? __pt_probeHead(400000) : ''",
                 Err(_) => "typeof __pt_probeTail === 'function' ? __pt_probeTail(40) : ''",
             };
             let mut where_: Vec<Option<u32>> = vec![None];

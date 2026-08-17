@@ -1036,7 +1036,17 @@ const TIMERS_TEMPLATE: &str = r#"(() => {
 /// Never on by default: it wraps accessors, which is a change to the surface it
 /// is measuring.
 pub fn probe_tracer_script() -> String {
-    r##"(() => {
+    let cap = std::env::var("NOKK_TRACE_CAP")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(40_000);
+    TRACER_TEMPLATE.replace("__HEAD_CAP__", &cap.to_string())
+}
+
+const TRACER_TEMPLATE: &str = r##"(() => {
+  // Потолок ленты: по умолчанию хватает, но при разборе долгих пауз нужно
+  // видеть дальше — NOKK_TRACE_CAP поднимает его.
+  const HEAD_CAP = __HEAD_CAP__;
   const log = new Map();
   const show = (v) => {
     try {
@@ -1063,7 +1073,7 @@ pub fn probe_tracer_script() -> String {
     const e = log.get(name) || { n: 0, last: '' };
     e.n++; e.last = show(v);
     log.set(name, e);
-    if (head.length < 40000) head.push([Date.now() - t0, name, e.last]);
+    if (head.length < HEAD_CAP) head.push([Date.now() - t0, name, e.last]);
     if (tail.length >= 400) tail.shift();
     tail.push([Date.now() - t0, name, e.last]);
     return v;
@@ -1261,9 +1271,7 @@ pub fn probe_tracer_script() -> String {
     if (globalThis[name]) { trace(globalThis[name], tag + 'own.'); traceData(globalThis[name], tag); }
   }
   traceData(globalThis, 'win.');
-})();"##
-        .to_string()
-}
+})();"##;
 
 /// Turn a freshly created context into a worker's global scope. A worker is not
 /// a window with things missing — it is a different global object, and code that

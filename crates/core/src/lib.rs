@@ -1869,9 +1869,15 @@ impl BrowserContext {
             }
             let slices_ms = turn_started.elapsed().as_millis();
             work += ran as usize;
-            if ran > 0 || slices_ms > 30 {
-                tracing::debug!(worker = id, ran, slices_ms, "worker turn");
-            }
+            // Что воркер ждёт, когда молчит: свой таймер (и через сколько) или
+            // ничего вовсе — тогда он висит на обещании.
+            let pending = self
+                .eval_in(child, "typeof __pt_nextTimerDelay === 'function' ? __pt_nextTimerDelay() : -1")
+                .await
+                .ok()
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1);
+            tracing::debug!(worker = id, ran, slices_ms, pending, "worker turn");
 
             let qjson = self.eval_in(child, DRAIN_IO).await?;
             let queues: Value = match qjson {
