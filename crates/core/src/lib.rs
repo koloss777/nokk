@@ -1797,7 +1797,7 @@ impl BrowserContext {
                             // «отзовись через 55 мс» и меряет, сколько вышло.
                             // Дожидаться общего круга значило приписать к его
                             // 55 мс наши тридцать.
-                            self.serve_worker_soon(child).await;
+                            self.serve_worker_soon(index, id, child).await;
                         }
                         None => tracing::debug!(owner = index, worker = id, "worker post: no such worker"),
                     }
@@ -1816,9 +1816,12 @@ impl BrowserContext {
     /// Дать воркеру доработать то, что вот-вот наступит: свежедоставленное
     /// сообщение почти всегда ставит короткий таймер, и время до него — это
     /// время, которое кто-то замеряет.
-    async fn serve_worker_soon(&self, child: usize) {
-        const NEAR: i64 = 250;
-        for _ in 0..4 {
+    async fn serve_worker_soon(&self, owner: usize, id: u32, child: usize) {
+        // Ждём только то, что вот-вот: короткий таймер задания. Длинные — не
+        // наше дело, их обслужит общий круг, иначе один воркер задержит всех.
+        const NEAR: i64 = 80;
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_millis(150) {
             let slice = self
                 .engine
                 .pool
@@ -1830,6 +1833,10 @@ impl BrowserContext {
                 .and_then(|r| r.ok())
                 .unwrap_or(0);
             if slice > 0 {
+                // Ответ уходит домой сразу же, а не следующим общим кругом:
+                // это последние миллисекунды, которые челлендж приписывает к
+                // нашему времени отклика.
+                self.flush_worker_out(owner, id, child).await;
                 continue;
             }
             let next = self
@@ -1843,6 +1850,35 @@ impl BrowserContext {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(next.max(1) as u64)).await;
+        }
+        self.flush_worker_out(owner, id, child).await;
+    }
+
+    /// Отдать домой всё, что воркер уже отправил. Отдельно от общего круга,
+    /// потому что время между «колбэк положил сообщение» и «страница его
+    /// получила» тоже засекают.
+    async fn flush_worker_out(&self, owner: usize, id: u32, child: usize) {
+        let Ok(out) = self
+            .eval_in(child, "__ptJSON.stringify(__pt_drainWorkerOut())")
+            .await
+        else {
+            return;
+        };
+        let messages: Vec<String> = out
+            .as_str()
+            .and_then(|t| serde_json::from_str::<Value>(t).ok())
+            .and_then(|v| {
+                v.as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|m| m.as_str().map(str::to_string))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        for m in messages {
+            let _ = self
+                .eval_in(owner, &format!("__pt_workerMessage({id}, {})", js_str(&m)))
+                .await;
         }
     }
 
