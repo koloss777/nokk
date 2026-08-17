@@ -2171,9 +2171,20 @@ const PERFORMANCE_TEMPLATE: &str = r#"(() => {
   // DOMHighResTimeStamp: 0.1 ms granularity (Chrome coarsens it against timing
   // attacks) and never decreasing. Derived from the same clock as `Date.now()`,
   // so `timeOrigin + now()` tracks it exactly.
+  // Настоящие монотонные часы, огрублённые до браузерного шага в 0.1 мс.
+  // Считать от `Date.now()` нельзя: тот идёт целыми миллисекундами, и внутри
+  // одной задачи время не двигалось совсем — два подряд идущих `now()` всегда
+  // давали одно значение. Челлендж Cloudflare меряет ровно это: пять тысяч
+  // замеров подряд и минимальная положительная разница. У браузера 0.1 мс, у
+  // нас не было ни одного продвижения на пяти тысячах.
+  const hr = globalThis.__pt_hrtime;
+  const HR_BASE = typeof hr === 'function' ? hr() : 0;
   let last = 0;
   const nowMs = () => {
-    const coarse = Math.round(Math.max(0, Date.now() - ORIGIN) * 10) / 10;
+    const raw = typeof hr === 'function' ? hr() - HR_BASE : Math.max(0, Date.now() - ORIGIN);
+    // Тот же квант, что у Chrome, и та же арифметика с плавающей точкой:
+    // деление на 10 даёт 98.59999996423721, а не 98.6 — это видно в замерах.
+    const coarse = Math.floor(raw * 10) / 10;
     if (coarse > last) last = coarse;
     return last;
   };

@@ -42,6 +42,7 @@ pub fn install(scope: &mut v8::HandleScope) {
     bind(scope, "__pt_aesgcm", aes_gcm_op);
     bind(scope, "__pt_aescbc", aes_cbc_op);
     bind(scope, "__pt_pngDataUrl", png_data_url);
+    bind(scope, "__pt_hrtime", hrtime);
 
     // Optional real 2D rasterization (the `render` feature). Their presence is the
     // signal the JS canvas checks to use real pixels instead of synthesis.
@@ -1414,4 +1415,24 @@ fn png_data_url(
         Some(s) => rv.set(s.into()),
         None => rv.set_null(),
     }
+}
+
+/// `__pt_hrtime()` — миллисекунды с запуска процесса, с разрешением часов
+/// операционной системы.
+///
+/// `performance.now()` считался от `Date.now()`, а тот идёт целыми
+/// миллисекундами: внутри одной задачи время не двигалось вовсе. Челлендж
+/// Cloudflare меряет это в лоб — пять тысяч подряд идущих замеров и минимальная
+/// положительная разница между ними; у браузера она 0.1 мс, у нас не было ни
+/// одного продвижения. Отсюда и берётся настоящий монотонный источник, а
+/// огрубление до браузерного шага делает уже JS.
+fn hrtime(
+    scope: &mut v8::HandleScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    let ms = start.elapsed().as_nanos() as f64 / 1.0e6;
+    rv.set(v8::Number::new(scope, ms).into());
 }

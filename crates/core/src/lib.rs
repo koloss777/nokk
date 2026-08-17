@@ -6193,6 +6193,47 @@ mod tests {
         assert_eq!(out["highEntropy"], "x86");
     }
 
+    /// Cloudflare's collector measures our clock with its own loop: five thousand
+    /// consecutive `performance.now()` readings, keeping the smallest positive
+    /// difference. A browser advances every 0.1 ms; ours was computed from
+    /// `Date.now()`, which moves in whole milliseconds, so inside a single task
+    /// the clock never moved at all — five thousand readings, one value.
+    #[tokio::test]
+    async fn the_clock_advances_the_way_a_browser_s_does() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            // Их цикл, слово в слово.
+            let min;
+            let advances = 0;
+            for (let d = 0; d < 5000; d++) {
+                const e = performance.now(), f = performance.now();
+                if (e < f) { advances++; const g = f - e; if (min === undefined || g < min) min = g; }
+            }
+            const seen = new Set();
+            for (let i = 0; i < 2000; i++) seen.add(performance.now());
+            const values = [...seen];
+            return __ptJSON.stringify({
+              advances, min: min === undefined ? -1 : min, distinct: values.length,
+              // Шаг ровно тот же, что у Chrome, и та же арифметика с плавающей точкой.
+              quantum: values.length > 1 ? Math.round((values[1] - values[0]) * 1000) / 1000 : -1,
+              monotonic: values.every((v, i) => i === 0 || v > values[i - 1]),
+              coherent: Math.abs(performance.timeOrigin + performance.now() - Date.now()) < 1000,
+            });
+        })()"#).await;
+
+        assert!(out["advances"].as_u64().unwrap_or(0) > 0, "the clock moves inside one task: {out}");
+        assert!(out["distinct"].as_u64().unwrap_or(0) > 1, "and successive readings differ: {out}");
+        assert_eq!(out["quantum"], 0.1, "in Chrome's 0.1 ms steps");
+        assert_eq!(out["monotonic"], true);
+        assert_eq!(out["coherent"], true, "timeOrigin + now() still tracks the wall clock");
+    }
+
     /// Font enumeration goes through `document.fonts.check('12px "Some Font"')`,
     /// and ours was a bare object from the graph table: the first call threw. A
     /// browser answers true for any family (a fallback always exists) and throws

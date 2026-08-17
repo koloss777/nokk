@@ -406,6 +406,26 @@ async fn main() -> Result<()> {
                       };
                     }
                   } catch (e) {}
+                  // Их собственные хлебные крошки: код усыпан вызовами
+                  // UpvLO0(<метка>) и eVARP2(<метка>) на каждом шаге. Метки
+                  // уникальны, поэтому последовательность вызовов — это трасса
+                  // их машины состояний, и её можно сравнить с браузерной.
+                  for (const name of ['UpvLO0', 'eVARP2']) {
+                    try {
+                      let held;
+                      Object.defineProperty(globalThis, name, {
+                        configurable: true,
+                        get() { return held; },
+                        set(v) {
+                          held = typeof v !== 'function' ? v : function (tag) {
+                            try { console.error('[crumb] ' + name + ' ' + String(tag).slice(0, 24)); } catch (e) {}
+                            return v.apply(this, arguments);
+                          };
+                        },
+                      });
+                    } catch (e) {}
+                  }
+
                   // Что VM успела потрогать перед броском. Стек внутри их
                   // интерпретатора ничего не говорит: там один диспетчер опкодов,
                   // а вот последние обращения к хостовым таблицам — говорят.
@@ -489,17 +509,27 @@ async fn main() -> Result<()> {
                   // Разговор с воркером сбора: кто кому и что послал.
                   try {
                     const WP = Worker.prototype.postMessage;
+                    const peek = (v) => {
+                      try {
+                        if (typeof v === 'string') return 'str' + v.length + ':' + v.slice(0, 90);
+                        if (v && typeof v === 'object') {
+                          return 'obj{' + Object.keys(v).map((k) => {
+                            const x = v[k];
+                            return k + '=' + (typeof x === 'string' ? 's' + x.length + ':' + x.slice(0, 40)
+                                              : x && typeof x === 'object' ? Object.prototype.toString.call(x)
+                                              : String(x).slice(0, 20));
+                          }).join(' ').slice(0, 200) + '}';
+                        }
+                        return String(v).slice(0, 60);
+                      } catch (e) { return '?'; }
+                    };
                     Worker.prototype.postMessage = function (data) {
-                      let d = '?';
-                      try { d = typeof data === 'string' ? 'str' + data.length : Object.prototype.toString.call(data); } catch (e) {}
-                      remember('worker.postMessage ' + d);
+                      remember('worker.postMessage ' + peek(data));
                       return WP.apply(this, arguments);
                     };
                     const WA = Worker.prototype.addEventListener;
                     const wrapHandler = (h) => (typeof h !== 'function' ? h : function (e) {
-                      let d = '?';
-                      try { d = typeof e.data === 'string' ? 'str' + e.data.length : Object.prototype.toString.call(e.data); } catch (x) {}
-                      remember('worker→frame ' + (e && e.type) + ' ' + d);
+                      remember('worker→frame ' + (e && e.type) + ' ' + peek(e && e.data));
                       return h.apply(this, arguments);
                     });
                     Worker.prototype.addEventListener = function (t, h) {
