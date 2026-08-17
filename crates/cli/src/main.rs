@@ -339,6 +339,17 @@ async fn main() -> Result<()> {
                     XMLHttpRequest.prototype.open = function (m, u) { this.__ptU = String(u); return O_.apply(this, arguments); };
                     XMLHttpRequest.prototype.send = function (b) {
                       try { console.error('[send] bytes=' + ((b && b.length) || 0) + ' url=' + String(this.__ptU || '').slice(-40)); } catch (e) {}
+                      // Маяк `/eb/` — единственное место, где челлендж сам
+                      // рассказывает, что у него не так. Тело собирается мимо
+                      // JSON.stringify и btoa, поэтому берём его прямо здесь.
+                      try {
+                        if (/\/eb\//.test(String(this.__ptU || ''))) {
+                          const t = typeof b === 'string' ? b : Object.prototype.toString.call(b);
+                          for (let i = 0; i < Math.min(t.length, 1600); i += 200) {
+                            console.error('[eb ' + i + '] ' + t.slice(i, i + 200));
+                          }
+                        }
+                      } catch (e) {}
                       return S_.apply(this, arguments);
                     };
                   } catch (e) {}
@@ -693,10 +704,33 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                // Чей таймер держит паузу: страницы или кадра виджета.
+                let raw = ctx
+                    .evaluate("typeof __pt_nextTimerDelay === 'function' ? String(__pt_nextTimerDelay()) : 'nofn'")
+                    .await;
+                let pending = match &raw {
+                    Ok(v) => v.as_str().unwrap_or("notstr").to_string(),
+                    Err(e) => format!("err:{e}"),
+                };
+                let frame_pending = match ctx.frame_list().first() {
+                    Some(f) => match ctx
+                        .evaluate_in_frame(
+                            f.id,
+                            "typeof __pt_nextTimerDelay === 'function' ? String(__pt_nextTimerDelay()) : 'nofn'",
+                        )
+                        .await
+                    {
+                        Ok(v) => v.as_str().unwrap_or("notstr").to_string(),
+                        Err(e) => format!("err:{e}"),
+                    },
+                    None => "noframe".to_string(),
+                };
                 tracing::debug!(
                     loop_ms = looped.as_millis(),
                     press_ms = before_press.elapsed().as_millis(),
                     worked,
+                    pending,
+                    frame_pending,
                     "solve turn"
                 );
                 // Пока в странице или её воркерах идёт работа, ждать нечего:
@@ -704,8 +738,12 @@ async fn main() -> Result<()> {
                 // что всё сделано. Сон в 400 мс на каждом витке отдавал сборщику
                 // отпечатка меньше трети реального времени, и он не поспевал за
                 // собственным таймаутом.
+                // Пауза здесь — это задержка для всякого таймера, который стал
+                // срочным внутри неё. Виджет разложен на цепочку из десятков
+                // шагов по таймеру, и четверть секунды на каждом растягивала
+                // четыре секунды работы в одиннадцать — ровно за его порог.
                 let idle = worked == 0;
-                tokio::time::sleep(Duration::from_millis(if idle { 250 } else { 20 })).await;
+                tokio::time::sleep(Duration::from_millis(if idle { 25 } else { 5 })).await;
             }
         }
 
