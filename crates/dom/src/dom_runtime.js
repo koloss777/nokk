@@ -311,6 +311,10 @@
     cloneNode(deep) {
       const c = this.__ptShallowClone();
       if (deep) for (const ch of this.__ptKids) c.appendChild(ch.cloneNode(true));
+      if (deep && this.__ptLocal === 'template' && this.__ptContent) {
+        const into = __templateContent(c);
+        for (const ch of this.__ptContent.__ptKids) into.appendChild(ch.cloneNode(true));
+      }
       return c;
     }
 
@@ -500,9 +504,37 @@
   /// A shadow root: a fragment that carries the query surface of an element and
   /// remembers its host, so a subtree can live outside the document tree while
   /// still being connected through it.
-  class ShadowRoot extends Node {
+  // DocumentFragment — свой интерфейс, а не псевдоним Node: у браузера на нём
+  // ровно одиннадцать членов, и `t.content.querySelector(...)` работает именно
+  // благодаря им. У нас фрагмент был голым Node, и запрос по нему падал.
+  class DocumentFragment extends Node {
+    constructor() { super(DOCUMENT_FRAGMENT_NODE); }
+    get [Symbol.toStringTag]() { return 'DocumentFragment'; }
+    get children() { return __collection(this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE)); }
+    get childElementCount() { return this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE).length; }
+    get firstElementChild() { return this.__ptKids.find((n) => n.nodeType === ELEMENT_NODE) || null; }
+    get lastElementChild() {
+      const k = this.__ptKids.filter((n) => n.nodeType === ELEMENT_NODE);
+      return k.length ? k[k.length - 1] : null;
+    }
+    getElementById(id) { return firstMatch(this, (e) => e.getAttribute('id') === String(id)); }
+    querySelector(sel) { return query(this, sel)[0] || null; }
+    querySelectorAll(sel) { return __staticNodeList(query(this, sel)); }
+    append(...nodes) { for (const n of nodes) this.appendChild(typeof n === 'string' ? new Text(n) : n); }
+    prepend(...nodes) {
+      const first = this.__ptKids[0] || null;
+      for (const n of nodes) this.insertBefore(typeof n === 'string' ? new Text(n) : n, first);
+    }
+    replaceChildren(...nodes) {
+      this.__ptKids = [];
+      for (const n of nodes) this.appendChild(typeof n === 'string' ? new Text(n) : n);
+    }
+    moveBefore(node, child) { return this.insertBefore(node, child); }
+  }
+
+  class ShadowRoot extends DocumentFragment {
     constructor(host, mode) {
-      super(DOCUMENT_FRAGMENT_NODE);
+      super();
       this.__ptHost = host;
       this.__ptMode = mode;
       this.ownerDocument = host.ownerDocument;
@@ -514,8 +546,16 @@
     get nodeValue() { return null; }
     get textContent() { return this.__ptKids.map(n => n.textContent).join(''); }
     set textContent(v) { this.__ptKids = []; if (v !== '') this.appendChild(new Text(String(v))); }
-    get innerHTML() { return this.__ptKids.map(serializeNode).join(''); }
-    set innerHTML(html) { this.__ptKids = []; for (const n of parseFragment(String(html))) this.appendChild(n); }
+    get innerHTML() {
+      const host = this.__ptLocal === 'template' ? __templateContent(this) : this;
+      return host.__ptKids.map(serializeNode).join('');
+    }
+    set innerHTML(html) {
+      // Разметка шаблона разбирается в его содержимое — таков разбор у него.
+      const host = this.__ptLocal === 'template' ? __templateContent(this) : this;
+      host.__ptKids = [];
+      for (const n of parseFragment(String(html))) host.appendChild(n);
+    }
     get children() { return this.__ptKids.filter(n => n.nodeType === ELEMENT_NODE); }
     get firstElementChild() { return this.children[0] || null; }
     get lastElementChild() { const c = this.children; return c[c.length - 1] || null; }
@@ -941,8 +981,16 @@
       return r && r.mode === 'open' ? r : null;
     }
 
-    get innerHTML() { return this.__ptKids.map(serializeNode).join(''); }
-    set innerHTML(html) { this.__ptKids = []; for (const n of parseFragment(String(html))) this.appendChild(n); }
+    get innerHTML() {
+      const host = this.__ptLocal === 'template' ? __templateContent(this) : this;
+      return host.__ptKids.map(serializeNode).join('');
+    }
+    set innerHTML(html) {
+      // Разметка шаблона разбирается в его содержимое — таков разбор у него.
+      const host = this.__ptLocal === 'template' ? __templateContent(this) : this;
+      host.__ptKids = [];
+      for (const n of parseFragment(String(html))) host.appendChild(n);
+    }
     get outerHTML() { return serializeNode(this); }
     // Rendered text (hidden subtrees excluded, whitespace collapsed) — an
     // approximation of `innerText` good enough for tools that read it.
@@ -1027,7 +1075,24 @@
     get isContentEditable() { const v = (this.getAttribute('contenteditable') || '').toLowerCase(); return v === '' || v === 'true'; }
     click() { this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
 
-    __ptShallowClone() { const e = new Element(this.localName); e.__ptAttrs = new Map(this.__ptAttrs); return e; }
+    __ptShallowClone() {
+      const e = new Element(this.localName);
+      e.__ptAttrs = new Map(this.__ptAttrs);
+      // Клон стоит на той же ступени лестницы интерфейсов, что и оригинал:
+      // копия `<template>` — тоже HTMLTemplateElement, а копия `<div>` —
+      // HTMLDivElement. Без этого клон был просто Element, и всё, что живёт на
+      // его интерфейсе, у копии пропадало.
+      try {
+        if (this.__ptNS && globalThis.__pt_svgProto) {
+          const p = __pt_svgProto(this.localName);
+          if (p) { Object.setPrototypeOf(e, p); e.__ptNS = this.__ptNS; }
+        } else if (globalThis.__pt_elementProto) {
+          Object.setPrototypeOf(e, __pt_elementProto(this.localName));
+        }
+      } catch (x) {}
+      e.ownerDocument = this.ownerDocument;
+      return e;
+    }
   }
 
   // ---- Document -------------------------------------------------------------
@@ -1181,7 +1246,7 @@
     }
     createTextNode(t) { const n = new Text(t); n.ownerDocument = this; return n; }
     createComment(t) { const n = new Comment(t); n.ownerDocument = this; return n; }
-    createDocumentFragment() { const f = new Node(DOCUMENT_FRAGMENT_NODE); f.ownerDocument = this; return f; }
+    createDocumentFragment() { const f = new DocumentFragment(); f.ownerDocument = this; return f; }
     createEvent() { return new Event(''); }
 
     getElementById(id) { return this.documentElement ? this.documentElement.getElementById(id) : null; }
@@ -1757,6 +1822,7 @@
   // Таблица живёт на своём элементе: страницы сравнивают
   // `document.styleSheets[0] === document.styleSheets[0]`, и правила
   // пересобираются только когда сменился текст.
+  globalThis.__pt_sheetFor = (owner) => __sheetFor(owner);
   function __sheetFor(owner) {
     __link('CSSStyleSheet', __sheetProto);
     const text = owner.__ptLocal === 'style' ? String(owner.textContent || '') : '';
@@ -2059,6 +2125,20 @@
   }
 
   // ---- build DOM from the Rust-parsed tree ----------------------------------
+  // `<template>` держит разобранное содержимое не в себе, а в отдельном
+  // DocumentFragment: `t.content`. У нас его не было вовсе, разобранные дети
+  // терялись, и код, который строит узлы через шаблон — а так делает и
+  // челлендж Cloudflare — получал undefined там, где ждал фрагмент.
+  function __templateContent(el) {
+    let f = el.__ptContent;
+    if (!f) {
+      f = (el.ownerDocument || globalThis.document).createDocumentFragment();
+      Object.defineProperty(el, '__ptContent', { value: f, writable: true, enumerable: false });
+    }
+    return f;
+  }
+  globalThis.__pt_templateContent = __templateContent;
+
   function buildNode(doc, spec) {
     if (spec.k === 't') return doc.createTextNode(spec.v);
     if (spec.k === 'c') return doc.createComment(spec.v);
@@ -2070,7 +2150,10 @@
       Object.defineProperty(el, '__ptRan', { value: true, configurable: true, enumerable: false });
     }
     for (const [name, value] of spec.attrs) el.setAttribute(name, value);
-    for (const child of spec.children) el.appendChild(buildNode(doc, child));
+    // Разбор кладёт детей шаблона в его содержимое, а сам элемент оставляет
+    // пустым — `t.childNodes.length === 0` и в браузере тоже.
+    const into = spec.tag === 'template' ? __templateContent(el) : el;
+    for (const child of spec.children) into.appendChild(buildNode(doc, child));
     return el;
   }
 
@@ -2267,6 +2350,55 @@
     return /^[a-z][a-z0-9]*(-[a-z0-9]+)+$/.test(tag) ? __htmlProto : __ifaceProto.get('HTMLUnknownElement');
   };
   globalThis.__pt_setPendingTag = (tag) => { __pendingTag = String(tag || 'div'); };
+  // `sheet` — таблица стилей самого элемента, та же, что лежит в
+  // `document.styleSheets`. Мы построили список, но с элементом его не связали,
+  // а читают чаще именно так: `document.querySelector('style').sheet.cssRules`.
+  for (const iface of ['HTMLStyleElement', 'HTMLLinkElement']) {
+    const proto = globalThis[iface] && globalThis[iface].prototype;
+    if (!proto) continue;
+    Object.defineProperty(proto, 'sheet', {
+      get() {
+        if (this.__ptLocal === 'link' && !/stylesheet/i.test(this.getAttribute('rel') || '')) return null;
+        if (!this.isConnected) return null;
+        return globalThis.__pt_sheetFor ? __pt_sheetFor(this) : null;
+      },
+      enumerable: true, configurable: true,
+    });
+  }
+  // `complete` у изображения ложен только пока загрузка в полёте. Мы за
+  // картинками в сеть не ходим, значит попытка всегда уже завершена — как и у
+  // браузера для картинки без src или с неудачной загрузкой.
+  {
+    const proto = globalThis.HTMLImageElement && HTMLImageElement.prototype;
+    if (proto) {
+      Object.defineProperty(proto, 'complete', {
+        get() { return true; }, enumerable: true, configurable: true,
+      });
+    }
+  }
+  // Члены HTMLTemplateElement, снятые с Chrome 148. `content` — сам фрагмент,
+  // остальные отражают атрибуты объявленного теневого корня.
+  {
+    const proto = globalThis.HTMLTemplateElement && HTMLTemplateElement.prototype;
+    if (proto) {
+      Object.defineProperty(proto, 'content', {
+        get() { return globalThis.__pt_templateContent ? __pt_templateContent(this) : null; },
+        enumerable: true, configurable: true,
+      });
+      const attr = (name, want) => Object.defineProperty(proto, name, {
+        get() { const v = this.getAttribute(want); return v === null ? (want === 'shadowrootmode' ? '' : false) : (want === 'shadowrootmode' ? v : true); },
+        set(v) { if (want === 'shadowrootmode') this.setAttribute(want, String(v)); else if (v) this.setAttribute(want, ''); else this.removeAttribute(want); },
+        enumerable: true, configurable: true,
+      });
+      attr('shadowRootMode', 'shadowrootmode');
+      attr('shadowRootDelegatesFocus', 'shadowrootdelegatesfocus');
+      attr('shadowRootClonable', 'shadowrootclonable');
+      attr('shadowRootSerializable', 'shadowrootserializable');
+      Object.defineProperty(proto, 'shadowRootCustomElementRegistry', {
+        get() { return ''; }, set() {}, enumerable: true, configurable: true,
+      });
+    }
+  }
   // Ссылка на прототип холста переживает обрезку глобалей воркерной области:
   // OffscreenCanvas берёт методы отсюда, когда документа нет.
   try {
@@ -2403,7 +2535,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   globalThis.Document = Document;
   globalThis.Event = Event;
   globalThis.CustomEvent = CustomEvent;
-  globalThis.DocumentFragment = Node;
+  globalThis.DocumentFragment = DocumentFragment;
   document.__ptView = globalThis;
 
   // <script> nodes in document order, so the loader can point `currentScript` at

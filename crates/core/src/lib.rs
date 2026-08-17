@@ -6144,6 +6144,57 @@ mod tests {
         assert_eq!(out["highEntropy"], "x86");
     }
 
+    /// `<template>` keeps its parsed markup in a fragment of its own, not in
+    /// itself. We had no `content` at all, and the parser's template children
+    /// were dropped on the floor — the widget's second-stage program builds nodes
+    /// through a template, and reported `TypeError: ie is not a function` to
+    /// Cloudflare's own error beacon because of it.
+    #[tokio::test]
+    async fn a_template_keeps_its_markup_in_its_content() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<html><body><template id=\"t\"><div class=\"a\">x</div><span>y</span></template></body></html>",
+        )
+        .await
+        .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const tag = (v) => Object.prototype.toString.call(v);
+            const t = document.getElementById('t');
+            const made = document.createElement('template');
+            made.innerHTML = '<p>hi</p>';
+            const clone = t.cloneNode(true);
+            return __ptJSON.stringify({
+              content: tag(t.content), nodeType: t.content.nodeType,
+              // Разобранные дети — в содержимом, сам элемент пуст.
+              kids: t.content.childNodes.length, own: t.childNodes.length,
+              first: t.content.firstChild.localName,
+              innerHTML: t.innerHTML,
+              query: t.content.querySelector('.a').localName,
+              madeKids: made.content.childNodes.length, madeOwn: made.childNodes.length,
+              cloneKids: clone.content.childNodes.length,
+              cloneIface: tag(clone),
+              fragment: Object.getOwnPropertyNames(DocumentFragment.prototype).length,
+            });
+        })()"#).await;
+
+        assert_eq!(out["content"], "[object DocumentFragment]");
+        assert_eq!(out["nodeType"], 11);
+        assert_eq!(out["kids"], 2, "the parser's children live in the content");
+        assert_eq!(out["own"], 0, "and the template itself has none");
+        assert_eq!(out["first"], "div");
+        assert_eq!(out["innerHTML"], "<div class=\"a\">x</div><span>y</span>");
+        assert_eq!(out["query"], "div", "a fragment answers queries of its own");
+        assert_eq!(out["madeKids"], 1, "innerHTML parses into the content");
+        assert_eq!(out["madeOwn"], 0);
+        assert_eq!(out["cloneKids"], 2, "a deep clone brings the content along");
+        assert_eq!(out["cloneIface"], "[object HTMLTemplateElement]", "and keeps its interface");
+        assert_eq!(out["fragment"], 12, "DocumentFragment is its own interface: Chrome's 11 + constructor");
+    }
+
     /// Cloudflare's collector worker is 291 bytes and runs its task under one
     /// condition: `e.isTrusted && '' === e.origin && null === e.source`. An event
     /// the engine delivers is the browser's own and is trusted; ours was not, so

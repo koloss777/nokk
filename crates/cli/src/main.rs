@@ -367,6 +367,18 @@ async fn main() -> Result<()> {
                       if (typeof out === 'string' && out.length > biggest.length) biggest = out;
                       if (typeof out === 'string' && out.length > 300 && n++ < 6) {
                         try { console.error('[payload ' + out.length + '] ' + out.slice(0, 900)); } catch (e) {}
+                        // Отчёт об ошибке — единственное место, где их код сам
+                        // называет, что у него сломалось. Печатаем рядом наш
+                        // список промахов чтения: имя недостающего члена почти
+                        // всегда там, последним.
+                        if (out.indexOf('\"stack\"') >= 0 || out.indexOf('is not a function') >= 0) {
+                          try {
+                            const tail = (globalThis.__pt_missTail && __pt_missTail(24)) || '(none)';
+                            for (let i = 0; i < tail.length; i += 200) {
+                              console.error('[misses@err ' + i + '] ' + tail.slice(i, i + 200));
+                            }
+                          } catch (e2) {}
+                        }
                       }
                       return out;
                     };
@@ -406,6 +418,7 @@ async fn main() -> Result<()> {
                     } catch (e) { return '(failed)'; }
                   };
                   const misses = [];
+                  globalThis.__pt_missTail = (n) => misses.slice(-(n || 24)).join(' ');
                   try {
                     const toStr = Object.prototype.toString;
                     const describe = (r) => {

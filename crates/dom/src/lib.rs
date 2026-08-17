@@ -98,7 +98,12 @@ pub fn parse(html: &str) -> ParsedPage {
 /// Serialize one node to JSON, recording any scripts encountered.
 fn serialize(node: &Handle, scripts: &mut Vec<Script>) -> Value {
     match &node.data {
-        NodeData::Element { name, attrs, .. } => {
+        NodeData::Element {
+            name,
+            attrs,
+            template_contents,
+            ..
+        } => {
             let tag = name.local.to_string();
             let attrs_json: Vec<Value> = attrs
                 .borrow()
@@ -134,7 +139,17 @@ fn serialize(node: &Handle, scripts: &mut Vec<Script>) -> Value {
                 }
             }
 
-            let children: Vec<Value> = node
+            // `<template>` держит разобранное содержимое отдельно от детей —
+            // так велит разбор, и html5ever кладёт его в `template_contents`.
+            // Мы читали только `children` и теряли содержимое целиком: у
+            // страницы `t.content` оказывался пуст, а код, который строит узлы
+            // через шаблон, — ни с чем.
+            let holder = template_contents.borrow();
+            let source = match holder.as_ref() {
+                Some(contents) => contents,
+                None => node,
+            };
+            let children: Vec<Value> = source
                 .children
                 .borrow()
                 .iter()
