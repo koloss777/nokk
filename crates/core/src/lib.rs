@@ -1792,6 +1792,12 @@ impl BrowserContext {
                             let _ = self
                                 .eval_in(child, &format!("__pt_workerDeliver({})", js_str(data)))
                                 .await;
+                            // И сразу отдаём воркеру ход. Задание обычно ставит
+                            // короткий таймер и ждёт его: челлендж просит
+                            // «отзовись через 55 мс» и меряет, сколько вышло.
+                            // Дожидаться общего круга значило приписать к его
+                            // 55 мс наши тридцать.
+                            self.serve_worker_soon(child).await;
                         }
                         None => tracing::debug!(owner = index, worker = id, "worker post: no such worker"),
                     }
@@ -1804,6 +1810,39 @@ impl BrowserContext {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Дать воркеру доработать то, что вот-вот наступит: свежедоставленное
+    /// сообщение почти всегда ставит короткий таймер, и время до него — это
+    /// время, которое кто-то замеряет.
+    async fn serve_worker_soon(&self, child: usize) {
+        const NEAR: i64 = 250;
+        for _ in 0..4 {
+            let slice = self
+                .engine
+                .pool
+                .dispatch(self.worker, move |iso| {
+                    iso.run_event_loop(child, 200, std::time::Duration::from_millis(40))
+                })
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or(0);
+            if slice > 0 {
+                continue;
+            }
+            let next = self
+                .eval_in(child, "typeof __pt_nextTimerDelay === 'function' ? __pt_nextTimerDelay() : -1")
+                .await
+                .ok()
+                .and_then(|v| v.as_f64())
+                .map(|v| v as i64)
+                .unwrap_or(-1);
+            if !(0..=NEAR).contains(&next) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(next.max(1) as u64)).await;
         }
     }
 
@@ -1919,6 +1958,7 @@ impl BrowserContext {
                 let _ = self
                     .eval_in(owner, &format!("__pt_workerMessage({id}, {})", js_str(&m)))
                     .await;
+                tracing::debug!(worker = id, bytes = m.len(), "worker reply delivered");
             }
             if drained["closed"].as_bool().unwrap_or(false) {
                 work += 1;
@@ -2915,7 +2955,11 @@ const IDLE_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_millis(1
 const LOAD_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_000);
 
 /// How often frames are given an event-loop turn while the page runs.
-const FRAME_PUMP_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
+// Каждые четыре миллисекунды, а не двадцать: через эту очередь идут и
+// сообщения кадра своему воркеру, а челлендж замеряет круг «поставь таймер на
+// 55 мс — ответь». Двадцать миллисекунд задержки на доставку превращали
+// честные 55 в 79, и виджет гонял эту пробу заново, пока не выходил срок.
+const FRAME_PUMP_EVERY: std::time::Duration = std::time::Duration::from_millis(4);
 
 fn json_num(v: u32) -> Value {
     Value::Number(serde_json::Number::from(v))
