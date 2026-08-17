@@ -554,6 +554,20 @@ async fn main() -> Result<()> {
                       const v = obj[k];
                       if (typeof v !== 'function') continue;
                       obj[k] = function () {
+                        // Один раз: их метка времени против наших часов. Челлендж
+                        // объявляет `fail`, если расхождение больше 12 часов.
+                        if (!globalThis.__pt_clockLogged) {
+                          globalThis.__pt_clockLogged = true;
+                          try {
+                            const o = globalThis._cf_chl_opt || {};
+                            const theirs = Object.keys(o)
+                              .filter((n) => /^\d{10}$/.test(String(o[n])))
+                              .map((n) => n + '=' + o[n]);
+                            const now = Math.floor(Date.now() / 1000);
+                            console.error('[clock] ours=' + now + ' theirs=[' + theirs.join(' ') +
+                                          '] skew=' + theirs.map((t) => now - Number(t.split('=')[1])).join(','));
+                          } catch (e) {}
+                        }
                         remember(label + '.' + k);
                         try { console.error('[hook] ' + label + '.' + k); } catch (e) {}
                         try {
