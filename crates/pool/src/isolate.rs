@@ -65,9 +65,37 @@ pub(crate) fn init_platform() {
         // Pin one ref for the whole process so the platform is never freed while
         // isolates still reference it (a use-after-free otherwise).
         std::mem::forget(platform.clone());
+        // И держим ссылку для прокачки: у платформы своя очередь задач, и без
+        // неё асинхронная работа V8 не завершается никогда. Заметнее всего это
+        // на `WebAssembly.compile` — обещание просто не разрешается, а
+        // сборщик отпечатка, который его ждёт, стоит до собственного таймаута.
+        PLATFORM.set(platform.clone()).ok();
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();
     });
+}
+
+/// Платформа V8, разделяемая процессом: нужна, чтобы прокачивать её очередь
+/// задач между витками нашего цикла событий.
+static PLATFORM: std::sync::OnceLock<v8::SharedRef<v8::Platform>> = std::sync::OnceLock::new();
+
+/// Прокачать очередь задач платформы для этого изолята: одна порция задач и
+/// контрольная точка микрозадач. Возвращает `true`, если что-то выполнилось.
+fn pump_platform(isolate: &mut v8::Isolate) -> bool {
+    let Some(platform) = PLATFORM.get() else {
+        return false;
+    };
+    let mut ran = false;
+    // Ограничиваем порцию: очередь может пополнять сама себя, и бесконечный
+    // цикл здесь заморозил бы весь воркер.
+    for _ in 0..64 {
+        if !v8::Platform::pump_message_loop(platform, isolate, false) {
+            break;
+        }
+        ran = true;
+    }
+    isolate.perform_microtask_checkpoint();
+    ran
 }
 
 /// One JS isolate plus its contexts.
@@ -388,7 +416,17 @@ impl Isolate {
         // gets a chance to fire in that case. Arm the same terminate-watchdog as
         // `eval` so one runaway callback can't wedge the worker permanently.
         let watchdog = TerminateWatchdog::arm(&mut self.isolate);
-        let result = self.pump_timers(&global, max_callbacks, deadline);
+        // Сначала — очередь платформы: там доделывается то, что V8 начал сам
+        // (асинхронная компиляция WebAssembly и прочая фоновая работа). Её
+        // обещания разрешаются только здесь, а таймеры страницы ждут их.
+        let pumped = pump_platform(&mut self.isolate);
+        let mut result = self.pump_timers(&global, max_callbacks, deadline);
+        // И ещё раз после таймеров: колбэк мог начать новую фоновую работу.
+        if pump_platform(&mut self.isolate) || pumped {
+            if let Ok(n) = result.as_mut() {
+                *n += 1;
+            }
+        }
         watchdog.disarm();
         self.isolate.cancel_terminate_execution();
         if self.took_oom() {

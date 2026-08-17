@@ -1983,6 +1983,27 @@ const WEB_BODIES_TEMPLATE: &str = r##"(() => {
   // объявляются позже DOM-слоя, и в первый раз их ещё нет.
   try { if (globalThis.__pt_fillShapes) __pt_fillShapes(); } catch (e) {}
 
+  // `caches` был пустым объектом из таблицы графа: имя есть, методов нет, и
+  // первый же `caches.keys()` в воркере сборщика бросал TypeError. Хранилища у
+  // нас нет, но интерфейс обязан быть и обязан отвечать обещаниями.
+  const CS = rebrand(globalThis.caches, 'CacheStorage');
+  if (CS) {
+    const CacheIface = iface('Cache');
+    const emptyCache = () => {
+      const c = Object.create(CacheIface.prototype);
+      return c;
+    };
+    for (const m of ['add', 'addAll', 'put', 'delete']) meth(CacheIface.prototype, m, function () { return Promise.resolve(m === 'delete' ? false : undefined); });
+    meth(CacheIface.prototype, 'match', function () { return Promise.resolve(undefined); });
+    meth(CacheIface.prototype, 'matchAll', function () { return Promise.resolve([]); });
+    meth(CacheIface.prototype, 'keys', function () { return Promise.resolve([]); });
+    meth(CS.prototype, 'open', function () { return Promise.resolve(emptyCache()); });
+    meth(CS.prototype, 'has', function () { return Promise.resolve(false); });
+    meth(CS.prototype, 'delete', function () { return Promise.resolve(false); });
+    meth(CS.prototype, 'keys', function () { return Promise.resolve([]); });
+    meth(CS.prototype, 'match', function () { return Promise.resolve(undefined); });
+  }
+
   // `speechSynthesis` голосов не отдаёт (их и в headless-Chrome нет), но
   // интерфейсом быть обязан: сборщик идёт по прототипу.
   const SS = rebrand(globalThis.speechSynthesis, 'SpeechSynthesis', ET);

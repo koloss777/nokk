@@ -6144,6 +6144,36 @@ mod tests {
         assert_eq!(out["highEntropy"], "x86");
     }
 
+    /// V8 does part of its own work on the platform's task queue — asynchronous
+    /// WebAssembly compilation above all — and nothing pumped that queue here, so
+    /// `WebAssembly.compile` returned a promise that never settled. Anything
+    /// waiting on it waited forever: the challenge's collector sat for nine
+    /// seconds and then declared itself overrun.
+    #[tokio::test]
+    async fn webassembly_compiles_and_the_promise_settles() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            r#"<html><body><script>
+                globalThis.__log = { done: false };
+                // The smallest legal module: header plus version.
+                const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
+                WebAssembly.compile(bytes).then(
+                  (m) => { globalThis.__log = { done: true, kind: Object.prototype.toString.call(m) }; },
+                  (e) => { globalThis.__log = { done: true, kind: 'REJECT ' + e }; });
+              </script></body></html>"#,
+        )
+        .await
+        .unwrap();
+
+        let out = pump_until(&ctx, "__ptJSON.stringify(__log)", 40).await;
+        let said = out.as_str().unwrap_or("");
+        assert!(said.contains(r#""done":true"#), "the promise settled: {said}");
+        assert!(said.contains("[object WebAssembly.Module]"), "with a module: {said}");
+    }
+
     /// `<template>` keeps its parsed markup in a fragment of its own, not in
     /// itself. We had no `content` at all, and the parser's template children
     /// were dropped on the floor — the widget's second-stage program builds nodes
