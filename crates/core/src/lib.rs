@@ -6144,6 +6144,49 @@ mod tests {
         assert_eq!(out["highEntropy"], "x86");
     }
 
+    /// Font enumeration goes through `document.fonts.check('12px "Some Font"')`,
+    /// and ours was a bare object from the graph table: the first call threw. A
+    /// browser answers true for any family (a fallback always exists) and throws
+    /// SyntaxError on a string that is not a font shorthand at all.
+    #[tokio::test]
+    async fn the_font_set_answers_and_a_lock_is_granted() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+
+        let out = probe(&ctx, r#"(() => {
+            const bad = (() => { try { document.fonts.check('not-a-font'); return 'no throw'; }
+                                 catch (e) { return e.name; } })();
+            return __ptJSON.stringify({
+              tag: Object.prototype.toString.call(document.fonts),
+              size: document.fonts.size, status: document.fonts.status,
+              known: document.fonts.check('12px sans-serif'),
+              unknown: document.fonts.check('12px "No Such Font XYZ"'),
+              bad,
+              iterable: [...document.fonts].length,
+              // Chrome не публикует это имя на окне — интерфейс есть, глобали нет.
+              global: typeof globalThis.FontFaceSet,
+              locks: Object.prototype.toString.call(navigator.locks),
+              lockMembers: Object.getOwnPropertyNames(Object.getPrototypeOf(navigator.locks))
+                .filter((k) => k !== 'constructor').sort(),
+            });
+        })()"#).await;
+
+        assert_eq!(out["tag"], "[object FontFaceSet]");
+        assert_eq!(out["size"], 0);
+        assert_eq!(out["status"], "loaded");
+        assert_eq!(out["known"], true);
+        assert_eq!(out["unknown"], true, "a fallback is always there, so any family checks out");
+        assert_eq!(out["bad"], "SyntaxError");
+        assert_eq!(out["iterable"], 0);
+        assert_eq!(out["global"], "undefined");
+        assert_eq!(out["locks"], "[object LockManager]");
+        assert_eq!(out["lockMembers"], serde_json::json!(["query", "request"]));
+    }
+
     /// V8 does part of its own work on the platform's task queue — asynchronous
     /// WebAssembly compilation above all — and nothing pumped that queue here, so
     /// `WebAssembly.compile` returned a promise that never settled. Anything

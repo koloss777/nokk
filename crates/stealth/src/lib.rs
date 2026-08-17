@@ -1660,14 +1660,18 @@ const WEB_BODIES_TEMPLATE: &str = r##"(() => {
   // Интерфейс так, как его видит страница: конструктор бросает «Illegal
   // constructor», прототип несёт toStringTag и обратную ссылку на конструктор,
   // а имя лежит на окне неперечислимым — как у любого браузерного интерфейса.
-  const iface = (name, base) => {
+  // `hidden` — интерфейс без имени на окне: `FontFaceSet` у Chrome именно такой,
+  // и лишнее имя на глобальном объекте видно сборщику первым же обходом графа.
+  const iface = (name, base, hidden) => {
     const C = function () { throw new TypeError('Illegal constructor'); };
     try { Object.defineProperty(C, 'name', { value: name, configurable: true }); } catch (e) {}
     if (base) { try { Object.setPrototypeOf(C.prototype, base); } catch (e) {} }
     try { Object.defineProperty(C.prototype, 'constructor', { value: C, writable: true, configurable: true }); } catch (e) {}
     try { Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {}
     native(C);
-    try { Object.defineProperty(globalThis, name, { value: C, writable: true, enumerable: false, configurable: true }); } catch (e) {}
+    if (!hidden) {
+      try { Object.defineProperty(globalThis, name, { value: C, writable: true, enumerable: false, configurable: true }); } catch (e) {}
+    }
     return C;
   };
 
@@ -1675,9 +1679,9 @@ const WEB_BODIES_TEMPLATE: &str = r##"(() => {
   // переезжают на прототип: у Chrome ни у `navigator.storage`, ни у
   // `screen.orientation` собственных свойств нет вовсе — всё на прототипе,
   // и сборщик отпечатка идёт по графу именно так.
-  const rebrand = (obj, name, base) => {
+  const rebrand = (obj, name, base, hidden) => {
     if (!obj || typeof obj !== 'object') return obj;
-    const C = iface(name, base);
+    const C = iface(name, base, hidden);
     for (const k of Object.getOwnPropertyNames(obj)) {
       let d;
       try { d = Object.getOwnPropertyDescriptor(obj, k); } catch (e) { continue; }
@@ -1982,6 +1986,71 @@ const WEB_BODIES_TEMPLATE: &str = r##"(() => {
   // Второй проход по форме интерфейсов: Storage, SpeechSynthesis и звук
   // объявляются позже DOM-слоя, и в первый раз их ещё нет.
   try { if (globalThis.__pt_fillShapes) __pt_fillShapes(); } catch (e) {}
+
+  // `document.fonts` — FontFaceSet. Проверка доступности шрифта через
+  // `fonts.check('12px "Some Font"')` — обычный способ снять отпечаток по
+  // набору шрифтов, а у нас это был пустой объект, и первый же вызов бросал.
+  // Браузер отвечает true на любое семейство (запасной шрифт есть всегда) и
+  // бросает SyntaxError на строку, которая не разбирается как шрифт.
+  if (globalThis.document) {
+    // Chrome имя FontFaceSet на окне не публикует — интерфейс есть, глобали нет.
+    const FFS = rebrand(document.fonts, 'FontFaceSet', ET, true);
+    if (FFS) {
+      const P = FFS.prototype;
+      const empty = new Set();
+      defg(P, 'size', function () { return empty.size; });
+      defg(P, 'status', function () { return 'loaded'; });
+      const ready = Promise.resolve(document.fonts);
+      defg(P, 'ready', function () { return ready; });
+      for (const on of ['onloading', 'onloadingdone', 'onloadingerror']) {
+        try { Object.defineProperty(P, on, { value: null, writable: true, enumerable: true, configurable: true }); } catch (e) {}
+      }
+      // Разбор сокращения: без размера и семейства это не шрифт.
+      const parses = (font) => /(^|\s)(\d+(\.\d+)?(px|pt|em|rem|%)|x?x-(small|large)|small|medium|large|larger|smaller)(\s|\/)/.test(' ' + String(font) + ' ');
+      meth(P, 'check', function (font) {
+        if (!parses(font)) {
+          throw new (globalThis.DOMException || Error)("Failed to execute 'check' on 'FontFaceSet': Could not resolve '" + font + "' as a font.", 'SyntaxError');
+        }
+        return true;
+      });
+      meth(P, 'load', function (font) {
+        if (!parses(font)) {
+          return Promise.reject(new (globalThis.DOMException || Error)("Failed to execute 'load' on 'FontFaceSet': Could not resolve '" + font + "' as a font.", 'SyntaxError'));
+        }
+        return Promise.resolve([]);
+      });
+      meth(P, 'add', function () { return this; });
+      meth(P, 'delete', function () { return false; });
+      meth(P, 'clear', function () {});
+      meth(P, 'has', function () { return false; });
+      meth(P, 'forEach', function (f, t) { empty.forEach(f, t); });
+      meth(P, 'keys', function () { return empty.keys(); });
+      meth(P, 'values', function () { return empty.values(); });
+      meth(P, 'entries', function () { return empty.entries(); });
+      try {
+        Object.defineProperty(P, Symbol.iterator, {
+          value: fn('[Symbol.iterator]', function () { return empty.values(); }),
+          writable: true, configurable: true,
+        });
+      } catch (e) {}
+    }
+  }
+
+  // `navigator.locks` — LockManager: `request` берёт замок и зовёт колбэк.
+  if (globalThis.navigator && navigator.locks) {
+    const LM = rebrand(navigator.locks, 'LockManager');
+    if (LM) {
+      meth(LM.prototype, 'request', function (name, optionsOrCb, maybeCb) {
+        const cb = typeof optionsOrCb === 'function' ? optionsOrCb : maybeCb;
+        const lock = { name: String(name), mode: 'exclusive' };
+        try { return Promise.resolve(typeof cb === 'function' ? cb(lock) : undefined); }
+        catch (e) { return Promise.reject(e); }
+      });
+      meth(LM.prototype, 'query', function () {
+        return Promise.resolve({ held: [], pending: [] });
+      });
+    }
+  }
 
   // `caches` был пустым объектом из таблицы графа: имя есть, методов нет, и
   // первый же `caches.keys()` в воркере сборщика бросал TypeError. Хранилища у
