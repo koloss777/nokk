@@ -529,13 +529,31 @@ const PT_WRITE_HELPER: &str = r#"(() => {
   // in one store and are told apart by the literal they were born from: a set
   // holding each of the thousands of stub functions cost 256 KB per context.
   // Only functions from stub-only literals may be added.
-  {
+  const kit = (() => {
     const loc = typeof globalThis.__pt_fnLocation === 'function' ? globalThis.__pt_fnLocation : null;
     const boot = typeof globalThis.__pt_isBoot === 'function' ? globalThis.__pt_isBoot : null;
-    const sites = new Set(), other = new WeakSet();
+    const sites = new Set(), other = new WeakSet(), slotSites = new Set();
     const site = (f) => { const l = loc(f); return l ? l[1] + ':' + l[2] : ''; };
-    const kit = {
-      slots: new WeakMap(),
+    const slots = new WeakMap();
+    const dflts = new WeakMap();
+    return {
+      slots,
+      // Stored members that are not stubs (the browser's own fields kept on
+      // the object, with a default per prototype). Marked like stubs, apart.
+      addSlot(f, P, name, dflt) {
+        if (loc !== null && boot !== null && boot(f)) slotSites.add(site(f));
+        if (dflt !== undefined) { let d = dflts.get(P); if (!d) { d = Object.create(null); dflts.set(P, d); } d[name] = dflt; }
+        return f;
+      },
+      isSlot(f) { return typeof f === 'function' && loc !== null && boot !== null && slotSites.size > 0 && boot(f) && slotSites.has(site(f)); },
+      dflt(P, name) { const d = dflts.get(P); return d ? d[name] : undefined; },
+      // The engine's write to a read-only stored member; `__pt_writers`
+      // holds `true` for those instead of a setter per member.
+      writeSlot(o, name, v) {
+        let s = slots.get(o);
+        if (!s) { s = Object.create(null); try { slots.set(o, s); } catch (e) { return; } }
+        s[name] = v;
+      },
       add(f) {
         if (typeof f !== 'function') return f;
         if (loc !== null && boot !== null && boot(f)) sites.add(site(f)); else other.add(f);
@@ -547,8 +565,8 @@ const PT_WRITE_HELPER: &str = r#"(() => {
         return loc !== null && boot !== null && boot(f) && sites.has(site(f));
       },
     };
-    Object.defineProperty(globalThis, '__pt_stubMembers', { value: kit, writable: true, enumerable: false, configurable: true });
-  }
+  })();
+  Object.defineProperty(globalThis, '__pt_stubMembers', { value: kit, writable: true, enumerable: false, configurable: true });
   // A method born with its name and length, calling `f`: editing either
   // afterwards turns a function into dictionary mode (~260 bytes each).
   {
@@ -577,7 +595,7 @@ const PT_WRITE_HELPER: &str = r#"(() => {
     if (!obj) return;
     for (let p = obj; p; p = Object.getPrototypeOf(p)) {
       const w = writers.get(p);
-      if (w && w[name]) { w[name].call(obj, value); return; }
+      if (w && w[name]) { if (w[name] === true) kit.writeSlot(obj, name, value); else w[name].call(obj, value); return; }
       const d = Object.getOwnPropertyDescriptor(p, name);
       if (d) {
         if (d.set) { d.set.call(obj, value); return; }
@@ -1955,15 +1973,14 @@ const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
       set [name](v) { let s = slots.get(this); if (!s) { s = Object.create(null); try { slots.set(this, s); } catch (e) { return; } } s[name] = v; },
     }, name);
     const get = mark(pair.get);
-    const write = pair.set;
-    let set = __s_indexOf(kind, 's') >= 0 ? mark(write) : undefined;
+    let set = __s_indexOf(kind, 's') >= 0 ? mark(pair.set) : undefined;
     // Read-only from outside, but the engine writes via `__pt_write`.
-    if (!set && writers) { let w = writers.get(P); if (!w) { w = Object.create(null); writers.set(P, w); } w[name] = write; }
+    if (!set && writers) { let w = writers.get(P); if (!w) { w = Object.create(null); writers.set(P, w); } w[name] = stubs ? true : pair.set; }
     // Under tracing a read-only write is logged with its call site and goes
     // through: this finds every place the engine bypasses `__pt_write`.
     if (!set && TRACE) set = function (v) {
       try { console.error('[brand] write to read-only ' + name + ' on ' + Object.prototype.toString.call(this) + ' | ' + __s_slice(__s_split(String(new Error().stack || ''), '\n'), 2, 6).map((x) => __s_replace(__s_trim(x), /https?:\/\/[^ )]*\//, '')).join(' < ')); } catch (e) {}
-      write.call(this, v);
+      stubs.writeSlot(this, name, v);
     };
     return { get, set };
   };
@@ -2189,7 +2206,6 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
   const fewArgs = (what, need, got) => (TRACE && trace('args ' + what + ' need ' + need + ' got ' + got), __pt_mkErr(TypeError, 'Failed to execute \'' + __s_slice(what, __s_indexOf(what, '.') + 1) + '\' on \'' + __s_slice(what, 0, __s_indexOf(what, '.')) + '\': ' + need + ' argument' + (need === 1 ? '' : 's') + ' required, but only ' + got + ' present.'));
   const asMethod = (fn, key, guard) => {
     const name = keyName(key);
-    const P = guard && guard.prototype;
     // Not captured: a label string per member added up; errors rebuild it.
     const lk = guard ? guard.name + '.' + name : name;
     // Chrome's number of required args; too few throws, as there.
@@ -2199,14 +2215,14 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     // thousands of methods per context). Rare longer ones are fixed after.
     let holder;
     switch (need) {
-      case 0: holder = guard ? { [name]() { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]() { return fn.apply(this, arguments); } }; break;
-      case 1: holder = guard ? { [name]($0) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0) { return fn.apply(this, arguments); } }; break;
-      case 2: holder = guard ? { [name]($0, $1) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0, $1) { return fn.apply(this, arguments); } }; break;
-      case 3: holder = guard ? { [name]($0, $1, $2) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0, $1, $2) { return fn.apply(this, arguments); } }; break;
-      case 4: holder = guard ? { [name]($0, $1, $2, $3) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0, $1, $2, $3) { return fn.apply(this, arguments); } }; break;
-      case 5: holder = guard ? { [name]($0, $1, $2, $3, $4) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0, $1, $2, $3, $4) { return fn.apply(this, arguments); } }; break;
-      case 6: holder = guard ? { [name]($0, $1, $2, $3, $4, $5) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0, $1, $2, $3, $4, $5) { return fn.apply(this, arguments); } }; break;
-      default: holder = guard ? { [name]() { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]() { return fn.apply(this, arguments); } };
+      case 0: holder = guard ? { [name]() { if (!ownerOk(guard, guard.prototype, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(guard.prototype, this), arguments); } } : { [name]() { return fn.apply(this, arguments); } }; break;
+      case 1: holder = guard ? { [name]($0) { if (!ownerOk(guard, guard.prototype, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(guard.prototype, this), arguments); } } : { [name]($0) { return fn.apply(this, arguments); } }; break;
+      case 2: holder = guard ? { [name]($0, $1) { if (!ownerOk(guard, guard.prototype, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(guard.prototype, this), arguments); } } : { [name]($0, $1) { return fn.apply(this, arguments); } }; break;
+      case 3: holder = guard ? { [name]($0, $1, $2) { if (!ownerOk(guard, guard.prototype, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(guard.prototype, this), arguments); } } : { [name]($0, $1, $2) { return fn.apply(this, arguments); } }; break;
+      case 4: holder = guard ? { [name]($0, $1, $2, $3) { if (!ownerOk(guard, guard.prototype, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(guard.prototype, this), arguments); } } : { [name]($0, $1, $2, $3) { return fn.apply(this, arguments); } }; break;
+      case 5: holder = guard ? { [name]($0, $1, $2, $3, $4) { if (!ownerOk(guard, guard.prototype, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(guard.prototype, this), arguments); } } : { [name]($0, $1, $2, $3, $4) { return fn.apply(this, arguments); } }; break;
+      case 6: holder = guard ? { [name]($0, $1, $2, $3, $4, $5) { if (!ownerOk(guard, guard.prototype, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(guard.prototype, this), arguments); } } : { [name]($0, $1, $2, $3, $4, $5) { return fn.apply(this, arguments); } }; break;
+      default: holder = guard ? { [name]() { if (!ownerOk(guard, guard.prototype, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(guard.prototype, this), arguments); } } : { [name]() { return fn.apply(this, arguments); } };
     }
     const m = holder[name];
     return setNL(m, typeof key === 'symbol' ? name : key, need);
@@ -2218,17 +2234,18 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
   // `Set.prototype.keys.name === 'values'`); must not be renamed.
   const ALIAS_NAME = (owner, key, f) => (key === 'trimLeft' && f.name === 'trimStart') || (key === 'trimRight' && f.name === 'trimEnd')
     || (key === 'toGMTString' && f.name === 'toUTCString') || (key === 'keys' && f.name === 'values' && owner === Set.prototype);
+  // Only `fn`, `guard` and `key` are captured: a context slot per member
+  // counts, so the prototype and the promise flag are read when needed.
+  const rejecting = (guard, key) => PROMISE_GETTERS.has(guard.name + '.' + keyName(key));
   const asAccessor = (fn, key, kind, guard) => {
-    const P = guard && guard.prototype;
-    const rejects = !!guard && PROMISE_GETTERS.has(guard.name + '.' + keyName(key));
     // Method syntax: like a native getter, the trampoline has no `.prototype`.
     // A literal with a computed key gets name `get x`/`set x` and length 0/1
     // from birth.
     const k = typeof key === 'symbol' ? key : String(key);
     const g = kind === 'get '
-      ? (guard ? Object.getOwnPropertyDescriptor({ get [k]() { if (!ownerOk(guard, P, this)) { const err = illegal(guard.name + '.' + keyName(key) + '#get', this); if (rejects) return Promise.reject(err); throw err; } return fn.call(asThis(P, this)); } }, k).get
+      ? (guard ? Object.getOwnPropertyDescriptor({ get [k]() { if (!ownerOk(guard, guard.prototype, this)) { const err = illegal(guard.name + '.' + keyName(key) + '#get', this); if (rejecting(guard, key)) return Promise.reject(err); throw err; } return fn.call(asThis(guard.prototype, this)); } }, k).get
                : Object.getOwnPropertyDescriptor({ get [k]() { return fn.call(this); } }, k).get)
-      : (guard ? Object.getOwnPropertyDescriptor({ set [k](v) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + keyName(key) + '#set', this); return fn.call(asThis(P, this), v); } }, k).set
+      : (guard ? Object.getOwnPropertyDescriptor({ set [k](v) { if (!ownerOk(guard, guard.prototype, this)) throw illegal(guard.name + '.' + keyName(key) + '#set', this); return fn.call(asThis(guard.prototype, this), v); } }, k).set
                : Object.getOwnPropertyDescriptor({ set [k](v) { return fn.call(this, v); } }, k).set);
     return setNL(g, kind + keyName(key), kind === 'get ' ? 0 : 1);
   };
@@ -2240,25 +2257,30 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
   // instead of a guard wrapped around the stub: two closures per member were
   // most of a context's size. Each literal here makes only stubs.
   const stubAccessor = (key, kind, guard) => {
-    const P = guard.prototype;
-    const rejects = PROMISE_GETTERS.has(guard.name + '.' + keyName(key));
     const k = typeof key === 'symbol' ? key : String(key);
     const g = kind === 'get '
-      ? Object.getOwnPropertyDescriptor({ get [k]() { if (!ownerOk(guard, P, this)) { const err = illegal(guard.name + '.' + keyName(key) + '#get', this); if (rejects) return Promise.reject(err); throw err; } const s = SLOTS.get(asThis(P, this)); return s && k in s ? s[k] : undefined; } }, k).get
-      : Object.getOwnPropertyDescriptor({ set [k](v) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + keyName(key) + '#set', this); const t = asThis(P, this); let s = SLOTS.get(t); if (!s) { s = Object.create(null); try { SLOTS.set(t, s); } catch (e) { return; } } s[k] = v; } }, k).set;
+      ? Object.getOwnPropertyDescriptor({ get [k]() { if (!ownerOk(guard, guard.prototype, this)) { const err = illegal(guard.name + '.' + keyName(key) + '#get', this); if (rejecting(guard, key)) return Promise.reject(err); throw err; } const s = SLOTS.get(asThis(guard.prototype, this)); return s && key in s ? s[key] : undefined; } }, k).get
+      : Object.getOwnPropertyDescriptor({ set [k](v) { if (!ownerOk(guard, guard.prototype, this)) throw illegal(guard.name + '.' + keyName(key) + '#set', this); STUBS.writeSlot(asThis(guard.prototype, this), key, v); } }, k).set;
     STUBS.add(g);
     return setNL(g, kind + keyName(key), kind === 'get ' ? 0 : 1);
   };
+  // The same for stored members with a default (see `addSlot`).
+  const slotAccessor = (key, kind, guard) => {
+    const k = typeof key === 'symbol' ? key : String(key);
+    return setNL(kind === 'get '
+      ? Object.getOwnPropertyDescriptor({ get [k]() { if (!ownerOk(guard, guard.prototype, this)) { const err = illegal(guard.name + '.' + keyName(key) + '#get', this); if (rejecting(guard, key)) return Promise.reject(err); throw err; } const s = SLOTS.get(asThis(guard.prototype, this)); return s && key in s ? s[key] : STUBS.dflt(guard.prototype, key); } }, k).get
+      : Object.getOwnPropertyDescriptor({ set [k](v) { if (!ownerOk(guard, guard.prototype, this)) throw illegal(guard.name + '.' + keyName(key) + '#set', this); STUBS.writeSlot(asThis(guard.prototype, this), key, v); } }, k).set,
+      kind + keyName(key), kind === 'get ' ? 0 : 1);
+  };
   const stubMethod = (key, guard, need) => {
     const name = keyName(key);
-    const P = guard.prototype;
     let holder;
     switch (need) {
-      case 0: holder = { [name]() { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); } }; break;
-      case 1: holder = { [name]($0) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); } }; break;
-      case 2: holder = { [name]($0, $1) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); } }; break;
-      case 3: holder = { [name]($0, $1, $2) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); } }; break;
-      default: holder = { [name]() { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); } };
+      case 0: holder = { [name]() { if (!ownerOk(guard, guard.prototype, this)) throw illegal(guard.name + '.' + name, this); } }; break;
+      case 1: holder = { [name]($0) { if (!ownerOk(guard, guard.prototype, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); } }; break;
+      case 2: holder = { [name]($0, $1) { if (!ownerOk(guard, guard.prototype, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); } }; break;
+      case 3: holder = { [name]($0, $1, $2) { if (!ownerOk(guard, guard.prototype, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); } }; break;
+      default: holder = { [name]() { if (!ownerOk(guard, guard.prototype, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); } };
     }
     const m = holder[name];
     STUBS.add(m);
@@ -2296,7 +2318,10 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
         if ((wantG || !isStrict(f)) && d.configurable) {
           // A stub keeps the stub store; the engine's writes to a read-only
           // stub go through `__pt_writers`, to the same store.
-          const w = wantG && STUBS && STUBS.has(f) ? stubAccessor(key, kind, guard) : asAccessor(f, key, kind, wantG ? guard : null);
+          const w = !wantG || !STUBS ? asAccessor(f, key, kind, wantG ? guard : null)
+            : STUBS.has(f) ? stubAccessor(key, kind, guard)
+            : STUBS.isSlot(f) && owner === guard.prototype ? slotAccessor(key, kind, guard)
+            : asAccessor(f, key, kind, guard);
           if (kind === 'get ') get = w; else set = w;
           changed = true;
           N(w);
@@ -2371,7 +2396,8 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
         const pd = GOPD(p, k);
         if (!pd) continue;
         const w = (W && W.get(p) && W.get(p)[k]) || pd.set;
-        if (typeof w === 'function') { try { Reflect.apply(w, e, [v]); } catch (x) {} }
+        if (w === true) STUBS.writeSlot(e, k, v);
+        else if (typeof w === 'function') { try { Reflect.apply(w, e, [v]); } catch (x) {} }
         return;
       }
     };
@@ -2388,7 +2414,8 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
           const pd = GOPD(p, k);
           if (!pd) continue;
           const w = (W && W.get(p) && W.get(p)[k]) || pd.set;
-          if (typeof w === 'function') { try { Reflect.apply(w, e, [init[k]]); } catch (x) {} }
+          if (w === true) STUBS.writeSlot(e, k, init[k]);
+          else if (typeof w === 'function') { try { Reflect.apply(w, e, [init[k]]); } catch (x) {} }
           break;
         }
       }
@@ -3828,8 +3855,9 @@ const IFACE_KINDS_TEMPLATE: &str = r#"(() => {
   // browser, not shared across the prototype. One store for all of them (a
   // WeakMap per property was thousands per context), and accessors born with
   // their names (writing `name` later moves a function to dictionary mode).
-  const slots = new WeakMap();
-  const pair = (name, dflt) => {
+  const KIT = globalThis.__pt_stubMembers || null;
+  const slots = KIT ? KIT.slots : new WeakMap();
+  const pair = (P, name, dflt) => {
     const d = Object.getOwnPropertyDescriptor({
       get [name]() { const s = slots.get(this); return s && name in s ? s[name] : dflt; },
       set [name](v) {
@@ -3838,6 +3866,7 @@ const IFACE_KINDS_TEMPLATE: &str = r#"(() => {
         s[name] = v;
       },
     }, name);
+    if (KIT) { KIT.addSlot(d.get, P, name, dflt); KIT.addSlot(d.set, P, name); }
     return [nat(d.get), nat(d.set)];
   };
   // The engine still needs removed setters: the browser writes these fields
@@ -3858,16 +3887,17 @@ const IFACE_KINDS_TEMPLATE: &str = r#"(() => {
         try {
           if (__s_charCodeAt(kind, 0) === 97) {
             const wantSet = __s_charAt(kind, 2) === 's';
-            let get = d.get, set = d.set;
+            let get = d.get, set = d.set, own = false;
             if (!get || (wantSet && !set)) {
-              const made = pair(name, d.get ? undefined : d.value);
-              if (!get) { get = made[0]; set = made[1]; }
+              const made = pair(P, name, d.get ? undefined : d.value);
+              if (!get) { get = made[0]; set = made[1]; own = true; }
               else if (wantSet && !set) set = made[1];
             }
             if (!wantSet && set && writers) {
               let w = writers.get(P);
               if (!w) { w = Object.create(null); writers.set(P, w); }
-              w[name] = set;
+              // Our own setter writes the shared store: no function kept for it.
+              w[name] = own && KIT ? true : set;
             }
             Object.defineProperty(P, name, {
               get, set: wantSet ? set : undefined, enumerable: wantE, configurable: wantC,
