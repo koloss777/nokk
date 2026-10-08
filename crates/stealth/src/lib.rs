@@ -485,6 +485,19 @@ pub fn apply_geo(profile: &StealthProfile, timezone: &str, country_code: &str) -
 /// (see [`IFACE_KINDS`]) it is found in the store, otherwise it falls back to
 /// plain assignment. Shipped as a separate script that runs first (see
 /// [`PT_WRITE_HELPER`]), since earlier layers call it too.
+/// A data table for a template, as `JSON.parse("...")`. Written as a literal,
+/// V8 keeps a boilerplate copy of it and an allocation site per nested literal
+/// for as long as the function lives: about a megabyte per context.
+fn json_table(table: &str) -> String {
+    if serde_json::from_str::<serde_json::Value>(table).is_err() {
+        return table.to_string();
+    }
+    match serde_json::to_string(table) {
+        Ok(quoted) => format!("JSON.parse({quoted})"),
+        Err(_) => table.to_string(),
+    }
+}
+
 pub fn write_helper_script() -> String {
     PT_WRITE_HELPER.to_string()
 }
@@ -511,6 +524,52 @@ const PT_WRITE_HELPER: &str = r#"(() => {
     // Whether the engine is building an error right now: a DOMException created
     // by the page carries no stack in the browser, one thrown by a binding does.
     Object.defineProperty(globalThis, '__pt_errDepth', { value: () => depth, writable: true, enumerable: false, configurable: true });
+  }
+  // Stub members (declared by Chrome, not implemented here) keep their values
+  // in one store and are told apart by the literal they were born from: a set
+  // holding each of the thousands of stub functions cost 256 KB per context.
+  // Only functions from stub-only literals may be added.
+  {
+    const loc = typeof globalThis.__pt_fnLocation === 'function' ? globalThis.__pt_fnLocation : null;
+    const boot = typeof globalThis.__pt_isBoot === 'function' ? globalThis.__pt_isBoot : null;
+    const sites = new Set(), other = new WeakSet();
+    const site = (f) => { const l = loc(f); return l ? l[1] + ':' + l[2] : ''; };
+    const kit = {
+      slots: new WeakMap(),
+      add(f) {
+        if (typeof f !== 'function') return f;
+        if (loc !== null && boot !== null && boot(f)) sites.add(site(f)); else other.add(f);
+        return f;
+      },
+      has(f) {
+        if (typeof f !== 'function') return false;
+        if (other.has(f)) return true;
+        return loc !== null && boot !== null && boot(f) && sites.has(site(f));
+      },
+    };
+    Object.defineProperty(globalThis, '__pt_stubMembers', { value: kit, writable: true, enumerable: false, configurable: true });
+  }
+  // A method born with its name and length, calling `f`: editing either
+  // afterwards turns a function into dictionary mode (~260 bytes each).
+  {
+    const HOLD = [
+      (n, f) => ({ [n]() { return f.apply(this, arguments); } })[n],
+      (n, f) => ({ [n](a) { return f.apply(this, arguments); } })[n],
+      (n, f) => ({ [n](a, b) { return f.apply(this, arguments); } })[n],
+      (n, f) => ({ [n](a, b, c) { return f.apply(this, arguments); } })[n],
+      (n, f) => ({ [n](a, b, c, d) { return f.apply(this, arguments); } })[n],
+      (n, f) => ({ [n](a, b, c, d, e) { return f.apply(this, arguments); } })[n],
+      (n, f) => ({ [n](a, b, c, d, e, g) { return f.apply(this, arguments); } })[n],
+    ];
+    Object.defineProperty(globalThis, '__pt_method', {
+      value: (n, f, len) => {
+        const l = len === undefined ? f.length : len;
+        const m = HOLD[l < HOLD.length ? l : 0](n, f);
+        if (l >= HOLD.length) { try { Object.defineProperty(m, 'length', { value: l, configurable: true }); } catch (e) {} }
+        return m;
+      },
+      writable: true, enumerable: false, configurable: true,
+    });
   }
   const writers = new WeakMap();
   globalThis.__pt_writers = writers;
@@ -698,10 +757,15 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   // a class, throws "Illegal constructor" when called without `new` too.
   globalThis.__ptIllegal = (function () {
     'use strict';
-    return function () { return function () { throw __pt_mkErr(TypeError, 'Illegal constructor'); }; };
+    // Named at birth when a name is given: editing `name` turns a function
+    // into dictionary mode.
+    return function (n) {
+      if (n === undefined) return function () { throw __pt_mkErr(TypeError, 'Illegal constructor'); };
+      return ({ [n]: function () { throw __pt_mkErr(TypeError, 'Illegal constructor'); } })[n];
+    };
   })();
   globalThis.__ptName = (f, n) => {
-    try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {}
+    if (f.name !== n) { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} }
     return f;
   };
   // JSON captured before any page code: the engine serializes its own queues
@@ -721,8 +785,7 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
   // `navigator instanceof Navigator` holds. A plain object literal (the old
   // approach) fails all three, an instant headless tell.
   const defClass = (name, proto) => {
-    const Ctor = __ptIllegal();
-    try { Object.defineProperty(Ctor, "name", { value: name, configurable: true }); } catch (e) {}
+    const Ctor = __ptIllegal(name);
     // Prototype from a V8 template (immutable, like Chrome's); see __pt_protoTemplates.
     if (proto) {
       try {
@@ -756,9 +819,7 @@ const ENVIRONMENT_TEMPLATE: &str = r#"(() => {
       const methodish = /^[a-z_$]/.test(String(name))
         && Object.getOwnPropertyNames((fn && fn.prototype) || {}).length <= 1;
       if (typeof fn === 'function' && methodish && Object.getOwnPropertyDescriptor(fn, 'prototype')) {
-        const holder = { [name](...args) { return fn.apply(this, args); } };
-        m = holder[name];
-        Object.defineProperty(m, 'length', { value: fn.length, configurable: true });
+        m = __pt_method(name, fn);
       }
     } catch (e) {}
     try { Object.defineProperty(proto, name, { value: m, enumerable: true, configurable: true, writable: true }); } catch (e) {}
@@ -1245,9 +1306,9 @@ const INTL_SHIM_TEMPLATE: &str = r#"(() => {
 /// and masks patched functions so `fn.toString()` still reads `[native code]`.
 pub fn fingerprint_script(profile: &StealthProfile) -> String {
     FINGERPRINT_TEMPLATE
-        .replace("__RTC_CHROME__", RTC_CHROME)
-        .replace("__GL_ARITY__", GL_ARITY)
-        .replace("__WEBGL_EXT_SHAPES__", WEBGL_EXT_SHAPES)
+        .replace("__RTC_CHROME__", &json_table(RTC_CHROME))
+        .replace("__GL_ARITY__", &json_table(GL_ARITY))
+        .replace("__WEBGL_EXT_SHAPES__", &json_table(WEBGL_EXT_SHAPES))
         .replace("__WEBGL_VENDOR__", &quoted(&profile.webgl_vendor))
         .replace("__WEBGL_RENDERER__", &quoted(&profile.webgl_renderer))
         .replace("__FP_SEED__", &identity_seed(profile).to_string())
@@ -1844,7 +1905,7 @@ pub fn proto_shape_script() -> String {
         .unwrap_or_else(|| "null".to_string());
     PROTO_SHAPE_TEMPLATE
         .replace("__SHAPE_SKIP__", &skip)
-        .replace("__SHAPE__", PROTO_SHAPE)
+        .replace("__SHAPE__", &json_table(PROTO_SHAPE))
         .replace("__BRAND_TRACE__", if std::env::var_os("NOKK_TRACE_BRAND").is_some() { "true" } else { "false" })
 }
 
@@ -1868,19 +1929,15 @@ const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
     __s_trim = __sm(String.prototype.trim, 'trim'),
     __s_replace = __sm(String.prototype.replace, 'replace'),
     __s_split = __sm(String.prototype.split, 'split');
-  const T0 = __SHAPE__;
   const SKIP = __SHAPE_SKIP__;
-  const T = {};
-  for (const k of Object.keys(T0)) if (!SKIP || !SKIP.test(k)) T[k] = T0[k];
+  // Released at the end: stubs outlive this layer and keep its scope.
+  let T = {};
+  { const T0 = __SHAPE__; for (const k of Object.keys(T0)) if (!SKIP || !SKIP.test(k)) T[k] = T0[k]; }
   const TRACE = __BRAND_TRACE__;
   const desc = (o, k) => { try { return Object.getOwnPropertyDescriptor(o, k); } catch (e) { return undefined; } };
   const def = (o, k, d) => { try { Object.defineProperty(o, k, d); return true; } catch (e) { return false; } };
   const del = (o, k) => { try { return delete o[k]; } catch (e) { return false; } };
-  let stubs = null;
-  try {
-    if (!globalThis.__pt_stubMembers) Object.defineProperty(globalThis, '__pt_stubMembers', { value: new Set(), configurable: true, enumerable: false, writable: true });
-    stubs = globalThis.__pt_stubMembers;
-  } catch (e) {}
+  const stubs = globalThis.__pt_stubMembers || null;
   const mark = (f) => { if (stubs) try { stubs.add(f); } catch (e) {} return f; };
   const named = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return f; };
   const writers = globalThis.__pt_writers;
@@ -1889,11 +1946,13 @@ const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
   // (~290 bytes), and there are thousands of stubs per context. A literal
   // getter is named `get x` by itself, a literal method has no `prototype`,
   // as in the browser.
+  // One store for every stub accessor (object -> {name: value}): a WeakMap
+  // per member was thousands per context.
+  const slots = stubs ? stubs.slots : new WeakMap();
   const stubAccessor = (P, name, kind) => {
-    const slots = new WeakMap();
     const pair = Object.getOwnPropertyDescriptor({
-      get [name]() { const s = slots.get(this); return s ? s.v : undefined; },
-      set [name](v) { let s = slots.get(this); if (!s) { s = {}; try { slots.set(this, s); } catch (e) { return; } } s.v = v; },
+      get [name]() { const s = slots.get(this); return s && name in s ? s[name] : undefined; },
+      set [name](v) { let s = slots.get(this); if (!s) { s = Object.create(null); try { slots.set(this, s); } catch (e) { return; } } s[name] = v; },
     }, name);
     const get = mark(pair.get);
     const write = pair.set;
@@ -1999,6 +2058,8 @@ const PROTO_SHAPE_TEMPLATE: &str = r#"(() => {
       if (isStub) def(P, k, Object.assign({}, sd, { enumerable: d.enumerable, configurable: d.configurable }));
     }
   }
+  T = null;
+  for (const k of Object.keys(has)) delete has[k];
 })();"#;
 
 pub fn naturalize_script() -> String {
@@ -2011,10 +2072,10 @@ pub fn naturalize_script() -> String {
         .unwrap_or_else(|| "null".to_string());
     NATURALIZE_TEMPLATE
         .replace("__SKIP__", &skip)
-        .replace("__BRAND_EXCEPTIONS__", BRAND_EXCEPTIONS)
-        .replace("__CTOR_TABLE__", CTOR_TABLE)
-        .replace("__EVENT_DEFAULTS__", EVENT_DEFAULTS)
-        .replace("__METHOD_LENGTHS__", METHOD_LENGTHS)
+        .replace("__BRAND_EXCEPTIONS__", &json_table(BRAND_EXCEPTIONS))
+        .replace("__CTOR_TABLE__", &json_table(CTOR_TABLE))
+        .replace("__EVENT_DEFAULTS__", &json_table(EVENT_DEFAULTS))
+        .replace("__METHOD_LENGTHS__", &json_table(METHOD_LENGTHS))
         .replace("__BRAND_TRACE__", if std::env::var_os("NOKK_TRACE_BRAND").is_some() { "true" } else { "false" })
 }
 
@@ -2058,7 +2119,7 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
   // every one throws on reading `.caller`. Without this any JS wrapper, and so
   // our whole DOM, is detectable. An object is ours if its prototype chain has
   // the interface prototype or a constructor of that name (other realms too).
-  const EXC = new Set(__BRAND_EXCEPTIONS__);
+  let EXC = new Set(__BRAND_EXCEPTIONS__);
   const TRACE = __BRAND_TRACE__;
   const trace = (what) => {
     try {
@@ -2124,27 +2185,28 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
   // Rebuilt method: strict (reading `.caller` throws), no `.prototype`, brand
   // check where due. `guard` is the interface constructor, or null when the
   // owner is not an interface prototype.
-  const LENGTHS = __METHOD_LENGTHS__;
+  let LENGTHS = __METHOD_LENGTHS__;
   const fewArgs = (what, need, got) => (TRACE && trace('args ' + what + ' need ' + need + ' got ' + got), __pt_mkErr(TypeError, 'Failed to execute \'' + __s_slice(what, __s_indexOf(what, '.') + 1) + '\' on \'' + __s_slice(what, 0, __s_indexOf(what, '.')) + '\': ' + need + ' argument' + (need === 1 ? '' : 's') + ' required, but only ' + got + ' present.'));
   const asMethod = (fn, key, guard) => {
     const name = keyName(key);
     const P = guard && guard.prototype;
-    const label = guard ? guard.name + '.' + name : name;
+    // Not captured: a label string per member added up; errors rebuild it.
+    const lk = guard ? guard.name + '.' + name : name;
     // Chrome's number of required args; too few throws, as there.
-    const need = guard && Object.prototype.hasOwnProperty.call(LENGTHS, label) ? LENGTHS[label] : fn.length;
+    const need = guard && Object.prototype.hasOwnProperty.call(LENGTHS, lk) ? LENGTHS[lk] : fn.length;
     // Born with Chrome's `length`: one literal per arity, since writing
     // `length` afterwards moves the function to dictionary mode (~290 bytes,
     // thousands of methods per context). Rare longer ones are fixed after.
     let holder;
     switch (need) {
-      case 0: holder = guard ? { [name]() { if (!ownerOk(guard, P, this)) throw illegal(label, this); if (arguments.length < need) throw fewArgs(label, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]() { return fn.apply(this, arguments); } }; break;
-      case 1: holder = guard ? { [name]($0) { if (!ownerOk(guard, P, this)) throw illegal(label, this); if (arguments.length < need) throw fewArgs(label, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0) { return fn.apply(this, arguments); } }; break;
-      case 2: holder = guard ? { [name]($0, $1) { if (!ownerOk(guard, P, this)) throw illegal(label, this); if (arguments.length < need) throw fewArgs(label, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0, $1) { return fn.apply(this, arguments); } }; break;
-      case 3: holder = guard ? { [name]($0, $1, $2) { if (!ownerOk(guard, P, this)) throw illegal(label, this); if (arguments.length < need) throw fewArgs(label, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0, $1, $2) { return fn.apply(this, arguments); } }; break;
-      case 4: holder = guard ? { [name]($0, $1, $2, $3) { if (!ownerOk(guard, P, this)) throw illegal(label, this); if (arguments.length < need) throw fewArgs(label, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0, $1, $2, $3) { return fn.apply(this, arguments); } }; break;
-      case 5: holder = guard ? { [name]($0, $1, $2, $3, $4) { if (!ownerOk(guard, P, this)) throw illegal(label, this); if (arguments.length < need) throw fewArgs(label, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0, $1, $2, $3, $4) { return fn.apply(this, arguments); } }; break;
-      case 6: holder = guard ? { [name]($0, $1, $2, $3, $4, $5) { if (!ownerOk(guard, P, this)) throw illegal(label, this); if (arguments.length < need) throw fewArgs(label, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0, $1, $2, $3, $4, $5) { return fn.apply(this, arguments); } }; break;
-      default: holder = guard ? { [name]() { if (!ownerOk(guard, P, this)) throw illegal(label, this); if (arguments.length < need) throw fewArgs(label, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]() { return fn.apply(this, arguments); } };
+      case 0: holder = guard ? { [name]() { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]() { return fn.apply(this, arguments); } }; break;
+      case 1: holder = guard ? { [name]($0) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0) { return fn.apply(this, arguments); } }; break;
+      case 2: holder = guard ? { [name]($0, $1) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0, $1) { return fn.apply(this, arguments); } }; break;
+      case 3: holder = guard ? { [name]($0, $1, $2) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0, $1, $2) { return fn.apply(this, arguments); } }; break;
+      case 4: holder = guard ? { [name]($0, $1, $2, $3) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0, $1, $2, $3) { return fn.apply(this, arguments); } }; break;
+      case 5: holder = guard ? { [name]($0, $1, $2, $3, $4) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0, $1, $2, $3, $4) { return fn.apply(this, arguments); } }; break;
+      case 6: holder = guard ? { [name]($0, $1, $2, $3, $4, $5) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]($0, $1, $2, $3, $4, $5) { return fn.apply(this, arguments); } }; break;
+      default: holder = guard ? { [name]() { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); return fn.apply(asThis(P, this), arguments); } } : { [name]() { return fn.apply(this, arguments); } };
     }
     const m = holder[name];
     return setNL(m, typeof key === 'symbol' ? name : key, need);
@@ -2172,7 +2234,36 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
   };
   // Strict (and native) functions throw on reading `.caller`.
   const isStrict = (f) => { try { void f.caller; return false; } catch (e) { return true; } };
-  const stubs = () => { try { return globalThis.__pt_stubMembers || null; } catch (e) { return null; } };
+  const STUBS = globalThis.__pt_stubMembers || null;
+  const SLOTS = STUBS ? STUBS.slots : null;
+  // A stub member gets one function, brand check and value store together,
+  // instead of a guard wrapped around the stub: two closures per member were
+  // most of a context's size. Each literal here makes only stubs.
+  const stubAccessor = (key, kind, guard) => {
+    const P = guard.prototype;
+    const rejects = PROMISE_GETTERS.has(guard.name + '.' + keyName(key));
+    const k = typeof key === 'symbol' ? key : String(key);
+    const g = kind === 'get '
+      ? Object.getOwnPropertyDescriptor({ get [k]() { if (!ownerOk(guard, P, this)) { const err = illegal(guard.name + '.' + keyName(key) + '#get', this); if (rejects) return Promise.reject(err); throw err; } const s = SLOTS.get(asThis(P, this)); return s && k in s ? s[k] : undefined; } }, k).get
+      : Object.getOwnPropertyDescriptor({ set [k](v) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + keyName(key) + '#set', this); const t = asThis(P, this); let s = SLOTS.get(t); if (!s) { s = Object.create(null); try { SLOTS.set(t, s); } catch (e) { return; } } s[k] = v; } }, k).set;
+    STUBS.add(g);
+    return setNL(g, kind + keyName(key), kind === 'get ' ? 0 : 1);
+  };
+  const stubMethod = (key, guard, need) => {
+    const name = keyName(key);
+    const P = guard.prototype;
+    let holder;
+    switch (need) {
+      case 0: holder = { [name]() { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); } }; break;
+      case 1: holder = { [name]($0) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); } }; break;
+      case 2: holder = { [name]($0, $1) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); } }; break;
+      case 3: holder = { [name]($0, $1, $2) { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); } }; break;
+      default: holder = { [name]() { if (!ownerOk(guard, P, this)) throw illegal(guard.name + '.' + name, this); if (arguments.length < need) throw fewArgs(guard.name + '.' + name, need, arguments.length); } };
+    }
+    const m = holder[name];
+    STUBS.add(m);
+    return setNL(m, typeof key === 'symbol' ? name : key, need);
+  };
   const fix = (owner, key, guard) => {
     const d = desc(owner, key);
     if (!d) return;
@@ -2184,12 +2275,12 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
         const needs = hasOwn(f, 'prototype') || !isStrict(f) || wantGuard
           || (guard && Object.prototype.hasOwnProperty.call(LENGTHS, label) && LENGTHS[label] !== f.length);
         if (needs && d.configurable) {
-          const orig = f;
-          f = asMethod(f, key, wantGuard ? guard : null);
-          def(owner, key, Object.assign({}, d, { value: f }));
           // A surface stub stays a stub: layers that install real members over
-          // stubs (audio) recognize them by this set.
-          const S = stubs(); if (S && S.has(orig)) S.add(f);
+          // stubs (audio) recognize them.
+          f = wantGuard && STUBS && STUBS.has(f)
+            ? stubMethod(key, guard, Object.prototype.hasOwnProperty.call(LENGTHS, label) ? LENGTHS[label] : f.length)
+            : asMethod(f, key, wantGuard ? guard : null);
+          def(owner, key, Object.assign({}, d, { value: f }));
         } else if (typeof key === 'string' && f.name !== key && !ALIAS_NAME(owner, key, f)) {
           def(f, 'name', { value: key, configurable: true });
         }
@@ -2203,8 +2294,9 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
         if (typeof f !== 'function') continue;
         const wantG = guard && (!EXC.has(label + '#' + __s_trim(kind)) || (kind === 'get ' && PROMISE_GETTERS.has(label)));
         if ((wantG || !isStrict(f)) && d.configurable) {
-          const w = asAccessor(f, key, kind, wantG ? guard : null);
-          const S = stubs(); if (S && S.has(f)) S.add(w);
+          // A stub keeps the stub store; the engine's writes to a read-only
+          // stub go through `__pt_writers`, to the same store.
+          const w = wantG && STUBS && STUBS.has(f) ? stubAccessor(key, kind, guard) : asAccessor(f, key, kind, wantG ? guard : null);
           if (kind === 'get ') get = w; else set = w;
           changed = true;
           N(w);
@@ -2229,7 +2321,7 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
   // is refused, `new` on an abstract one throws "Illegal constructor", others
   // check the arg count. Outside sits a facade with the real class's
   // prototype and statics; the engine keeps the class itself.
-  const CT = __CTOR_TABLE__;
+  let CT = __CTOR_TABLE__;
   // Captured up front: the constructor facade must not call anything the page
   // can wrap.
   const RC = Reflect.construct, GPO = Object.getPrototypeOf, GOPD = Object.getOwnPropertyDescriptor;
@@ -2345,7 +2437,7 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
     def(globalThis, name, Object.assign({}, d, { value: F }));
   };
   const keysOf = (o) => { try { return Object.getOwnPropertyNames(o).concat(Object.getOwnPropertySymbols(o)); } catch (e) { return []; } };
-  const doneProto = new WeakSet();
+  let doneProto = new WeakSet();
   const walkProto = (proto, guard) => {
     if (!proto || typeof proto !== 'object' || doneProto.has(proto)) return;
     doneProto.add(proto);
@@ -2379,6 +2471,8 @@ const NATURALIZE_TEMPLATE: &str = r#"(() => {
       p = Object.getPrototypeOf(p);
     }
   }
+  // Load-time tables: the wrappers outlive this layer and keep its scope.
+  CT = LENGTHS = EXC = doneProto = null;
 })();"#;
 
 pub fn late_interfaces_script() -> String {
@@ -2651,7 +2745,7 @@ const CTOR_STATICS: &str = include_str!("ctor_statics.json");
 const PROTO_MEMBERS: &str = include_str!("proto_members.json");
 
 pub fn shape_fixes_script() -> String {
-    SHAPE_FIXES.replace("__CTOR_STATICS__", CTOR_STATICS).replace("__PROTO_MEMBERS__", PROTO_MEMBERS)
+    SHAPE_FIXES.replace("__CTOR_STATICS__", &json_table(CTOR_STATICS)).replace("__PROTO_MEMBERS__", &json_table(PROTO_MEMBERS))
 }
 
 const SHAPE_FIXES: &str = r#"(() => {
@@ -3295,7 +3389,7 @@ const SHAPE_FIXES: &str = r#"(() => {
 })();"#;
 
 pub fn window_order_script() -> String {
-    WINDOW_ORDER_TEMPLATE.replace("__WINDOW_ORDER__", WINDOW_ORDER)
+    WINDOW_ORDER_TEMPLATE.replace("__WINDOW_ORDER__", &json_table(WINDOW_ORDER))
 }
 
 const WINDOW_ORDER_TEMPLATE: &str = r#"(() => {
@@ -3463,7 +3557,7 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
     Object.defineProperty(navProto, k, {{ get: () => value, enumerable: true, configurable: true }});
   }}
   try {{ Object.defineProperty(navProto, Symbol.toStringTag, {{ value: 'WorkerNavigator', configurable: true }}); }} catch (e) {{}}
-  const WorkerNavigator = __ptName(__ptIllegal(), 'WorkerNavigator');
+  const WorkerNavigator = __ptIllegal('WorkerNavigator');
   WorkerNavigator.prototype = navProto;
   Object.defineProperty(navProto, 'constructor', {{ value: WorkerNavigator, writable: true, configurable: true }});
   globalThis.WorkerNavigator = WorkerNavigator;
@@ -3494,7 +3588,7 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
   }}
   Object.defineProperty(locProto, 'toString', {{ value: function toString() {{ return this.href; }}, writable: true, configurable: true }});
   try {{ Object.defineProperty(locProto, Symbol.toStringTag, {{ value: 'WorkerLocation', configurable: true }}); }} catch (e) {{}}
-  const WorkerLocation = __ptName(__ptIllegal(), 'WorkerLocation');
+  const WorkerLocation = __ptIllegal('WorkerLocation');
   WorkerLocation.prototype = locProto;
   Object.defineProperty(locProto, 'constructor', {{ value: WorkerLocation, writable: true, configurable: true }});
   globalThis.WorkerLocation = WorkerLocation;
@@ -3503,14 +3597,14 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
 
   // 5. The chain: globalThis -> DedicatedWorkerGlobalScope -> WorkerGlobalScope
   //    -> EventTarget -> Object, as in the browser.
-  const WorkerGlobalScope = __ptName(__ptIllegal(), 'WorkerGlobalScope');
+  const WorkerGlobalScope = __ptIllegal('WorkerGlobalScope');
   WorkerGlobalScope.prototype = wgsProto;
   Object.defineProperty(wgsProto, 'constructor', {{ value: WorkerGlobalScope, writable: true, configurable: true }});
   try {{ Object.defineProperty(wgsProto, Symbol.toStringTag, {{ value: 'WorkerGlobalScope', configurable: true }}); }} catch (e) {{}}
   Object.defineProperty(wgsProto, 'self', {{ get: () => globalThis, enumerable: true, configurable: true }});
 
   const dwgsProto = __reuse ? __clear(__T.w) : Object.create(wgsProto);
-  const DedicatedWorkerGlobalScope = __ptName(__ptIllegal(), 'DedicatedWorkerGlobalScope');
+  const DedicatedWorkerGlobalScope = __ptIllegal('DedicatedWorkerGlobalScope');
   DedicatedWorkerGlobalScope.prototype = dwgsProto;
   Object.defineProperty(dwgsProto, 'constructor', {{ value: DedicatedWorkerGlobalScope, writable: true, configurable: true }});
   // Interface constants as in Chrome: read-only, non-configurable.
@@ -3534,8 +3628,7 @@ pub fn worker_scope_script(name: &str, url: &str) -> String {
     ['onrtctransform', 'x']]) {{
     if (k in globalThis) continue;
     const value = kind === 'N' ? (() => {{
-      const f = __ptIllegal();
-      try {{ Object.defineProperty(f, 'name', {{ value: k, configurable: true }}); }} catch (e) {{}}
+      const f = __ptIllegal(k);
       return globalThis.__pt_native ? __pt_native(f) : f;
     }})() : null;
     try {{
@@ -3623,7 +3716,7 @@ __OPFS__
   try {{
     const fonts = globalThis.fonts;
     if (fonts && typeof globalThis.FontFaceSet !== 'function') {{
-      const FontFaceSet = __ptName(__ptIllegal(), 'FontFaceSet');
+      const FontFaceSet = __ptIllegal('FontFaceSet');
       const P = Object.create(EventTargetProto);
       const nat = (f, n) => (globalThis.__pt_native ? __pt_native(__ptName(f, n)) : __ptName(f, n));
       for (const [k, v] of [['onloading', null], ['onloadingdone', null], ['onloadingerror', null]]) {{
@@ -3685,7 +3778,7 @@ __OPFS__
         name = quoted(name),
         url = quoted(url),
     )
-    .replace("__WORKER_OWN__", WORKER_OWN)
+    .replace("__WORKER_OWN__", &json_table(WORKER_OWN))
     .replace("__WORKER_ENUM__", WORKER_ENUMERABLE)
     .replace("__WORKER_SCOPE_ENUM__", WORKER_SCOPE_ENUMERABLE)
     .replace("__WORKER_SCOPE__", WORKER_SCOPE)
@@ -3806,14 +3899,14 @@ pub fn web_surface_script() -> String {
             .replace("__OPFS__", OPFS_TEMPLATE)
             .replace("__CHROME_FULL__", CHROME_FULL),
         m("surf_bodies"),
-        WINDOW_SHAPE_TEMPLATE.replace("__WINDOW_ENUMERABLE__", WINDOW_ENUMERABLE),
+        WINDOW_SHAPE_TEMPLATE.replace("__WINDOW_ENUMERABLE__", &json_table(WINDOW_ENUMERABLE)),
         m("surf_window"),
         IFACE_STATICS_TEMPLATE
-            .replace("__IFACE_STATICS__", IFACE_STATICS)
-            .replace("__IFACE_PROTO_MOVES__", IFACE_PROTO_MOVES)
-            .replace("__IFACE_CHAIN__", IFACE_CHAIN)
-            .replace("__IFACE_LIFT__", IFACE_LIFT),
-    ) + &m("surf_statics") + &IFACE_KINDS_TEMPLATE.replace("__IFACE_KINDS__", IFACE_KINDS)
+            .replace("__IFACE_STATICS__", &json_table(IFACE_STATICS))
+            .replace("__IFACE_PROTO_MOVES__", &json_table(IFACE_PROTO_MOVES))
+            .replace("__IFACE_CHAIN__", &json_table(IFACE_CHAIN))
+            .replace("__IFACE_LIFT__", &json_table(IFACE_LIFT)),
+    ) + &m("surf_statics") + &IFACE_KINDS_TEMPLATE.replace("__IFACE_KINDS__", &json_table(IFACE_KINDS))
 }
 
 /// Makes window own-property enumerability match the browser. Runs last:
@@ -3860,7 +3953,7 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
   if (fromTemplate) { try { delete windowProperties.constructor; } catch (e) {} }
   const Window = globalThis.Window && typeof globalThis.Window === 'function'
     ? globalThis.Window
-    : native(__ptName(__ptIllegal(), 'Window'));
+    : native(__ptIllegal('Window'));
   const winProto = fromTemplate ? T.w : Object.create(windowProperties);
   for (const [name, fallback] of [['TEMPORARY', 0], ['PERSISTENT', 1]]) {
     let own;
@@ -3961,7 +4054,7 @@ const WINDOW_SHAPE_TEMPLATE: &str = r#"(() => {
     const dproto = Object.getPrototypeOf(globalThis.document);
     const HTMLDocument = typeof globalThis.HTMLDocument === 'function'
       ? globalThis.HTMLDocument
-      : __ptName(__ptIllegal(), 'HTMLDocument');
+      : __ptIllegal('HTMLDocument');
     if (dproto && !Object.getOwnPropertyDescriptor(dproto, 'constructor')) {
       // nothing: never seen a document prototype without a constructor
     }
@@ -4528,9 +4621,7 @@ __OPFS__
     const methodish = /^[a-z_$]/.test(String(name))
       && Object.getOwnPropertyNames((f && f.prototype) || {}).length <= 1;
     if (typeof f === 'function' && methodish && Object.getOwnPropertyDescriptor(f, 'prototype')) {
-      const holder = { [name](...args) { return f.apply(this, args); } };
-      m = holder[name];
-      try { Object.defineProperty(m, 'length', { value: f.length, configurable: true }); } catch (e) {}
+      m = __pt_method(name, f);
     }
     try { Object.defineProperty(m, 'name', { value: name, configurable: true }); } catch (e) {}
     return native(m);
@@ -4542,8 +4633,7 @@ __OPFS__
   // name is non-enumerable on window. `hidden`: no name on window (Chrome's
   // `FontFaceSet` is like that), since an extra global name shows in a walk.
   const iface = (name, base, hidden) => {
-    const C = __ptIllegal();
-    try { Object.defineProperty(C, 'name', { value: name, configurable: true }); } catch (e) {}
+    const C = __ptIllegal(name);
     if (base) { try { Object.setPrototypeOf(C.prototype, base); } catch (e) {} }
     try { Object.defineProperty(C.prototype, 'constructor', { value: C, writable: true, configurable: true }); } catch (e) {}
     try { Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {}
@@ -5453,9 +5543,19 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
   const native = globalThis.__pt_native || ((f) => f);
   // Strict function: interface members have no own `arguments`/`caller`.
   // Method/getter: strict and without `.prototype`, like native ones.
-  const strictFn = (function () {
+  // Born with name and length: editing them turns a function into dictionary
+  // mode (~260 bytes each).
+  const strictMethod = (function () {
     'use strict';
-    return function () { return ({ f() {} }).f; };
+    return (n, len) => {
+      const f = len === 0 ? ({ [n]() {} })[n] : len === 1 ? ({ [n](a) {} })[n] : len === 2 ? ({ [n](a, b) {} })[n] : ({ [n](a, b, c) {} })[n];
+      if (len > 3) Object.defineProperty(f, 'length', { value: len, configurable: true });
+      return f;
+    };
+  })();
+  const strictGetter = (function () {
+    'use strict';
+    return (n) => Object.getOwnPropertyDescriptor({ get [n]() {} }, n).get;
   })();
   // Chain first: until `Text` inherits `CharacterData`, placing members by
   // level is pointless. Only set where our chain is broken, and only if no
@@ -5573,11 +5673,8 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     for (const k of Object.keys(spec.f || {})) {
       if (has(k)) continue;
       try {
-        const f = strictFn();
-        Object.defineProperty(f, 'name', { value: k, configurable: true });
-        Object.defineProperty(f, 'length', { value: spec.f[k], configurable: true });
         // A method has no prototype: it is not a constructor.
-        try { delete f.prototype; } catch (e2) {}
+        const f = strictMethod(k, spec.f[k] | 0);
         Object.defineProperty(I, k, {
           value: native(f), writable: true, enumerable: !hidden.has(k), configurable: true,
         });
@@ -5586,9 +5683,7 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     for (const k of spec.g || []) {
       if (has(k)) continue;
       try {
-        const g = strictFn();
-        Object.defineProperty(g, 'name', { value: 'get ' + k, configurable: true });
-        Object.defineProperty(I, k, { get: native(g), enumerable: true, configurable: true });
+        Object.defineProperty(I, k, { get: native(strictGetter(k)), enumerable: true, configurable: true });
       } catch (e) {}
     }
   }
@@ -6470,18 +6565,9 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
   // Layers that shape their prototypes later (audio nodes, on first node
   // creation) check whether a name is taken and would yield to ours, so mark
   // what is declared here as free for them.
-  const stubs = globalThis.__pt_stubMembers || (() => {
-    const w = new WeakSet();
-    // Engine-internal names must not show in window enumeration: plain
-    // assignment would create an enumerable property visible to `for...in`.
-    Object.defineProperty(globalThis, '__pt_stubMembers', { value: w, writable: true, configurable: true });
-    return w;
-  })();
-  const named = (f, n) => {
-    try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {}
-    try { stubs.add(f); } catch (e) {}
-    return native(f);
-  };
+  const stubs = globalThis.__pt_stubMembers;
+  const liftSlots = stubs.slots;
+  const named = (f) => { try { stubs.add(f); } catch (e) {} return native(f); };
 
   const LIFT = __IFACE_LIFT__;
   for (const iface of Object.keys(LIFT)) {
@@ -6490,28 +6576,28 @@ const IFACE_STATICS_TEMPLATE: &str = r#"(() => {
     try { P = C && C.prototype; } catch (e) { continue; }
     if (!P) continue;
     const spec = LIFT[iface];
-    const slots = new WeakMap();
     for (const k of spec.a || []) {
       if (Object.prototype.hasOwnProperty.call(P, k)) continue;
       try {
-        Object.defineProperty(P, k, {
-          get: named(function () { const st = slots.get(this); return st ? st[k] : undefined; }, 'get ' + k),
-          set: named(function (v) {
-            let st = slots.get(this);
-            if (!st) { st = {}; try { slots.set(this, st); } catch (e2) { return; } }
+        const pair = Object.getOwnPropertyDescriptor({
+          get [k]() { const st = liftSlots.get(this); return st && k in st ? st[k] : undefined; },
+          set [k](v) {
+            let st = liftSlots.get(this);
+            if (!st) { st = Object.create(null); try { liftSlots.set(this, st); } catch (e2) { return; } }
             st[k] = v;
-          }, 'set ' + k),
-          enumerable: true, configurable: true,
-        });
+          },
+        }, k);
+        Object.defineProperty(P, k, { get: named(pair.get), set: named(pair.set), enumerable: true, configurable: true });
       } catch (e) {}
     }
     for (const k of Object.keys(spec.m || {})) {
       if (Object.prototype.hasOwnProperty.call(P, k)) continue;
       try {
-        const f = ({ f() {} }).f;
-        Object.defineProperty(f, 'length', { value: spec.m[k], configurable: true });
+        const n = spec.m[k];
+        const f = n === 0 ? ({ [k]() {} })[k] : n === 1 ? ({ [k](a) {} })[k] : n === 2 ? ({ [k](a, b) {} })[k] : ({ [k](a, b, c) {} })[k];
+        if (n > 3) Object.defineProperty(f, 'length', { value: n, configurable: true });
         Object.defineProperty(P, k, {
-          value: named(f, k), writable: true, enumerable: true, configurable: true,
+          value: named(f), writable: true, enumerable: true, configurable: true,
         });
       } catch (e) {}
     }
@@ -6587,15 +6673,15 @@ const WEB_SURFACE_TEMPLATE: &str = r##"(() => {
   // A stub must be a strict function: a sloppy one has own `arguments` and
   // `caller`, which browser interfaces lack (two extra properties on each of
   // ~1000 graph names). The stub still does nothing.
+  // Born with its name: editing `name` turns a function into dictionary mode.
   const strictFn = (function () {
     'use strict';
-    return function () { return function () {}; };
+    return (n) => ({ [n]: function () {} })[n];
   })();
   const stub = (name, cat) => {
     if (cat === 'N' || cat === 'f') {
       // A method (lowercase name) has no `.prototype`, like a native; an interface has one.
-      const f = /^[a-z]/.test(name) ? ({ f() {} }).f : strictFn();
-      try { Object.defineProperty(f, 'name', { value: name, configurable: true }); } catch (e) {}
+      const f = /^[a-z]/.test(name) ? ({ [name]() {} })[name] : strictFn(name);
       // An interface object carries a prototype whose members are enumerable and
       // whose `constructor` points back — that is what makes it look like one.
       try {
@@ -7818,13 +7904,13 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       if (n) { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} }
       return globalThis.__pt_native ? __pt_native(f) : f;
     };
-    const XHRET = __ptName(__ptIllegal(), 'XMLHttpRequestEventTarget');
+    const XHRET = __ptIllegal('XMLHttpRequestEventTarget');
     Object.setPrototypeOf(XHRET.prototype, globalThis.EventTarget.prototype);
     Object.defineProperty(XHRET.prototype, 'constructor', { value: XHRET, writable: true, configurable: true });
     Object.defineProperty(XHRET.prototype, Symbol.toStringTag, { value: 'XMLHttpRequestEventTarget', configurable: true });
     globalThis.XMLHttpRequestEventTarget = xmask(XHRET, 'XMLHttpRequestEventTarget');
 
-    const XHRUpload = __ptName(__ptIllegal(), 'XMLHttpRequestUpload');
+    const XHRUpload = __ptIllegal('XMLHttpRequestUpload');
     Object.setPrototypeOf(XHRUpload.prototype, XHRET.prototype);
     Object.defineProperty(XHRUpload.prototype, 'constructor', { value: XHRUpload, writable: true, configurable: true });
     Object.defineProperty(XHRUpload.prototype, Symbol.toStringTag, { value: 'XMLHttpRequestUpload', configurable: true });
@@ -8890,6 +8976,11 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // `Function.prototype.toString.toString()` reads native too, and `.name`/
   // `.length` are forwarded from the original (both preserved).
   const __ptNative = new WeakSet();
+  // The bootstrap's own functions read as native in every context of the
+  // isolate (an iframe's toString showed our source); the set keeps the rest.
+  const __ptBoot = typeof globalThis.__pt_isBoot === 'function' ? globalThis.__pt_isBoot : null;
+  const __ptIsNat = (f) => __ptNative.has(f) || (__ptBoot !== null && __ptBoot(f));
+  const __ptMark = (f) => { if (__ptBoot === null || !__ptBoot(f)) __ptNative.add(f); return f; };
   // Everything the trap uses is captured up front: a page that wrapped
   // Reflect.apply or put a `name` getter on a function would otherwise see
   // toString calling its code (Chrome's calls nothing).
@@ -8915,7 +9006,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   };
   const __ptToStr = __pt_proxy(Function.prototype.toString, {
     apply(target, thisArg, args) {
-      if (__ptNative.has(thisArg)) {
+      if (__ptIsNat(thisArg)) {
         return 'function ' + __ptFnName(thisArg) + '() { [native code] }';
       }
       return __ptRApply(target, thisArg, args);
@@ -8928,15 +9019,15 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       writable: true,
     });
   } catch (e) {}
-  __ptNative.add(__ptToStr);
+  __ptMark(__ptToStr);
 
   // Register a function as native, optionally renaming it. No longer sets an own
   // `toString` (the global patch above handles every call route).
   // Exported under a __pt name (hidden by the introspection filter): the
   // WEB_SURFACE_TEMPLATE surface marks its functions native through it.
-  globalThis.__pt_native = (fn) => { if (typeof fn === 'function') __ptNative.add(fn); return fn; };
+  globalThis.__pt_native = (fn) => { if (typeof fn === 'function') __ptMark(fn); return fn; };
   // Check without going through the toString proxy, for late shape layers.
-  globalThis.__pt_isNative = (fn) => __ptNative.has(fn);
+  globalThis.__pt_isNative = (fn) => __ptIsNat(fn);
 
   // A browser method is not a constructor: no `prototype`, and `new` throws.
   // A plain function has both and its `prototype` cannot be deleted, so the
@@ -8951,10 +9042,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     const looksLikeMethod = /^[a-z_$]/.test(key)
       && Object.getOwnPropertyNames(fn.prototype || {}).length <= 1;
     if (!looksLikeMethod) return fn;
-    const holder = { [key](...args) { return fn.apply(this, args); } };
-    const m = holder[key];
-    try { Object.defineProperty(m, 'length', { value: fn.length, configurable: true }); } catch (e) {}
-    return m;
+    return __pt_method(key, fn);
   };
 
   const mask = (fn, name) => {
@@ -8964,7 +9052,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     try {
       if (name && m.name !== name) Object.defineProperty(m, 'name', { value: name, configurable: true });
     } catch (e) {}
-    if (typeof m === 'function') __ptNative.add(m);
+    if (typeof m === 'function') __ptMark(m);
     return m;
   };
 
@@ -8984,12 +9072,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
             && Object.getOwnPropertyDescriptor(d.value, 'prototype')) {
           const m = asMethod(d.value, k);
           Object.defineProperty(proto, k, Object.assign({}, d, { value: m }));
-          __ptNative.add(m);
+          __ptMark(m);
           continue;
         }
-        if (typeof d.value === 'function') __ptNative.add(d.value);
-        if (typeof d.get === 'function') __ptNative.add(d.get);
-        if (typeof d.set === 'function') __ptNative.add(d.set);
+        if (typeof d.value === 'function') __ptMark(d.value);
+        if (typeof d.get === 'function') __ptMark(d.get);
+        if (typeof d.set === 'function') __ptMark(d.set);
       } catch (e) {}
     }
     return proto;
@@ -9024,7 +9112,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   for (const n of ['WebGLShader','WebGLProgram','WebGLBuffer','WebGLTexture','WebGLFramebuffer',
     'WebGLRenderbuffer','WebGLVertexArrayObject','WebGLUniformLocation','WebGLActiveInfo']) {
     // Not constructible, like the real interfaces — only the context hands them out.
-    if (!globalThis[n]) globalThis[n] = mask(__ptName(__ptIllegal(), n), n);
+    if (!globalThis[n]) globalThis[n] = mask(__ptIllegal(n), n);
   }
 
   // --- Canvas 2D --------------------------------------------------------
@@ -10529,26 +10617,37 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
           });
         } catch (e) {}
       }
+      const glCall = (self, args, name, need, P) => {
+        if (need && args.length < need) {
+          throw __pt_mkErr(TypeError, "Failed to execute '" + name + "' on '" +
+            (self instanceof globalThis.WebGL2RenderingContext ? 'WebGL2RenderingContext' : 'WebGLRenderingContext') +
+            "': " + need + ' argument' + (need === 1 ? '' : 's') +
+            ' required, but only ' + args.length + ' present.');
+        }
+        const t = ctxOf(self, P, name);
+        const lost = GL_LOST.get(t);
+        if (lost) return glLostAnswer(name, lost);
+        const m = Object.prototype.hasOwnProperty.call(t, name) ? t[name] : null;
+        return typeof m === 'function' ? m.apply(t, args) : undefined;
+      };
       for (const name of __s_split(methodsStr, ',')) {
         // As many args as the browser requires: fewer is a refusal naming the
         // method, not a silent `undefined`.
         const need = GL_ARITY[name] | 0;
-        const f = ({
-          [name](...args) {
-            if (need && args.length < need) {
-              throw __pt_mkErr(TypeError, "Failed to execute '" + name + "' on '" +
-                (this instanceof globalThis.WebGL2RenderingContext ? 'WebGL2RenderingContext' : 'WebGLRenderingContext') +
-                "': " + need + ' argument' + (need === 1 ? '' : 's') +
-                ' required, but only ' + args.length + ' present.');
-            }
-            const t = ctxOf(this, P, name);
-            const lost = GL_LOST.get(t);
-            if (lost) return glLostAnswer(name, lost);
-            const m = Object.prototype.hasOwnProperty.call(t, name) ? t[name] : null;
-            return typeof m === 'function' ? m.apply(t, args) : undefined;
-          },
-        })[name];
-        try { Object.defineProperty(f, 'length', { value: need, configurable: true }); } catch (e) {}
+        // Born with Chrome's `length` (editing it costs a dictionary each).
+        let f;
+        switch (need) {
+          case 0: f = ({ [name]() { return glCall(this, arguments, name, need, P); } })[name]; break;
+          case 1: f = ({ [name](a) { return glCall(this, arguments, name, need, P); } })[name]; break;
+          case 2: f = ({ [name](a, b) { return glCall(this, arguments, name, need, P); } })[name]; break;
+          case 3: f = ({ [name](a, b, c) { return glCall(this, arguments, name, need, P); } })[name]; break;
+          case 4: f = ({ [name](a, b, c, d) { return glCall(this, arguments, name, need, P); } })[name]; break;
+          case 5: f = ({ [name](a, b, c, d, e) { return glCall(this, arguments, name, need, P); } })[name]; break;
+          case 6: f = ({ [name](a, b, c, d, e, g) { return glCall(this, arguments, name, need, P); } })[name]; break;
+          default:
+            f = ({ [name]() { return glCall(this, arguments, name, need, P); } })[name];
+            try { Object.defineProperty(f, 'length', { value: need, configurable: true }); } catch (e) {}
+        }
         const mf = mask(f, name);
         try { CTX_STUBS.add(mf); } catch (e) {}
         try { Object.defineProperty(P, name, { value: mf, writable: true, enumerable: true, configurable: true }); } catch (e) {}
@@ -12078,8 +12177,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // '[object PluginArray]', entries are real Plugin/MimeType instances, and
   // both satisfy `instanceof`. A plain Array (the old shape) is an instant tell.
   const iface = (name) => {
-    const Ctor = __ptIllegal();
-    try { Object.defineProperty(Ctor, 'name', { value: name, configurable: true }); } catch (e) {}
+    const Ctor = __ptIllegal(name);
     try { Object.defineProperty(Ctor.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {}
     globalThis[name] = Ctor;
     return Ctor.prototype;
@@ -12632,7 +12730,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // `localStorage` is a Storage interface, not a literal: pages read
   // `Object.prototype.toString.call(localStorage)` like everything else.
   const StorageData = new WeakMap();
-  const Storage = __ptName(__ptIllegal(), 'Storage');
+  const Storage = __ptIllegal('Storage');
   {
     const P = Storage.prototype, data = (o) => StorageData.get(o) || new Map();
     const put = (name, f) => {
@@ -13357,25 +13455,25 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     'PerformanceEntry', 'PerformanceResourceTiming', 'PerformanceNavigationTiming',
     'CustomElementRegistry']) {
     const c = globalThis[n];
-    if (typeof c === 'function') { __ptNative.add(c); maskProto(c.prototype); }
+    if (typeof c === 'function') { __ptMark(c); maskProto(c.prototype); }
   }
   for (const n of ['dispatchEvent', 'reportError', 'cancelIdleCallback', 'requestIdleCallback',
     'addEventListener', 'removeEventListener', 'queueMicrotask', 'structuredClone']) {
-    if (typeof globalThis[n] === 'function') __ptNative.add(globalThis[n]);
+    if (typeof globalThis[n] === 'function') __ptMark(globalThis[n]);
   }
   // The element interface ladder is built in the DOM runtime before the
   // native registry exists here, so collect all of them by name.
   for (const n of Object.getOwnPropertyNames(globalThis)) {
     if (!/^(HTML|SVG)[A-Za-z]*Element$/.test(n)) continue;
     const c = globalThis[n];
-    if (typeof c === 'function') { __ptNative.add(c); maskProto(c.prototype); }
+    if (typeof c === 'function') { __ptMark(c); maskProto(c.prototype); }
   }
 
   // `console.log.toString()` is read like everything else.
   try {
     for (const k of Object.getOwnPropertyNames(globalThis.console || {})) {
       const f = console[k];
-      if (typeof f === 'function') __ptNative.add(f);
+      if (typeof f === 'function') __ptMark(f);
     }
   } catch (e) {}
 
@@ -13392,7 +13490,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
       for (const k of Object.keys(F)) {
         Object.defineProperty(ctor, k, { value: F[k], enumerable: true, configurable: true });
       }
-      __ptNative.add(ctor);
+      __ptMark(ctor);
       globalThis.NodeFilter = ctor;
     }
   } catch (e) {}
@@ -13406,7 +13504,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   try {
     const lp = globalThis.location && Object.getPrototypeOf(globalThis.location);
     if (lp && !('valueOf' in lp)) {
-      Object.defineProperty(lp, 'valueOf', { value: __ptNative.add(function valueOf() { return this; }) ? function valueOf() { return this; } : undefined, enumerable: true, configurable: true });
+      Object.defineProperty(lp, 'valueOf', { value: __ptMark(function valueOf() { return this; }) ? function valueOf() { return this; } : undefined, enumerable: true, configurable: true });
     }
   } catch (e) {}
 

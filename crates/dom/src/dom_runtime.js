@@ -2327,10 +2327,11 @@
   // assigning fields to the instance would be an obvious tell.
   const evtAccessors = (Ctor, names) => {
     for (const n of names) {
-      const get = function () { return this.__ptE[n]; };
-      const set = function (v) { this.__ptE[n] = v; };
-      try { Object.defineProperty(get, 'name', { value: 'get ' + n, configurable: true }); } catch (e) {}
-      try { Object.defineProperty(set, 'name', { value: 'set ' + n, configurable: true }); } catch (e) {}
+      // Accessor literals are born named `get x`/`set x` (no dictionary).
+      const { get, set } = Object.getOwnPropertyDescriptor({
+        get [n]() { return this.__ptE[n]; },
+        set [n](v) { this.__ptE[n] = v; },
+      }, n);
       Object.defineProperty(Ctor.prototype, n, { get, set, configurable: true, enumerable: false });
     }
   };
@@ -5161,13 +5162,13 @@
   const __mkIface = (function () {
     'use strict';
     return (name, parentProto) => {
-    const C = function () {
+    // Named at birth: editing `name` turns a function into dictionary mode.
+    const C = ({ [name]: function () {
       // `new HTMLElement()` throws in Chrome, but `super()` from a custom
       // element class must work.
       if (new.target && new.target !== C) return Reflect.construct(Element, [__pendingTag], new.target);
       throw __pt_mkErr(TypeError, "Illegal constructor");
-    };
-    try { Object.defineProperty(C, 'name', { value: name, configurable: true }); } catch (e) {}
+    } })[name];
     C.prototype = Object.create(parentProto);
     Object.defineProperty(C.prototype, 'constructor', { value: C, writable: true, configurable: true });
     try { Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) {}
@@ -6004,9 +6005,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const native = globalThis.__pt_native || ((f) => f);
     const stub = (name, cat) => {
       if (cat === 'N') {
-        const f = function () {};
-        try { Object.defineProperty(f, 'name', { value: name, configurable: true }); } catch (e) {}
-        return native(f);
+        return native(({ [name]: function () {} })[name]);
       }
       if (cat === 'x') return null;
       if (cat === 'u') return undefined;

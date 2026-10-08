@@ -500,10 +500,12 @@ fn build_bootstrap(profile: &StealthProfile) -> String {
     }
     // Diagnostic only, and last so it wraps a finished surface. Reading
     // `__pt_probeLog()` afterwards says what the page asked us and what we said.
-    match std::env::var("NOKK_TRACE_PROBES").ok().as_deref() {
+    let base = match std::env::var("NOKK_TRACE_PROBES").ok().as_deref() {
         Some("1") | Some("true") => format!("{base}\n{}", nokk_stealth::probe_tracer_script()),
         _ => base,
-    }
+    };
+    // Marks the script so `__pt_isBoot` knows the engine's functions in any context.
+    format!("{base}\n//# sourceMappingURL={}\n", nokk_pool::BOOT_SCRIPT_MARK)
 }
 
 /// For each `__pt…` name assigned anywhere in `sources` (`.__ptX = `), a setter on
@@ -8818,6 +8820,40 @@ mod tests {
                         isNat(FTS.toString()) &&
                         FTS.name === 'toString' && FTS.length === 0 &&
                         !isNat(pageFn.toString())
+                    );
+                })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(v, Value::String("true".into()));
+    }
+
+    #[tokio::test]
+    async fn another_frames_tostring_reads_engine_functions_as_native() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>")
+            .await
+            .unwrap();
+        // The registry of native functions was per window: an iframe's
+        // `Function.prototype.toString` printed the parent's wrapper source.
+        let v = ctx
+            .evaluate(
+                r#"(() => {
+                    const f = document.createElement('iframe');
+                    document.body.appendChild(f);
+                    const W = f.contentWindow;
+                    const isNat = s => /\{\s*\[native code\]\s*\}/.test(s);
+                    const get = Object.getOwnPropertyDescriptor(Node.prototype, 'nodeType').get;
+                    function pageFn() { return 1; }
+                    return String(
+                        isNat(W.Function.prototype.toString.call(document.querySelector)) &&
+                        isNat(W.Function.prototype.toString.call(get)) &&
+                        isNat(W.Function.prototype.toString.call(HTMLElement)) &&
+                        isNat(Function.prototype.toString.call(W.document.querySelector)) &&
+                        !isNat(W.Function.prototype.toString.call(pageFn)) &&
+                        !isNat(String(W.eval('(function y() {})')))
                     );
                 })()"#,
             )

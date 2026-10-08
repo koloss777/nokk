@@ -79,6 +79,7 @@ pub fn install(scope: &mut v8::PinScope) {
     bind(scope, "__pt_heapStats", heap_stats);
     bind(scope, "__pt_setCodegen", set_codegen);
     bind(scope, "__pt_fnLocation", fn_location);
+    bind(scope, "__pt_isBoot", fn_is_boot);
     bind(scope, "__pt_rtcStart", rtc_start);
     bind(scope, "__pt_rtcPoll", rtc_poll);
 
@@ -2363,6 +2364,29 @@ fn fn_location(
     let c = v8::Integer::new(scope, col.map(|x| x as i32).unwrap_or(-1));
     arr.set_index(scope, 2, c.into());
     rv.set(arr.into());
+}
+
+/// The bootstrap's source map URL: it marks the loader's script in every
+/// context (snapshot, realm, worker) without a per-function registry.
+pub const BOOT_SCRIPT_MARK: &str = "nokk:boot";
+
+/// `__pt_isBoot(fn)`: whether `fn` was compiled from the bootstrap, in any
+/// context of this isolate. Such functions are the engine's and read as native.
+fn fn_is_boot(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let Ok(f) = v8::Local::<v8::Function>::try_from(args.get(0)) else {
+        rv.set_bool(false);
+        return;
+    };
+    let origin = f.get_script_origin(scope);
+    let boot = origin
+        .source_map_url()
+        .filter(|v| v.is_string())
+        .is_some_and(|v| v.to_rust_string_lossy(scope) == BOOT_SCRIPT_MARK);
+    rv.set_bool(boot);
 }
 
 /// `__pt_setCodegen(allowed)`: whether this context may generate code from

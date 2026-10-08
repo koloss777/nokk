@@ -41,6 +41,7 @@ mod natives;
 mod webgl;
 
 pub use isolate::{build_snapshot, icu_ready, Isolate};
+pub use natives::BOOT_SCRIPT_MARK;
 
 /// Initialise the V8 platform (and ICU data) on this thread, before building the snapshot.
 pub fn init_v8() {

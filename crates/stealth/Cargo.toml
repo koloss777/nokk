@@ -11,3 +11,4 @@ categories = ["web-programming"]
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
