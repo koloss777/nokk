@@ -169,6 +169,16 @@ def _build_command(
     return cmd
 
 
+def _child_stdout() -> Optional[int]:
+    """Where the engine's log lines go: our stderr. Our stdout belongs to the
+    caller; an MCP stdio server speaks its protocol there, and log lines in it
+    broke the session."""
+    try:
+        return sys.stderr.fileno()
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
 def _merged_env(env: Optional[Mapping[str, str]]) -> "dict[str, str]":
     proc_env = dict(os.environ)
     if env:
@@ -323,7 +333,7 @@ def launch(
         args=args,
     )
     child_env = _merged_env(env)
-    process = subprocess.Popen(cmd, env=child_env)
+    process = subprocess.Popen(cmd, env=child_env, stdout=_child_stdout())
     server = NokkServer(process, host, resolved_port, child_env.get("NOKK_TOKEN") or None)
     try:
         server._wait_until_ready(timeout)
@@ -462,7 +472,7 @@ async def launch_async(
         args=args,
     )
     child_env = _merged_env(env)
-    process = await asyncio.create_subprocess_exec(*cmd, env=child_env)
+    process = await asyncio.create_subprocess_exec(*cmd, env=child_env, stdout=_child_stdout())
     server = AsyncNokkServer(process, host, resolved_port, child_env.get("NOKK_TOKEN") or None)
     try:
         await server._wait_until_ready(timeout)

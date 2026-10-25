@@ -30,8 +30,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import os
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
+
+from pydantic import Field
 
 import nokk
 from nokk._cdp import CDP, Page
@@ -50,7 +53,24 @@ except ImportError as exc:  # pragma: no cover
     ) from exc
 
 
-mcp = _Server("nokk")
+_INSTRUCTIONS = (
+    "A headless browser with Chrome's fingerprint. Call `open` first; the other "
+    "tools act on the page it opened. Cloudflare challenges are solved during `open`."
+)
+# SDK 2.x reports a server version; 1.x has no such argument.
+_server_kwargs: Dict[str, Any] = {"instructions": _INSTRUCTIONS}
+if "version" in inspect.signature(_Server.__init__).parameters:
+    _server_kwargs["version"] = nokk.__version__
+mcp = _Server("nokk", **_server_kwargs)
+
+_Selector = Annotated[
+    str,
+    Field(description="CSS selector, e.g. `h1`, `#price`, `form input[name=q]`."),
+]
+_OptionalSelector = Annotated[
+    str,
+    Field(description="CSS selector of one element; empty for the whole page."),
+]
 
 # Lazily-created singletons: one nokk server + one page, shared across tool calls
 # so the agent can navigate, then click, then read within one session. A lock
@@ -77,83 +97,97 @@ async def _get_page() -> Page:
 
 
 @mcp.tool()
-async def open(url: str) -> Dict[str, Any]:
-    """Navigate the stealth browser to ``url``. Returns the final ``{url, title}``.
-
-    A Cloudflare challenge on the way is solved before this returns (unless the
-    server runs with ``--no-auto-solve``); ``challenge`` then reports what was
-    met: ``kind``, ``solved``, and ``remaining`` (``"none"`` when through)."""
+async def open(
+    url: Annotated[str, Field(description="Absolute address to load, e.g. `https://example.com/`.")],
+) -> Dict[str, Any]:
+    """Load a page in the browser and wait until it has loaded. Returns the final
+    `url` and `title`. A Cloudflare challenge on the way is solved first (unless the
+    server runs with `--no-auto-solve`); `challenge` then reports `kind`, `solved`
+    and `remaining` (`"none"` once through). Call this before the other tools."""
     page = await _get_page()
     return await page.navigate(url, timeout=_NAV_TIMEOUT)
 
 
 @mcp.tool()
-async def solve_challenge(timeout_seconds: float = 30) -> Dict[str, Any]:
-    """Solve the Cloudflare challenge the current page shows — the "Just a
-    moment…" interstitial or a Turnstile widget — pressing its checkbox if it
-    puts one up. Returns ``status``, ``solved``, ``remaining``, ``title``, ``url``."""
+async def solve_challenge(
+    timeout_seconds: Annotated[float, Field(description="How long to wait for the challenge to clear, in seconds.")] = 30,
+) -> Dict[str, Any]:
+    """Solve the Cloudflare challenge on the current page: the "Just a moment..."
+    page or a Turnstile widget, pressing its checkbox if it shows one. Only needed
+    when `open` ran with auto-solve off or a widget appeared later. Returns
+    `status`, `solved`, `remaining`, `title` and `url`."""
     page = await _get_page()
     return await page.solve_challenge(timeout_seconds)
 
 
 @mcp.tool()
 async def challenge_state() -> Dict[str, Any]:
-    """Which gate the current page shows: ``kind`` is ``"none"``,
-    ``"cloudflare-interstitial"``, ``"turnstile-widget"``, ``"aws-waf"``,
-    ``"recaptcha-widget"`` or ``"datadome"`` (recognised, not solvable);
-    ``solvable`` says whether ``solve_challenge`` can take it on."""
+    """Report whether the current page is behind a bot check. `kind` is `"none"`
+    when the page itself is shown, else the kind of check (`"cloudflare-interstitial"`,
+    `"turnstile-widget"`, `"aws-waf"` and others); `solvable` says whether
+    `solve_challenge` can clear it."""
     page = await _get_page()
     return await page.challenge_state()
 
 
 @mcp.tool()
-async def read_text(selector: str = "") -> Optional[str]:
-    """Visible text of the current page, or of the first element matching the CSS
-    ``selector`` if given."""
+async def read_text(selector: _OptionalSelector = "") -> Optional[str]:
+    """Return the visible text of the current page, or of the first element
+    matching `selector`. `null` when no element matches."""
     page = await _get_page()
     return await page.read_text(selector or None)
 
 
 @mcp.tool()
-async def read_html(selector: str = "") -> Optional[str]:
-    """Outer HTML of the current page, or of the first element matching the CSS
-    ``selector`` if given."""
+async def read_html(selector: _OptionalSelector = "") -> Optional[str]:
+    """Return the HTML of the current page as it is now (after its scripts ran),
+    or the outer HTML of the first element matching `selector`. `null` when no
+    element matches."""
     page = await _get_page()
     return await page.read_html(selector or None)
 
 
 @mcp.tool()
-async def click(selector: str) -> bool:
-    """Click the first element matching the CSS ``selector``."""
+async def click(selector: _Selector) -> bool:
+    """Click the first element matching `selector`. Returns `true`; fails when
+    nothing matches."""
     page = await _get_page()
     return await page.click(selector)
 
 
 @mcp.tool()
-async def fill(selector: str, value: str) -> bool:
-    """Set the value of the form field matching ``selector`` and fire input/change."""
+async def fill(
+    selector: _Selector,
+    value: Annotated[str, Field(description="Text to put in the field.")],
+) -> bool:
+    """Type `value` into the form field matching `selector` (its `input` and
+    `change` events fire, as when a person types). Returns `true`; fails when
+    nothing matches."""
     page = await _get_page()
     return await page.fill(selector, value)
 
 
 @mcp.tool()
-async def evaluate(expression: str) -> object:
-    """Evaluate a JavaScript expression in the current page and return its value."""
+async def evaluate(
+    expression: Annotated[str, Field(description="JavaScript expression, e.g. `document.title` or `[...document.querySelectorAll('h2')].map(e => e.textContent)`.")],
+) -> object:
+    """Run a JavaScript expression in the current page and return its value as
+    JSON (a promise is awaited). For data the other tools do not read."""
     page = await _get_page()
     return await page.evaluate(expression)
 
 
 @mcp.tool()
 async def links() -> List[str]:
-    """All absolute hyperlink URLs on the current page."""
+    """Return the absolute addresses of all links on the current page."""
     page = await _get_page()
     return await page.links()
 
 
 @mcp.tool()
 async def reset() -> str:
-    """Discard the current browsing session (a fresh, coherent identity is used
-    for the next navigation)."""
+    """Close the browser session: cookies and page state are dropped, and the
+    next `open` starts a fresh one."""
     cdp = _state.pop("cdp", None)
     server = _state.pop("server", None)
     _state.pop("page", None)
