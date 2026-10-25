@@ -1,0 +1,66 @@
+{
+  "manifest_version": "0.3",
+  "name": "nokk",
+  "display_name": "nokk",
+  "version": "0.1.46-alpha.1",
+  "description": "Headless browser for AI agents with Chrome's fingerprint that passes Cloudflare challenges.",
+  "long_description": "nokk is a headless browser engine in Rust (V8 and its own DOM) with Chrome 151's TLS, HTTP/2 and JavaScript fingerprint. It passes Cloudflare challenges without Chromium. An agent opens a page, reads its text or HTML, clicks, fills forms and runs JavaScript.",
+  "author": {
+    "name": "koloss777",
+    "url": "https://github.com/koloss777"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/koloss777/nokk"
+  },
+  "homepage": "https://github.com/koloss777/nokk",
+  "documentation": "https://github.com/koloss777/nokk/blob/main/python/README.md",
+  "support": "https://github.com/koloss777/nokk/issues",
+  "icon": "icon.png",
+  "server": {
+    "type": "python",
+    "entry_point": "src/server.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--directory", "${__dirname}", "src/server.py"],
+      "env": {
+        "NOKK_PROXY": "${user_config.proxy}",
+        "NOKK_ROTATE_FINGERPRINT": "${user_config.rotate_fingerprint}"
+      }
+    }
+  },
+  "tools": [
+    { "name": "open", "description": "Load a page and wait until it has loaded; a Cloudflare challenge on the way is solved first." },
+    { "name": "solve_challenge", "description": "Solve the Cloudflare challenge on the current page." },
+    { "name": "challenge_state", "description": "Report whether the current page is behind a bot check." },
+    { "name": "read_text", "description": "Return the visible text of the page or of an element." },
+    { "name": "read_html", "description": "Return the HTML of the page as it is now, or of an element." },
+    { "name": "click", "description": "Click the first element matching a CSS selector." },
+    { "name": "fill", "description": "Type a value into a form field." },
+    { "name": "evaluate", "description": "Run a JavaScript expression in the page and return its value." },
+    { "name": "links", "description": "Return the absolute addresses of all links on the page." },
+    { "name": "reset", "description": "Close the browser session and drop its cookies." }
+  ],
+  "user_config": {
+    "proxy": {
+      "type": "string",
+      "title": "Proxy",
+      "description": "Upstream proxy, e.g. socks5://host:1080 or http://user:pass@host:port. Leave empty for a direct connection.",
+      "required": false,
+      "default": ""
+    },
+    "rotate_fingerprint": {
+      "type": "boolean",
+      "title": "Rotate fingerprint",
+      "description": "Give each browsing session its own coherent fingerprint.",
+      "required": false,
+      "default": false
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "linux", "win32"],
+    "runtimes": { "python": ">=3.10" }
+  },
+  "keywords": ["browser", "headless", "cloudflare", "web-scraping", "chrome", "turnstile"],
+  "license": "MIT OR Apache-2.0"
+}
