@@ -7167,6 +7167,7 @@ const STACK_TEMPLATE: &str = r##"(() => {
         ? (f.getScriptNameOrSourceURL() || f.getFileName())
         : f.getFileName();
       if (from) return false;                 // script with a URL: the page's
+      if (f.getFileName() === '') return false; // DevTools evaluation, named '' as in Chrome
       if (f.isEval()) return false;           // eval/Function: also the page's
       return f.getLineNumber() != null;       // unnamed but positioned: ours
     } catch (e) { return false; }

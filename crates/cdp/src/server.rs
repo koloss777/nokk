@@ -1735,6 +1735,7 @@ impl Conn {
                     .get("contextId")
                     .and_then(|v| v.as_i64())
                     .and_then(frame_of_ctx_id);
+                let expr = dev_value(&expr);
                 let (ctx, session, tx) =
                     (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 // Whatever this evaluate queued (a fetch, a socket) gets pumped by
@@ -1785,9 +1786,9 @@ impl Conn {
                             .collect()
                     })
                     .unwrap_or_default();
-                // Newline-isolate the declaration too — Playwright's function
-                // sources can carry a trailing `//# sourceURL=` comment.
-                let expr = format!("(\n{decl}\n).apply({this_js}, [{}])", args_js.join(","));
+                // Compiled as DevTools code and called by the engine, so the
+                // call leaves no frame (`__pt_devCall`).
+                let expr = format!("__pt_devCall({}, {this_js}, [{}])", js_str(decl), args_js.join(","));
                 // Same realm rule as `Runtime.evaluate`: a frame's context id sends
                 // the call into that frame. This is how `frame.evaluate(…)` reaches
                 // the right document — a client calls a function, it does not
@@ -2126,13 +2127,8 @@ impl Conn {
 /// `Runtime.evaluate` against a frame's own document. Same wrapper as the page
 /// path so the result shape matches; a frame that has gone away answers
 /// `undefined` rather than failing the command, since frames die on their own.
-async fn frame_eval(ctx: &BrowserContext, frame: u32, expr: &str, by_value: bool, await_promise: bool) -> Value {
+async fn frame_eval(ctx: &BrowserContext, frame: u32, value: &str, by_value: bool, await_promise: bool) -> Value {
     let by = if by_value { "true" } else { "false" };
-    // The expression goes into the script itself, compiled by the engine: an `eval`
-    // of the string is what a frame under Trusted Types refuses (Turnstile's is one),
-    // and DevTools evaluates there regardless. Statements fall back to `eval`.
-    let compiled = format!("(\n{expr}\n)");
-    let evaled = format!("__pt_devEval({})", js_str(expr));
     if await_promise {
         // As for the page: the settled value lands in a hidden slot of the
         // frame's global while the loop (frames included) runs.
@@ -2145,11 +2141,7 @@ async fn frame_eval(ctx: &BrowserContext, frame: u32, expr: &str, by_value: bool
                           e => {{ globalThis.{slot}.v = e; globalThis.{slot}.rej = true; globalThis.{slot}.done = true; }}); }})()"
             )
         };
-        let started = match ctx.evaluate_in_frame(frame, &setup(&compiled)).await {
-            Ok(_) => true,
-            Err(_) => ctx.evaluate_in_frame(frame, &setup(&evaled)).await.is_ok(),
-        };
-        if !started {
+        if ctx.evaluate_in_frame(frame, &setup(value)).await.is_err() {
             return json!({ "result": { "type": "undefined" } });
         }
         let deadline = std::time::Instant::now() + AWAIT_PROMISE_TIMEOUT;
@@ -2180,11 +2172,7 @@ async fn frame_eval(ctx: &BrowserContext, frame: u32, expr: &str, by_value: bool
                catch (e) {{ return JSON.stringify(__pt_exc(e, false, {by})); }} }})()"
         )
     };
-    let r = match ctx.evaluate_in_frame(frame, &wrap(&compiled)).await {
-        Ok(v) => Ok(v),
-        Err(_) => ctx.evaluate_in_frame(frame, &wrap(&evaled)).await,
-    };
-    eval_reply(r.ok())
+    eval_reply(ctx.evaluate_in_frame(frame, &wrap(value)).await.ok())
 }
 
 /// The body of a `Runtime.evaluate`/`callFunctionOn` reply from the JSON the
@@ -2211,25 +2199,25 @@ fn eval_reply(js: Option<Value>) -> Value {
     })
 }
 
+/// The JS that evaluates a client's `Runtime.evaluate` source: a script of its
+/// own, taking its completion value as CDP does, in global scope. Splicing the
+/// source inline (`__pt_wrap((SRC),…)`) breaks on the statement forms
+/// Puppeteer and Playwright send (an IIFE with a trailing `;`, a trailing
+/// `//# sourceURL=` comment); passed as a string, it does not.
+fn dev_value(expr: &str) -> String {
+    format!("__pt_devEval({})", js_str(expr))
+}
+
 /// Evaluate `expr` and return a CDP `RemoteObject` — by value (JSON) or as an
 /// `objectId` handle (via the JS `__pt_wrap` registry), matching `by_value`.
 /// Drives the event loop when awaiting a Promise.
 async fn remote_eval(
     ctx: &BrowserContext,
-    expr: &str,
+    value: &str,
     by_value: bool,
     await_promise: bool,
 ) -> Value {
     let by = if by_value { "true" } else { "false" };
-    // Evaluate the caller's source as a *script* via indirect `eval`, taking its
-    // completion value — exactly what CDP `Runtime.evaluate` does, and in global
-    // scope. Splicing the source inline as a sub-expression (`__pt_wrap((SRC),…)`)
-    // breaks on the statement forms Puppeteer/Playwright actually send: an IIFE
-    // with a trailing `;` becomes `(…;)` (illegal semicolon in parens) and a
-    // trailing `//# sourceURL=` comment swallows the wrapper's `)`. Passing the
-    // source as a string sidesteps both. `(0, eval)` forces the indirect/global
-    // form rather than a scoped direct eval.
-    let src = js_str(expr);
     let js = if await_promise {
         // Resolve the (possibly-Promise) value via the event loop, then wrap it.
         // The await path spans several `evaluate` calls with event-loop turns in
@@ -2241,7 +2229,7 @@ async fn remote_eval(
         let slot = format!("__pt_cdp{}", IDS.fetch_add(1, Ordering::Relaxed));
         let setup = format!(
             "(() => {{ Object.defineProperty(globalThis, '{slot}', {{ value: {{ done: false, v: undefined }}, configurable: true, enumerable: false, writable: true }}); \
-             let p; try {{ p = Promise.resolve(__pt_devEval({src})); }} catch (e) {{ globalThis.{slot}.sync = true; p = Promise.reject(e); }} \
+             let p; try {{ p = Promise.resolve({value}); }} catch (e) {{ globalThis.{slot}.sync = true; p = Promise.reject(e); }} \
              p.then(\
                v => {{ globalThis.{slot}.v = v; globalThis.{slot}.done = true; }}, \
                e => {{ globalThis.{slot}.v = e; globalThis.{slot}.rej = true; globalThis.{slot}.done = true; }}); }})()"
@@ -2281,7 +2269,7 @@ async fn remote_eval(
         )
     } else {
         format!(
-            "(() => {{ try {{ return JSON.stringify(__pt_wrap(__pt_devEval({src}), {by})); }} \
+            "(() => {{ try {{ return JSON.stringify(__pt_wrap({value}, {by})); }} \
                catch (e) {{ return JSON.stringify(__pt_exc(e, false, {by})); }} }})()"
         )
     };
@@ -2891,8 +2879,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(remote_eval(&ctx, "1 + 2", true, false).await["result"]["value"], json!(3));
-        assert_eq!(remote_eval(&ctx, "Promise.resolve(globalThis.pageEval)", true, true).await["result"]["value"], json!("EvalError"));
+        assert_eq!(remote_eval(&ctx, &dev_value("1 + 2"), true, false).await["result"]["value"], json!(3));
+        assert_eq!(remote_eval(&ctx, &dev_value("Promise.resolve(globalThis.pageEval)"), true, true).await["result"]["value"], json!("EvalError"));
         // Still refused for the page after the evaluation.
         assert_eq!(
             ctx.evaluate("(() => { try { eval('1'); return 'ran'; } catch (e) { return e.name; } })()").await.unwrap(),
@@ -2938,12 +2926,12 @@ mod tests {
         }
         let frame = frame.expect("the frame");
         let expr = "(async () => { await new Promise(r => setTimeout(r, 50)); return document.body.textContent + 'y'; })()";
-        let v = frame_eval(&ctx, frame, expr, true, true).await;
+        let v = frame_eval(&ctx, frame, &dev_value(expr), true, true).await;
         assert_eq!(v, json!({ "result": { "type": "string", "value": "xy" } }));
-        let v = frame_eval(&ctx, frame, "Promise.reject(new Error('no'))", true, true).await;
+        let v = frame_eval(&ctx, frame, &dev_value("Promise.reject(new Error('no'))"), true, true).await;
         assert_eq!(v["exceptionDetails"]["text"], json!("Uncaught (in promise) Error: no"));
         // Without awaitPromise a promise is an object, as in Chrome.
-        assert_eq!(frame_eval(&ctx, frame, expr, true, false).await["result"]["type"], json!("object"));
+        assert_eq!(frame_eval(&ctx, frame, &dev_value(expr), true, false).await["result"]["type"], json!("object"));
     }
 
     /// A throw or a rejection comes back as Chrome sends it: `exceptionDetails`
@@ -2956,7 +2944,7 @@ mod tests {
         let ctx = conn.engine.new_context().await.unwrap();
         ctx.load_html("https://example.com/", "<html><body></body></html>").await.unwrap();
 
-        let v = remote_eval(&ctx, "(() => { throw new TypeError('boom'); })()", true, false).await;
+        let v = remote_eval(&ctx, &dev_value("(() => { throw new TypeError('boom'); })()"), true, false).await;
         let d = &v["exceptionDetails"];
         assert_eq!(d["text"], json!("Uncaught"));
         assert_eq!(d["exception"]["subtype"], json!("error"));
@@ -2965,30 +2953,53 @@ mod tests {
         // A thrown object is a handle even when the value was asked for.
         assert!(v["result"]["objectId"].is_string(), "{v}");
 
-        let v = remote_eval(&ctx, "Promise.reject(new Error('no'))", true, true).await;
+        let v = remote_eval(&ctx, &dev_value("Promise.reject(new Error('no'))"), true, true).await;
         assert_eq!(v["exceptionDetails"]["text"], json!("Uncaught (in promise) Error: no"));
-        let v = remote_eval(&ctx, "Promise.reject(5)", true, true).await;
+        let v = remote_eval(&ctx, &dev_value("Promise.reject(5)"), true, true).await;
         assert_eq!(v["exceptionDetails"]["text"], json!("Uncaught (in promise)"), "{v}");
         assert_eq!(v["result"], json!({ "type": "number", "value": 5 }));
-        let v = remote_eval(&ctx, "(() => { throw 'str'; })()", true, true).await;
+        let v = remote_eval(&ctx, &dev_value("(() => { throw 'str'; })()"), true, true).await;
         assert_eq!(v["exceptionDetails"]["text"], json!("Uncaught"));
         assert_eq!(v["exceptionDetails"]["exception"], json!({ "type": "string", "value": "str" }));
-        let v = remote_eval(&ctx, "1 +", false, false).await;
+        let v = remote_eval(&ctx, &dev_value("1 +"), false, false).await;
         assert_eq!(v["exceptionDetails"]["exception"]["className"], json!("SyntaxError"));
 
         // A value is still just a result.
-        assert_eq!(remote_eval(&ctx, "40 + 2", true, false).await, json!({ "result": { "type": "number", "value": 42 } }));
+        assert_eq!(remote_eval(&ctx, &dev_value("40 + 2"), true, false).await, json!({ "result": { "type": "number", "value": 42 } }));
         // Reporting the error runs none of the page's code.
         let v = remote_eval(
             &ctx,
-            "(() => { Object.defineProperty(Error, Symbol.hasInstance, { value: () => { globalThis.hooked = 1; return false; } }); \
-               Error.prototype.toString = () => { globalThis.hooked = 2; return 'x'; }; throw new Error('e'); })()",
+            &dev_value("(() => { Object.defineProperty(Error, Symbol.hasInstance, { value: () => { globalThis.hooked = 1; return false; } }); \
+               Error.prototype.toString = () => { globalThis.hooked = 2; return 'x'; }; throw new Error('e'); })()"),
             true,
             false,
         )
         .await;
         assert_eq!(v["exceptionDetails"]["exception"]["subtype"], json!("error"));
-        assert_eq!(remote_eval(&ctx, "globalThis.hooked", true, false).await["result"], json!({ "type": "undefined" }));
+        assert_eq!(remote_eval(&ctx, &dev_value("globalThis.hooked"), true, false).await["result"], json!({ "type": "undefined" }));
+    }
+
+    /// DevTools code is a script named '' as in Chrome: its frames read
+    /// `<anonymous>:1:7`, an eval inside it `eval at f (:1:24)`, and nothing
+    /// names the engine. A function from `callFunctionOn` is called without a
+    /// frame of ours, at its own line and column.
+    #[tokio::test]
+    async fn devtools_code_leaves_chromes_stack() {
+        let _s = SERIAL.lock().await;
+        let conn = test_conn();
+        let ctx = conn.engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>").await.unwrap();
+
+        let v = remote_eval(&ctx, &dev_value("new Error('top').stack"), true, false).await;
+        assert_eq!(v["result"]["value"], json!("Error: top\n    at <anonymous>:1:1"));
+        let v = remote_eval(&ctx, &dev_value("(function f() { return eval('new Error(1).stack'); })()"), true, false).await;
+        assert_eq!(
+            v["result"]["value"],
+            json!("Error: 1\n    at eval (eval at f (:1:24), <anonymous>:1:1)\n    at f (<anonymous>:1:24)\n    at <anonymous>:1:54")
+        );
+        let call = format!("__pt_devCall({}, globalThis, [2])", js_str("function (n) { return new Error(n).stack; }"));
+        let v = remote_eval(&ctx, &call, true, false).await;
+        assert_eq!(v["result"]["value"], json!("Error: 2\n    at <anonymous>:1:24"));
     }
 
     #[tokio::test]

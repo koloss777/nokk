@@ -8832,17 +8832,25 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // DevTools evaluation (CDP Runtime.evaluate, callFunctionOn) is not the
   // page's code: Chrome runs it whatever the page's CSP or Trusted Types say.
   // Playwright's evaluate on GitHub got an EvalError instead.
+  // The source is a script of its own named '' as Chrome compiles it: its
+  // frames read `<anonymous>:1:7` and an eval inside it `eval at f (:1:7)`.
+  // Under `eval` every frame named our function ("eval at
+  // globalThis.__pt_devEval"). The stack formatter keeps ''-named frames.
   globalThis.__pt_devEval = (src) => {
     const allowed = !globalThis.__pt_cspEval && !globalThis.__pt_ttOn;
     const tt = __csp.ttBypass;
     try { if (typeof globalThis.__pt_setCodegen === 'function') __pt_setCodegen(true); } catch (e) {}
     __csp.ttBypass = true;
-    try { return (0, eval)(src); }
+    try { return typeof __pt_evalScript === 'function' ? __pt_evalScript(src, '', 0) : (0, eval)(src); }
     finally {
       __csp.ttBypass = tt;
       try { if (typeof globalThis.__pt_setCodegen === 'function') __pt_setCodegen(allowed); } catch (e) {}
     }
   };
+  // `Runtime.callFunctionOn`: Chrome compiles `(declaration)` and calls the
+  // function itself, so the call leaves no frame of its own.
+  const __devApply = Reflect.apply;
+  globalThis.__pt_devCall = (decl, self, args) => __devApply(globalThis.__pt_devEval('(' + decl + '\n)'), self, args);
   const __cspWrapEval = () => {
     const ev = __cspEvalMessage();
     const tt = __ttRequired();
