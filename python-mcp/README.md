@@ -20,7 +20,7 @@ Client configuration (Claude Desktop, Claude Code, Cursor and others):
 }
 ```
 
-Tools: `open`, `read_text`, `read_html`, `click`, `fill`, `evaluate`, `links`, `solve_challenge`,
+Tools: `open`, `snapshot`, `read_text`, `read_html`, `click`, `fill`, `evaluate`, `links`, `solve_challenge`,
 `challenge_state`, `reset`. `open` solves a Cloudflare challenge on the way and says what it met.
 
 Options (flags or environment variables):

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import inspect
 import os
 from typing import Annotated, Any, Dict, List, Optional
@@ -37,15 +38,17 @@ from typing import Annotated, Any, Dict, List, Optional
 from pydantic import Field
 
 import nokk
-from nokk._cdp import CDP, Page
+from nokk._cdp import CDP, CDPError, Page
 
 # The MCP SDK's high-level server is `MCPServer` in v2, `FastMCP` in v1 — both
 # share the `.tool()` decorator + `.run()` API this module uses.
 try:
     try:
         from mcp.server import MCPServer as _Server  # SDK >= 2.0
+        from mcp.server.mcpserver.exceptions import ToolError
     except ImportError:
         from mcp.server.fastmcp import FastMCP as _Server  # SDK 1.x
+        from mcp.server.fastmcp.exceptions import ToolError
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "nokk-mcp needs the Model Context Protocol SDK. Install the extra: "
@@ -55,7 +58,9 @@ except ImportError as exc:  # pragma: no cover
 
 _INSTRUCTIONS = (
     "A headless browser with Chrome's fingerprint. Call `open` first; the other "
-    "tools act on the page it opened. Cloudflare challenges are solved during `open`."
+    "tools act on the page it opened. Cloudflare challenges are solved during `open`. "
+    "`snapshot` shows the page compactly with numbered controls (`e12`) that `click` "
+    "and `fill` accept."
 )
 # SDK 2.x reports a server version; 1.x has no such argument.
 _server_kwargs: Dict[str, Any] = {"instructions": _INSTRUCTIONS}
@@ -63,9 +68,23 @@ if "version" in inspect.signature(_Server.__init__).parameters:
     _server_kwargs["version"] = nokk.__version__
 mcp = _Server("nokk", **_server_kwargs)
 
-_Selector = Annotated[
+
+def _tool(fn):
+    """Register ``fn`` as a tool whose page errors reach the agent as text.
+    SDK 2.x hides any exception but ``ToolError`` behind "Error executing tool"."""
+
+    @functools.wraps(fn)
+    async def run(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except (CDPError, asyncio.TimeoutError) as e:
+            raise ToolError(str(e) or type(e).__name__) from e
+
+    return mcp.tool()(run)
+
+_Target = Annotated[
     str,
-    Field(description="CSS selector, e.g. `h1`, `#price`, `form input[name=q]`."),
+    Field(description="A ref from the last `snapshot`, e.g. `e12`, or a CSS selector, e.g. `#price`, `form input[name=q]`."),
 ]
 _OptionalSelector = Annotated[
     str,
@@ -96,7 +115,7 @@ async def _get_page() -> Page:
         return _state["page"]  # type: ignore[return-value]
 
 
-@mcp.tool()
+@_tool
 async def open(
     url: Annotated[str, Field(description="Absolute address to load, e.g. `https://example.com/`.")],
 ) -> Dict[str, Any]:
@@ -108,7 +127,7 @@ async def open(
     return await page.navigate(url, timeout=_NAV_TIMEOUT)
 
 
-@mcp.tool()
+@_tool
 async def solve_challenge(
     timeout_seconds: Annotated[float, Field(description="How long to wait for the challenge to clear, in seconds.")] = 30,
 ) -> Dict[str, Any]:
@@ -120,7 +139,7 @@ async def solve_challenge(
     return await page.solve_challenge(timeout_seconds)
 
 
-@mcp.tool()
+@_tool
 async def challenge_state() -> Dict[str, Any]:
     """Report whether the current page is behind a bot check. `kind` is `"none"`
     when the page itself is shown, else the kind of check (`"cloudflare-interstitial"`,
@@ -130,7 +149,21 @@ async def challenge_state() -> Dict[str, Any]:
     return await page.challenge_state()
 
 
-@mcp.tool()
+@_tool
+async def snapshot(
+    selector: _OptionalSelector = "",
+    max_chars: Annotated[int, Field(description="Cut the outline after this many characters.")] = 20000,
+) -> Optional[str]:
+    """Show the current page as a compact outline: headings and text in reading
+    order, and every link, button and form field numbered (`[e12]`) with its
+    name, address or value. Pass a ref to `click` or `fill`. Far smaller than
+    `read_html`; take a new snapshot after the page changes. `null` when
+    `selector` matches nothing."""
+    page = await _get_page()
+    return await page.snapshot(selector or None, max_chars)
+
+
+@_tool
 async def read_text(selector: _OptionalSelector = "") -> Optional[str]:
     """Return the visible text of the current page, or of the first element
     matching `selector`. `null` when no element matches."""
@@ -138,7 +171,7 @@ async def read_text(selector: _OptionalSelector = "") -> Optional[str]:
     return await page.read_text(selector or None)
 
 
-@mcp.tool()
+@_tool
 async def read_html(selector: _OptionalSelector = "") -> Optional[str]:
     """Return the HTML of the current page as it is now (after its scripts ran),
     or the outer HTML of the first element matching `selector`. `null` when no
@@ -147,27 +180,27 @@ async def read_html(selector: _OptionalSelector = "") -> Optional[str]:
     return await page.read_html(selector or None)
 
 
-@mcp.tool()
-async def click(selector: _Selector) -> bool:
-    """Click the first element matching `selector`. Returns `true`; fails when
-    nothing matches."""
+@_tool
+async def click(target: _Target) -> bool:
+    """Click an element: a ref from `snapshot` or the first match of a CSS
+    selector. Returns `true`; fails when nothing matches or the ref is stale."""
     page = await _get_page()
-    return await page.click(selector)
+    return await page.click(target)
 
 
-@mcp.tool()
+@_tool
 async def fill(
-    selector: _Selector,
+    target: _Target,
     value: Annotated[str, Field(description="Text to put in the field.")],
 ) -> bool:
-    """Type `value` into the form field matching `selector` (its `input` and
-    `change` events fire, as when a person types). Returns `true`; fails when
-    nothing matches."""
+    """Type `value` into a form field: a ref from `snapshot` or the first match
+    of a CSS selector (its `input` and `change` events fire, as when a person
+    types). Returns `true`; fails when nothing matches or the ref is stale."""
     page = await _get_page()
-    return await page.fill(selector, value)
+    return await page.fill(target, value)
 
 
-@mcp.tool()
+@_tool
 async def evaluate(
     expression: Annotated[str, Field(description="JavaScript expression, e.g. `document.title` or `[...document.querySelectorAll('h2')].map(e => e.textContent)`.")],
 ) -> object:
@@ -177,14 +210,14 @@ async def evaluate(
     return await page.evaluate(expression)
 
 
-@mcp.tool()
+@_tool
 async def links() -> List[str]:
     """Return the absolute addresses of all links on the current page."""
     page = await _get_page()
     return await page.links()
 
 
-@mcp.tool()
+@_tool
 async def reset() -> str:
     """Close the browser session: cookies and page state are dropped, and the
     next `open` starts a fresh one."""

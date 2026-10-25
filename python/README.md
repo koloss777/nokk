@@ -95,7 +95,7 @@ pip install "nokk[mcp]"
 ```
 
 Use the `python` from the environment where you installed `nokk[mcp]` (its full
-path if the client doesn't share your shell). Tools: `open`, `read_text`,
+path if the client doesn't share your shell). Tools: `open`, `snapshot`, `read_text`,
 `read_html`, `click`, `fill`, `evaluate`, `links`, `solve_challenge`,
 `challenge_state`, `reset`. Run it directly with `python -m nokk.mcp`; it
 accepts `--proxy`, `--rotate-fingerprint`, `--geoip-timezone`,

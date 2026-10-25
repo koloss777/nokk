@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import itertools
 import json
+import re
 from typing import Any, Callable, Dict, List, Optional
 
 try:
@@ -24,6 +25,9 @@ except ImportError as exc:  # pragma: no cover - guarded at call sites
         "the CDP client needs the `websockets` package; install the extra: "
         "`pip install nokk[mcp]`"
     ) from exc
+
+
+_REF = re.compile(r"e([1-9][0-9]*)")
 
 
 class CDPError(RuntimeError):
@@ -138,6 +142,8 @@ class Page:
         self._cdp = cdp
         self._session = session_id
         self.target_id = target_id
+        # The remote array behind the last snapshot: [outline, el1, el2, ...].
+        self._snapshot_id: Optional[str] = None
 
     @classmethod
     async def create(cls, cdp: CDP) -> "Page":
@@ -234,21 +240,89 @@ class Page:
             f" return el ? el.outerHTML : null; }})()"
         )
 
-    async def click(self, selector: str) -> bool:
-        sel = json.dumps(selector)
-        return await self.evaluate(
-            f"(() => {{ const el = document.querySelector({sel});"
-            f" if (!el) throw new Error('no element matches ' + {sel}); el.click(); return true; }})()"
-        )
+    async def snapshot(self, selector: Optional[str] = None, max_chars: int = 20000) -> Optional[str]:
+        """The page as an outline: text in reading order, controls numbered
+        ``[e1]``, ``[e2]``… for :meth:`click` and :meth:`fill`. ``None`` when
+        ``selector`` matches nothing."""
+        from ._snapshot import SNAPSHOT_JS
 
-    async def fill(self, selector: str, value: str) -> bool:
-        sel, val = json.dumps(selector), json.dumps(value)
-        return await self.evaluate(
-            f"(() => {{ const el = document.querySelector({sel});"
-            f" if (!el) throw new Error('no element matches ' + {sel});"
-            f" el.focus(); el.value = {val};"
-            f" el.dispatchEvent(new Event('input', {{bubbles: true}}));"
-            f" el.dispatchEvent(new Event('change', {{bubbles: true}})); return true; }})()"
+        expr = f"({SNAPSHOT_JS})({json.dumps(selector or None)}, {int(max_chars)})"
+        result = await self._cdp.send(
+            "Runtime.evaluate",
+            {"expression": expr, "returnByValue": False},
+            session_id=self._session,
+        )
+        details = result.get("exceptionDetails")
+        if details:
+            exc = details.get("exception") or {}
+            raise CDPError(exc.get("description") or details.get("text") or "snapshot error")
+        object_id = result.get("result", {}).get("objectId")
+        if not object_id:
+            raise CDPError("snapshot returned no object")
+        old, self._snapshot_id = self._snapshot_id, object_id
+        if old:
+            with contextlib.suppress(Exception):
+                await self._cdp.send("Runtime.releaseObject", {"objectId": old}, session_id=self._session)
+        return await self._call_on_snapshot("function () { return this[0]; }")
+
+    async def _call_on_snapshot(self, fn: str, *args: Any) -> Any:
+        result = await self._cdp.send(
+            "Runtime.callFunctionOn",
+            {
+                "functionDeclaration": fn,
+                "objectId": self._snapshot_id,
+                "arguments": [{"value": a} for a in args],
+                "returnByValue": True,
+                "awaitPromise": True,
+                "userGesture": True,
+            },
+            session_id=self._session,
+        )
+        details = result.get("exceptionDetails")
+        if details:
+            exc = details.get("exception") or {}
+            # Our own message, without the stack and the `Error: ` prefix.
+            msg = (exc.get("description") or details.get("text") or "eval error").split("\n")[0]
+            raise CDPError(msg[len("Error: "):] if msg.startswith("Error: ") else msg)
+        return result.get("result", {}).get("value")
+
+    async def _on_element(self, target: str, body: str, *args: Any) -> Any:
+        """Run ``body`` with ``el`` bound to ``target``: a snapshot ref such as
+        ``e12`` or a CSS selector. Extra ``args`` arrive as ``a0``, ``a1``…."""
+        params = ", ".join(f"a{i}" for i in range(len(args)))
+        m = _REF.fullmatch(target.strip())
+        if m:
+            if not self._snapshot_id:
+                raise CDPError(f"no snapshot yet: call snapshot before using {target}")
+            fn = (
+                f"function (i{', ' if params else ''}{params}) {{ const el = this[i];"
+                f" if (!el || !el.isConnected) throw new Error('{target} is gone: call snapshot again');"
+                f" {body} }}"
+            )
+            try:
+                return await self._call_on_snapshot(fn, int(m.group(1)), *args)
+            except CDPError as e:
+                if "Could not find object" in str(e):
+                    raise CDPError(f"{target} is from an earlier page: call snapshot again") from None
+                raise
+        sel = json.dumps(target)
+        fn = (
+            f"function ({params}) {{ const el = document.querySelector({sel});"
+            f" if (!el) throw new Error('no element matches ' + {sel}); {body} }}"
+        )
+        args_js = ", ".join(json.dumps(a) for a in args)
+        return await self.evaluate(f"({fn})({args_js})")
+
+    async def click(self, target: str) -> bool:
+        return await self._on_element(target, "el.click(); return true;")
+
+    async def fill(self, target: str, value: str) -> bool:
+        return await self._on_element(
+            target,
+            "el.focus(); el.value = a0;"
+            " el.dispatchEvent(new Event('input', {bubbles: true}));"
+            " el.dispatchEvent(new Event('change', {bubbles: true})); return true;",
+            value,
         )
 
     async def links(self) -> List[str]:

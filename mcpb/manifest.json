@@ -22,7 +22,12 @@
     "entry_point": "src/server.py",
     "mcp_config": {
       "command": "uv",
-      "args": ["run", "--directory", "${__dirname}", "src/server.py"],
+      "args": [
+        "run",
+        "--directory",
+        "${__dirname}",
+        "src/server.py"
+      ],
       "env": {
         "NOKK_PROXY": "${user_config.proxy}",
         "NOKK_ROTATE_FINGERPRINT": "${user_config.rotate_fingerprint}"
@@ -30,16 +35,50 @@
     }
   },
   "tools": [
-    { "name": "open", "description": "Load a page and wait until it has loaded; a Cloudflare challenge on the way is solved first." },
-    { "name": "solve_challenge", "description": "Solve the Cloudflare challenge on the current page." },
-    { "name": "challenge_state", "description": "Report whether the current page is behind a bot check." },
-    { "name": "read_text", "description": "Return the visible text of the page or of an element." },
-    { "name": "read_html", "description": "Return the HTML of the page as it is now, or of an element." },
-    { "name": "click", "description": "Click the first element matching a CSS selector." },
-    { "name": "fill", "description": "Type a value into a form field." },
-    { "name": "evaluate", "description": "Run a JavaScript expression in the page and return its value." },
-    { "name": "links", "description": "Return the absolute addresses of all links on the page." },
-    { "name": "reset", "description": "Close the browser session and drop its cookies." }
+    {
+      "name": "open",
+      "description": "Load a page and wait until it has loaded; a Cloudflare challenge on the way is solved first."
+    },
+    {
+      "name": "snapshot",
+      "description": "Show the page as a compact outline with numbered links, buttons and fields for click and fill."
+    },
+    {
+      "name": "solve_challenge",
+      "description": "Solve the Cloudflare challenge on the current page."
+    },
+    {
+      "name": "challenge_state",
+      "description": "Report whether the current page is behind a bot check."
+    },
+    {
+      "name": "read_text",
+      "description": "Return the visible text of the page or of an element."
+    },
+    {
+      "name": "read_html",
+      "description": "Return the HTML of the page as it is now, or of an element."
+    },
+    {
+      "name": "click",
+      "description": "Click an element by its snapshot ref or a CSS selector."
+    },
+    {
+      "name": "fill",
+      "description": "Type a value into a form field by its snapshot ref or a CSS selector."
+    },
+    {
+      "name": "evaluate",
+      "description": "Run a JavaScript expression in the page and return its value."
+    },
+    {
+      "name": "links",
+      "description": "Return the absolute addresses of all links on the page."
+    },
+    {
+      "name": "reset",
+      "description": "Close the browser session and drop its cookies."
+    }
   ],
   "user_config": {
     "proxy": {
@@ -58,9 +97,22 @@
     }
   },
   "compatibility": {
-    "platforms": ["darwin", "linux", "win32"],
-    "runtimes": { "python": ">=3.10" }
+    "platforms": [
+      "darwin",
+      "linux",
+      "win32"
+    ],
+    "runtimes": {
+      "python": ">=3.10"
+    }
   },
-  "keywords": ["browser", "headless", "cloudflare", "web-scraping", "chrome", "turnstile"],
+  "keywords": [
+    "browser",
+    "headless",
+    "cloudflare",
+    "web-scraping",
+    "chrome",
+    "turnstile"
+  ],
   "license": "MIT OR Apache-2.0"
 }

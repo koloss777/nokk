@@ -172,7 +172,7 @@ such as Claude Desktop or Claude Code browses through the fingerprinted engine. 
 ```
 
 Without uv: `pip install "nokk[mcp]"`, then `"command": "python", "args": ["-m", "nokk.mcp"]`.
-Tools: `open`, `read_text`, `read_html`, `click`, `fill`, `evaluate`, `links`, `solve_challenge`,
+Tools: `open`, `snapshot`, `read_text`, `read_html`, `click`, `fill`, `evaluate`, `links`, `solve_challenge`,
 `challenge_state`, `reset`.
 
 ### Cloudflare challenges
