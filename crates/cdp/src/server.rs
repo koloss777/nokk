@@ -1746,7 +1746,7 @@ impl Conn {
                         None => remote_eval(&ctx, &expr, by_value, await_promise).await,
                     };
                     let _ = tx.send(Message::Text(
-                        ok(id, &session, json!({ "result": ro })).to_string(),
+                        ok(id, &session, ro).to_string(),
                     ));
                 });
                 vec![]
@@ -1823,7 +1823,7 @@ impl Conn {
                         None => remote_eval(&ctx, &expr, by_value, await_promise).await,
                     };
                     let _ = tx.send(Message::Text(
-                        ok(id, &session, json!({ "result": ro })).to_string(),
+                        ok(id, &session, ro).to_string(),
                     ));
                 });
                 vec![]
@@ -2140,9 +2140,9 @@ async fn frame_eval(ctx: &BrowserContext, frame: u32, expr: &str, by_value: bool
         let setup = |value: &str| {
             format!(
                 "(() => {{ Object.defineProperty(globalThis, '{slot}', {{ value: {{ done: false, v: undefined }}, configurable: true, enumerable: false, writable: true }}); \
-                   let p; try {{ p = Promise.resolve({value}); }} catch (e) {{ p = Promise.reject(e); }} \
+                   let p; try {{ p = Promise.resolve({value}); }} catch (e) {{ globalThis.{slot}.sync = true; p = Promise.reject(e); }} \
                    p.then(v => {{ globalThis.{slot}.v = v; globalThis.{slot}.done = true; }}, \
-                          e => {{ globalThis.{slot}.v = String(e); globalThis.{slot}.done = true; }}); }})()"
+                          e => {{ globalThis.{slot}.v = e; globalThis.{slot}.rej = true; globalThis.{slot}.done = true; }}); }})()"
             )
         };
         let started = match ctx.evaluate_in_frame(frame, &setup(&compiled)).await {
@@ -2150,7 +2150,7 @@ async fn frame_eval(ctx: &BrowserContext, frame: u32, expr: &str, by_value: bool
             Err(_) => ctx.evaluate_in_frame(frame, &setup(&evaled)).await.is_ok(),
         };
         if !started {
-            return json!({ "type": "undefined" });
+            return json!({ "result": { "type": "undefined" } });
         }
         let deadline = std::time::Instant::now() + AWAIT_PROMISE_TIMEOUT;
         loop {
@@ -2170,27 +2170,45 @@ async fn frame_eval(ctx: &BrowserContext, frame: u32, expr: &str, by_value: bool
         }
         let read = format!(
             "(() => {{ const s = globalThis.{slot}; delete globalThis.{slot}; \
-               return JSON.stringify(__pt_wrap(s && s.done ? s.v : undefined, {by})); }})()"
+               return JSON.stringify(s && s.rej ? __pt_exc(s.v, !s.sync, {by}) : __pt_wrap(s && s.done ? s.v : undefined, {by})); }})()"
         );
-        return match ctx.evaluate_in_frame(frame, &read).await {
-            Ok(Value::String(s)) => serde_json::from_str(&s).unwrap_or(json!({ "type": "undefined" })),
-            _ => json!({ "type": "undefined" }),
-        };
+        return eval_reply(ctx.evaluate_in_frame(frame, &read).await.ok());
     }
     let wrap = |value: &str| {
         format!(
             "(() => {{ try {{ return JSON.stringify(__pt_wrap({value}, {by})); }} \
-               catch (e) {{ return JSON.stringify(__pt_wrap(String(e), true)); }} }})()"
+               catch (e) {{ return JSON.stringify(__pt_exc(e, false, {by})); }} }})()"
         )
     };
     let r = match ctx.evaluate_in_frame(frame, &wrap(&compiled)).await {
         Ok(v) => Ok(v),
         Err(_) => ctx.evaluate_in_frame(frame, &wrap(&evaled)).await,
     };
-    match r {
-        Ok(Value::String(s)) => serde_json::from_str(&s).unwrap_or(json!({ "type": "undefined" })),
+    eval_reply(r.ok())
+}
+
+/// The body of a `Runtime.evaluate`/`callFunctionOn` reply from the JSON the
+/// page-side wrapper produced: `{result}`, or for a throw or a rejection
+/// `{result, exceptionDetails}` as Chrome sends it, which is how Puppeteer and
+/// Playwright know to raise instead of handing back a value.
+fn eval_reply(js: Option<Value>) -> Value {
+    let v = match js {
+        Some(Value::String(s)) => serde_json::from_str(&s).unwrap_or(json!({ "type": "undefined" })),
         _ => json!({ "type": "undefined" }),
-    }
+    };
+    let Some(exc) = v.get("__ptExc") else {
+        return json!({ "result": v });
+    };
+    json!({
+        "result": exc["result"],
+        "exceptionDetails": {
+            "exceptionId": IDS.fetch_add(1, Ordering::Relaxed),
+            "text": exc["text"],
+            "lineNumber": 0,
+            "columnNumber": 0,
+            "exception": exc["exception"],
+        },
+    })
 }
 
 /// Evaluate `expr` and return a CDP `RemoteObject` — by value (JSON) or as an
@@ -2222,13 +2240,14 @@ async fn remote_eval(
         // the slot lives on the page's global while it waits.
         let slot = format!("__pt_cdp{}", IDS.fetch_add(1, Ordering::Relaxed));
         let setup = format!(
-            "Object.defineProperty(globalThis, '{slot}', {{ value: {{ done: false, v: undefined }}, configurable: true, enumerable: false, writable: true }}); \
-             Promise.resolve(__pt_devEval({src})).then(\
+            "(() => {{ Object.defineProperty(globalThis, '{slot}', {{ value: {{ done: false, v: undefined }}, configurable: true, enumerable: false, writable: true }}); \
+             let p; try {{ p = Promise.resolve(__pt_devEval({src})); }} catch (e) {{ globalThis.{slot}.sync = true; p = Promise.reject(e); }} \
+             p.then(\
                v => {{ globalThis.{slot}.v = v; globalThis.{slot}.done = true; }}, \
-               e => {{ globalThis.{slot}.v = String(e); globalThis.{slot}.done = true; }});"
+               e => {{ globalThis.{slot}.v = e; globalThis.{slot}.rej = true; globalThis.{slot}.done = true; }}); }})()"
         );
         if ctx.evaluate(&setup).await.is_err() {
-            return json!({ "type": "undefined" });
+            return json!({ "result": { "type": "undefined" } });
         }
         // Drive the loop until the promise settles. One turn used to be enough
         // because timers collapsed their delays; now `await new Promise(r =>
@@ -2258,18 +2277,15 @@ async fn remote_eval(
         }
         format!(
             "(() => {{ const s = globalThis.{slot}; delete globalThis.{slot}; \
-               return JSON.stringify(__pt_wrap(s.done ? s.v : undefined, {by})); }})()"
+               return JSON.stringify(s.rej ? __pt_exc(s.v, !s.sync, {by}) : __pt_wrap(s.done ? s.v : undefined, {by})); }})()"
         )
     } else {
         format!(
             "(() => {{ try {{ return JSON.stringify(__pt_wrap(__pt_devEval({src}), {by})); }} \
-               catch (e) {{ return JSON.stringify(__pt_wrap(String(e), true)); }} }})()"
+               catch (e) {{ return JSON.stringify(__pt_exc(e, false, {by})); }} }})()"
         )
     };
-    match ctx.evaluate(&js).await {
-        Ok(Value::String(s)) => serde_json::from_str(&s).unwrap_or(json!({ "type": "undefined" })),
-        _ => json!({ "type": "undefined" }),
-    }
+    eval_reply(ctx.evaluate(&js).await.ok())
 }
 
 /// Expand one completed request into the CDP events a client expects to see for
@@ -2875,8 +2891,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(remote_eval(&ctx, "1 + 2", true, false).await["value"], json!(3));
-        assert_eq!(remote_eval(&ctx, "Promise.resolve(globalThis.pageEval)", true, true).await["value"], json!("EvalError"));
+        assert_eq!(remote_eval(&ctx, "1 + 2", true, false).await["result"]["value"], json!(3));
+        assert_eq!(remote_eval(&ctx, "Promise.resolve(globalThis.pageEval)", true, true).await["result"]["value"], json!("EvalError"));
         // Still refused for the page after the evaluation.
         assert_eq!(
             ctx.evaluate("(() => { try { eval('1'); return 'ran'; } catch (e) { return e.name; } })()").await.unwrap(),
@@ -2923,11 +2939,56 @@ mod tests {
         let frame = frame.expect("the frame");
         let expr = "(async () => { await new Promise(r => setTimeout(r, 50)); return document.body.textContent + 'y'; })()";
         let v = frame_eval(&ctx, frame, expr, true, true).await;
-        assert_eq!(v, json!({ "type": "string", "value": "xy" }));
+        assert_eq!(v, json!({ "result": { "type": "string", "value": "xy" } }));
         let v = frame_eval(&ctx, frame, "Promise.reject(new Error('no'))", true, true).await;
-        assert_eq!(v["value"], json!("Error: no"));
+        assert_eq!(v["exceptionDetails"]["text"], json!("Uncaught (in promise) Error: no"));
         // Without awaitPromise a promise is an object, as in Chrome.
-        assert_eq!(frame_eval(&ctx, frame, expr, true, false).await["type"], json!("object"));
+        assert_eq!(frame_eval(&ctx, frame, expr, true, false).await["result"]["type"], json!("object"));
+    }
+
+    /// A throw or a rejection comes back as Chrome sends it: `exceptionDetails`
+    /// beside the result. Puppeteer and Playwright raise on that field; without
+    /// it `page.evaluate(() => { throw … })` handed back the string "Error: …".
+    #[tokio::test]
+    async fn a_throw_answers_with_exception_details() {
+        let _s = SERIAL.lock().await;
+        let conn = test_conn();
+        let ctx = conn.engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>").await.unwrap();
+
+        let v = remote_eval(&ctx, "(() => { throw new TypeError('boom'); })()", true, false).await;
+        let d = &v["exceptionDetails"];
+        assert_eq!(d["text"], json!("Uncaught"));
+        assert_eq!(d["exception"]["subtype"], json!("error"));
+        assert_eq!(d["exception"]["className"], json!("TypeError"));
+        assert!(d["exception"]["description"].as_str().unwrap().starts_with("TypeError: boom"), "{v}");
+        // A thrown object is a handle even when the value was asked for.
+        assert!(v["result"]["objectId"].is_string(), "{v}");
+
+        let v = remote_eval(&ctx, "Promise.reject(new Error('no'))", true, true).await;
+        assert_eq!(v["exceptionDetails"]["text"], json!("Uncaught (in promise) Error: no"));
+        let v = remote_eval(&ctx, "Promise.reject(5)", true, true).await;
+        assert_eq!(v["exceptionDetails"]["text"], json!("Uncaught (in promise)"), "{v}");
+        assert_eq!(v["result"], json!({ "type": "number", "value": 5 }));
+        let v = remote_eval(&ctx, "(() => { throw 'str'; })()", true, true).await;
+        assert_eq!(v["exceptionDetails"]["text"], json!("Uncaught"));
+        assert_eq!(v["exceptionDetails"]["exception"], json!({ "type": "string", "value": "str" }));
+        let v = remote_eval(&ctx, "1 +", false, false).await;
+        assert_eq!(v["exceptionDetails"]["exception"]["className"], json!("SyntaxError"));
+
+        // A value is still just a result.
+        assert_eq!(remote_eval(&ctx, "40 + 2", true, false).await, json!({ "result": { "type": "number", "value": 42 } }));
+        // Reporting the error runs none of the page's code.
+        let v = remote_eval(
+            &ctx,
+            "(() => { Object.defineProperty(Error, Symbol.hasInstance, { value: () => { globalThis.hooked = 1; return false; } }); \
+               Error.prototype.toString = () => { globalThis.hooked = 2; return 'x'; }; throw new Error('e'); })()",
+            true,
+            false,
+        )
+        .await;
+        assert_eq!(v["exceptionDetails"]["exception"]["subtype"], json!("error"));
+        assert_eq!(remote_eval(&ctx, "globalThis.hooked", true, false).await["result"], json!({ "type": "undefined" }));
     }
 
     #[tokio::test]

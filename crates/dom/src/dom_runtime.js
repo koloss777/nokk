@@ -9700,6 +9700,46 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     else if (v.__ptType) { subtype = 'node'; description = __s_toLowerCase(v.nodeName || 'node'); }
     return { type: 'object', subtype, objectId: id, className, description };
   };
+  // A thrown or rejected value as Chrome reports it: `{__ptExc: {result,
+  // exception, text}}`. An object comes back as a handle whatever `byValue`
+  // says, an error described by its stack; a rejection's `result` follows
+  // `byValue` like any value. Nothing here may run page code (`instanceof`
+  // reads Symbol.hasInstance, `String(e)` calls the page's toString).
+  const __excIsProto = Object.prototype.isPrototypeOf, __excErrProto = Error.prototype;
+  const __excApply = Reflect.apply, __excOwn = Object.getOwnPropertyDescriptor;
+  const __excStackGet = (() => { try { const d = __excOwn(new Error(), 'stack'); return d && d.get; } catch (x) { return undefined; } })();
+  const __excIsError = (e) => { try { return __excApply(__excIsProto, __excErrProto, [e]); } catch (x) { return false; } };
+  globalThis.__pt_exc = (e, rejected, byValue) => {
+    let ro;
+    const isErr = e !== null && typeof e === 'object' && __excIsError(e);
+    if (e !== null && (typeof e === 'object' || typeof e === 'function')) {
+      ro = __pt_wrap(e, false);
+      if (isErr) {
+        ro.subtype = 'error';
+        // V8's own accessor or a plain value; a getter the page put there is not called.
+        let stack;
+        try {
+          const d = __excOwn(e, 'stack');
+          if (d && typeof d.value === 'string') stack = d.value;
+          else if (d && d.get && d.get === __excStackGet) stack = __excApply(__excStackGet, e, []);
+        } catch (x) {}
+        if (typeof stack !== 'string' || !stack) {
+          const m = __excOwn(e, 'message');
+          const msg = m && typeof m.value === 'string' ? m.value : '';
+          stack = msg ? ro.className + ': ' + msg : ro.className;
+        }
+        ro.description = stack;
+      }
+    } else {
+      ro = __pt_wrap(e, true);
+    }
+    let text = rejected ? 'Uncaught (in promise)' : 'Uncaught';
+    if (rejected && isErr && typeof ro.description === 'string') {
+      const nl = __s_indexOf(ro.description, '\n');
+      text += ' ' + (nl < 0 ? ro.description : __s_slice(ro.description, 0, nl));
+    }
+    return { __ptExc: { result: rejected ? __pt_wrap(e, byValue) : ro, exception: ro, text } };
+  };
   globalThis.__pt_objGet = (id) => __ptObjs.get(id);
   globalThis.__pt_release = (id) => { __ptObjs.delete(id); };
 
