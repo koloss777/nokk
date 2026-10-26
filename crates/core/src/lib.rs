@@ -13463,6 +13463,40 @@ href|http://www.w3.org/1999/xlink href|http://www.w3.org/1999/xlink".into()));
         assert_eq!(out, Value::String("0 1 null".into()));
     }
 
+    /// Line heights, UA margins and line breaks as Chrome 151 lays them out
+    /// (values measured there): a multiplier is of the used font size, not
+    /// a percentage resolved against the width; a list in a list has no UA
+    /// block margins and an author's bottom margin keeps the UA's top one;
+    /// a word breaks after `-` and `?` but not after `/`; a multiplier line
+    /// height is of the font size in 1/64 px, floored, a length is rounded.
+    #[tokio::test]
+    async fn line_heights_margins_and_breaks_match_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<!doctype html><style>body { font-size: 100% } .lh p { line-height: 1.6 }\
+             dd > :first-child { margin-top: 0 } dl > dd:last-child > :last-child { margin-bottom: 0 }\
+             .w { width: 40px; font: 16px Arial } .s { display: inline-block; font-family: 'Liberation Mono' }</style>\
+             <div class=lh><p id=p>x</p></div><dl><dd><p id=a>a</p><p id=b>b</p><dl id=n><dt>c</dt></dl></dd></dl>\
+             <div class=w id=w1>aaaa-bbbb</div><div class=w id=w2>aaaa?bbbb</div><div class=w id=w3>aaaa/bbbb</div>\
+             <div><span class=s id=s1 style='font-size: 15.44px; line-height: 1.6'>x</span></div>\
+             <div><span class=s id=s2 style='font-size: 17.3px; line-height: 1.6em'>x</span></div>",
+        )
+        .await
+        .unwrap();
+        let out = ctx
+            .evaluate(
+                r#"(() => { const $ = (i) => document.getElementById(i), r = (i) => $(i).getBoundingClientRect();
+            return [getComputedStyle($('p')).lineHeight, r('b').y - r('a').bottom, getComputedStyle($('n')).marginTop,
+              r('w1').height, r('w2').height, r('w3').height, r('s1').height * 64, r('s2').height * 64].join(' '); })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, Value::String("25.6px 16 0px 36 36 18 1580 1772".into()));
+    }
+
     /// A form answers its controls by name and index as Chrome 151's does:
     /// the names before its own members, a shared name as a live
     /// RadioNodeList, a renamed control under its old name until it leaves,

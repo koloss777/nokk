@@ -13293,8 +13293,90 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return Math.ceil(w * 64 - 1e-6) / 64;
   }
 
-  // Word wrapping: greedy, at spaces; the trailing space does not count
-  // toward the line width, as in Chrome.
+  // Where a word may break across lines, as Chrome 151 breaks it: between
+  // two ASCII characters by Blink's own table (measured: no break after `/`
+  // or a backslash, one after `-` and `?`, and after closing punctuation
+  // before an opening one; `-` before a digit only after a letter or digit),
+  // elsewhere by ICU's line rules, the same `Intl.v8BreakIterator` Chrome
+  // has. A soft hyphen does not break here: Chrome draws a hyphen there.
+  const __ASCII_PUNCT_BREAK = "!\"#%&)*+,.:;=>\\]|}~";
+  const __ASCII_BREAKS = new Map([
+    ["-", "\"#%&'(*+-0123456789<=>@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\^_`abcdefghijklmnopqrstuvwxyz{|~"],
+    ["?", "#$%&(*+-0123456789<=>@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\^_`abcdefghijklmnopqrstuvwxyz{|~"],
+  ]);
+  const __ASCII_ALNUM = /^[A-Za-z0-9]*$/;
+  const __alnum = (c) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+  // The iterator is made at first use (its ICU object cannot go into the
+  // startup snapshot), from the constructor and member getters taken now,
+  // before a page can replace them.
+  let __lineIter = null;
+  const __lineIterMake = (() => {
+    try {
+      const C = Intl.v8BreakIterator, P = C.prototype;
+      const g = (k) => Object.getOwnPropertyDescriptor(P, k).get;
+      const adopt = g('adoptText'), first = g('first'), next = g('next');
+      return () => {
+        const it = new C(['en'], { type: 'line' });
+        return { adopt: adopt.call(it), first: first.call(it), next: next.call(it) };
+      };
+    } catch (e) { return null; }
+  })();
+  // Letters and digits of scripts with no breaks between them (UAX #14 AL,
+  // HL, NU, CM): most words, answered without ICU. CJK and South-East Asian
+  // scripts are not among them. Other words' answers are kept, as text
+  // repeats its words.
+  const __NO_INNER_BREAK = /^[[[\p{Script=Latin}\p{Script=Cyrillic}\p{Script=Greek}\p{Script=Armenian}\p{Script=Georgian}\p{Script=Hebrew}\p{Script=Arabic}\p{M}0-9]&&[\p{L}\p{M}0-9]]--[\uFF00-\uFFEF]]*$/v;
+  const __NONE = [];
+  let __breaksMemo = new Map();
+  const __lineBreaks = (t) => {
+    if (__ASCII_ALNUM.test(t) || __NO_INNER_BREAK.test(t)) return __NONE;
+    const hit = __breaksMemo.get(t);
+    if (hit !== undefined) return hit;
+    const out = __lineBreaksOf(t);
+    if (__breaksMemo.size >= 20000) __breaksMemo = new Map();
+    __breaksMemo.set(t, out);
+    return out;
+  };
+  const __lineBreaksOf = (t) => {
+    const out = [];
+    let icu = null;
+    for (let i = 1; i < t.length; i++) {
+      const a = __s_charCodeAt(t, i - 1), b = __s_charCodeAt(t, i);
+      if (a >= 0x21 && a <= 0x7e && b >= 0x21 && b <= 0x7e) {
+        if (a === 45 && b >= 48 && b <= 57) { if (i >= 2 && __alnum(__s_charCodeAt(t, i - 2))) out.push(i); continue; }
+        const row = __ASCII_BREAKS.get(String.fromCharCode(a));
+        const B = String.fromCharCode(b);
+        if (row ? __s_indexOf(row, B) >= 0 : __s_indexOf(__ASCII_PUNCT_BREAK, String.fromCharCode(a)) >= 0 && __s_indexOf('(<[{', B) >= 0) out.push(i);
+        continue;
+      }
+      if (a === 0xad || (b >= 0xdc00 && b <= 0xdfff)) continue;
+      if (!icu) {
+        icu = new Set();
+        if (!__lineIter && __lineIterMake) { try { __lineIter = __lineIterMake(); } catch (e) {} }
+        if (__lineIter) {
+          __lineIter.adopt(t);
+          __lineIter.first();
+          for (let n = __lineIter.next(); n !== -1; n = __lineIter.next()) icu.add(n);
+        }
+      }
+      if (icu.has(i)) out.push(i);
+    }
+    return out;
+  };
+
+  // A line height in LayoutUnits, as Blink makes it (measured): a multiplier
+  // times the font size in 1/64 px, floored (1.6 x 15.44px is 24.6875, of
+  // 15.4375px); a length or percentage rounded (1.6em of 15.4px is
+  // 24.640625).
+  function __lineHeightPx(t, fs, base, fallback) {
+    if (/^[\d.]+$/.test(t)) return Math.floor(parseFloat(t) * (Math.round(fs * 64) / 64) * 64 + 1e-6) / 64;
+    const px = /^[\d.]+%$/.test(t) ? parseFloat(t) / 100 * fs : __lengthPx(t, fs, base);
+    return px ? Math.round(px * 64) / 64 : fallback;
+  }
+
+  // Word wrapping: greedy, at spaces and where a word may break inside
+  // (`__lineBreaks`); the trailing space does not count toward the line
+  // width, as in Chrome.
   function __wrapLines(text, maxWidth, fs, family, bold) {
     const words = __s_split(String(text), ' ').filter((w) => w.length);
     const out = [];
@@ -13303,20 +13385,29 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const all = words.join(' ');
       return [{ text: all, width: Math.round(__textWidth(all, fs, family, bold, false) * 64) / 64 }];
     }
-    // Words are shaped one at a time (Chrome caches a run per word), so a
-    // line is its words and the spaces between them: each word is measured
+    // Pieces of words, each with whether a space comes before it.
+    const parts = [], gap = [];
+    for (let i = 0; i < words.length; i++) {
+      const t = words[i];
+      let from = 0;
+      for (const at of __lineBreaks(t)) { parts.push(__s_slice(t, from, at)); gap.push(from === 0 && i > 0); from = at; }
+      parts.push(__s_slice(t, from)); gap.push(from === 0 && i > 0);
+    }
+    // Pieces are shaped one at a time (Chrome caches a run per word), so a
+    // line is its pieces and the spaces between them: each is measured
     // once, not every prefix of the line again (quadratic in the words).
     const ceil64 = (v) => Math.ceil(v * 64 - 1e-6) / 64;
     const byText = __fontWidths(fs, family, bold, false);
     const space = __textMetricsIn(byText, ' ', fs, family, bold, false)[0] || 0;
-    let start = 0, acc = __textMetricsIn(byText, words[0], fs, family, bold, false)[0] || 0;
+    let start = 0, acc = __textMetricsIn(byText, parts[0], fs, family, bold, false)[0] || 0;
     const flush = (end) => {
-      const text = words.slice(start, end).join(' ');
+      let text = '';
+      for (let k = start; k < end; k++) text += (k > start && gap[k] ? ' ' : '') + parts[k];
       out.push({ text, width: __textWidth(text, fs, family, bold, false) });
     };
-    for (let i = 1; i < words.length; i++) {
-      const w = __textMetricsIn(byText, words[i], fs, family, bold, false)[0] || 0;
-      const next = acc + space + w;
+    for (let i = 1; i < parts.length; i++) {
+      const w = __textMetricsIn(byText, parts[i], fs, family, bold, false)[0] || 0;
+      const next = acc + (gap[i] ? space : 0) + w;
       if (ceil64(next) > maxWidth) {
         flush(i);
         start = i;
@@ -13325,7 +13416,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
         acc = next;
       }
     }
-    flush(words.length);
+    flush(parts.length);
     // Line widths are kept in 1/64 px too.
     for (const l of out) l.width = Math.round(l.width * 64) / 64;
     return out;
@@ -13376,11 +13467,20 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // Margins set in pixels (body has 8px on all sides).
   const UA_MARGIN_PX = { body: [8, 8], hr: [8, 0], fieldset: [0, 2] };
 
-  function __uaMargin(tag, fs) {
+  // A list inside a list (`dl dl`, `ul ol`, `dl ul`... at any depth) has no
+  // block margins in Chrome's UA sheet.
+  const UA_LISTS = new Set(['dir', 'dl', 'menu', 'ol', 'ul']);
+  function __uaMargin(tag, fs, el) {
     const px = UA_MARGIN_PX[tag];
     if (px) return px;
     const em = UA_MARGIN[tag];
-    return em ? [em[0] * (fs || 16), em[1]] : null;
+    if (!em) return null;
+    if (el && UA_LISTS.has(tag)) {
+      for (let p = el.__ptParent; p && p.__ptType === ELEMENT_NODE; p = p.__ptParent) {
+        if (UA_LISTS.has(p.__ptLocal) && (p.__ptNS === undefined || p.__ptNS === 'http://www.w3.org/1999/xhtml')) return [0, em[1]];
+      }
+    }
+    return [em[0] * (fs || 16), em[1]];
   }
 
   // unicode-bidi from the UA sheet: initial is `normal`; `isolate` is given
@@ -13826,18 +13926,26 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const inlineish = __INLINEISH.test(display) && !(forced && forced.block);
     const position = __s_toLowerCase(String(cs.get('position') || 'static'));
 
-    const uam = __uaMargin(tag, fs);
+    // UA margins side by side: an author's `margin-bottom: 0` keeps the
+    // UA's top margin.
+    const uam = __uaMargin(tag, fs, el);
     if (uam) {
-      if (!setM[0] && !setM[2]) { mt = uam[0]; mb = uam[0]; }
-      if (!setM[3] && !setM[1]) { ml = uam[1]; mr = uam[1]; }
+      if (!setM[0]) mt = uam[0];
+      if (!setM[2]) mb = uam[0];
+      if (!setM[3]) ml = uam[1];
+      if (!setM[1]) mr = uam[1];
     }
     const ua = __uaBox(el, tag);
     if (ua) {
       if (!pt_ && !pb && ua.p) { pt_ = ua.p[0]; pb = ua.p[0]; }
       if (!pl && !pr && ua.p) { pl = ua.p[1]; pr = ua.p[1]; }
       if (!bt && !br && !bb && !bl && ua.b) { bt = br = bb = bl = ua.b; }
-      if (!setM[0] && !setM[2] && ua.m) { mt = ua.m[0]; mb = ua.m[0]; }
-      if (!setM[3] && !setM[1] && ua.m) { ml = ua.m[1]; mr = ua.m[1]; }
+      if (ua.m) {
+        if (!setM[0]) mt = ua.m[0];
+        if (!setM[2]) mb = ua.m[0];
+        if (!setM[3]) ml = ua.m[1];
+        if (!setM[1]) mr = ua.m[1];
+      }
     }
     // `box-sizing: border-box`: the size includes padding and border.
     const bbox = /^border-box$/i.test(__s_trim(String(cs.get('box-sizing') || '')));
@@ -13934,7 +14042,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const t = lh == null ? '' : __s_trim(String(lh));
       if (t && t !== 'normal') {
         // Multiplier and percentage are relative to the font size.
-        lineH = /^[\d.]+$/.test(t) ? parseFloat(t) * fs : /^[\d.]+%$/.test(t) ? parseFloat(t) / 100 * fs : (__lengthPx(t, fs, availW) || fbox.line);
+        lineH = __lineHeightPx(t, fs, availW, fbox.line);
       }
     }
     const contentX = boxX + bl + pl;
@@ -14878,7 +14986,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       // UA stylesheet margins where the author set none (body 8px, p, h*).
       {
         const q = (v) => (Math.round(v * 1e4) / 1e4) + 'px';
-        const uam = __uaMargin(tag, fs);
+        const uam = __uaMargin(tag, fs, el);
         if (uam) {
           for (const [k, v] of [['margin-top', uam[0]], ['margin-bottom', uam[0]],
                                 ['margin-left', uam[1]], ['margin-right', uam[1]]]) {
@@ -14965,10 +15073,11 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
             .join(' ') + (inset ? ' inset' : ''));
         }
       }
-      // A line-height multiplier is printed in pixels.
+      // A line-height multiplier is printed in pixels, of the used font size
+      // (the map's is still a percentage resolved against the width here).
       const lh = String(map.get('line-height') || '');
       if (/^[\d.]+$/.test(lh)) {
-        const px = parseFloat(lh) * parseFloat(map.get('font-size')) || 0;
+        const px = parseFloat(lh) * fs || 0;
         map.set('line-height', (Math.round(px * 1e4) / 1e4) + 'px');
       }
       // Links have a UA default style, visible in computed style.
