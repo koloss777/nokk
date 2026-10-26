@@ -4526,6 +4526,11 @@
     if (prop === 'box-shadow' || prop === 'text-shadow') return __cssShadow(v);
     if (prop === 'outline') return __cssOutline(v);
     if (prop === 'transform') return __cssTransform(v);
+    // Area strings print double-quoted, one space between cells.
+    if (prop === 'grid-template-areas' && /["']/.test(v)) {
+      const rows = v.match(/"[^"]*"|'[^']*'/g) || [];
+      return rows.map((r) => '"' + __s_split(__s_trim(__s_slice(r, 1, -1)), /\s+/).join(' ') + '"').join(' ');
+    }
     // A slash in grid shorthands prints with spaces around it.
     if (prop === 'grid-area' || prop === 'grid-row' || prop === 'grid-column') {
       return __s_replace(v, /\s*\/\s*/g, ' / ');
@@ -5203,7 +5208,7 @@
   const __mediaListProto = {
     get [Symbol.toStringTag]() { return 'MediaList'; },
     get mediaText() { return this.__ptMedia.join(', '); },
-    set mediaText(v) { this.__ptMedia = __s_split(String(v), ',').map((s) => __s_trim(s)).filter(Boolean); },
+    set mediaText(v) { this.__ptMedia = __mqList(String(v)).map((q) => q.text); },
     get length() { return this.__ptMedia.length; },
     item(i) { return this.__ptMedia[i] != null ? this.__ptMedia[i] : null; },
     appendMedium(m) { if (!__s_includes(this.__ptMedia, String(m))) this.__ptMedia.push(String(m)); },
@@ -5213,7 +5218,7 @@
   function __mediaList(text) {
     const m = Object.create(__link('MediaList', __mediaListProto));
     Object.defineProperty(m, '__ptMedia', {
-      value: __s_split(String(text || ''), ',').map((s) => __s_trim(s)).filter(Boolean),
+      value: __mqList(String(text || '')).map((q) => q.text),
       writable: true, enumerable: false,
     });
     return m;
@@ -5291,7 +5296,8 @@
   }).join(', ');
   // A media query list: one space around `and`, `: ` in features, `, `
   // between queries.
-  const __mediaText = (q) => __s_replace(__s_replace(__s_replace(__s_trim(String(q)), /\s+/g, ' '), /\s*:\s*/g, ': '), /\s*,\s*/g, ', ');
+  // An @media condition as Chrome prints it (see `__mqParse`).
+  const __mediaText = (q) => __mqList(String(q)).map((x) => x.text).join(', ');
   // A selector or a rule list changed through the CSSOM: the rule list and
   // every cascade are rebuilt.
   const __cssomChanged = () => { __importGen++; __markDirty(); };
@@ -11253,22 +11259,352 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return ids * 10000 + cls * 100 + tags;
   }
 
-  // @media: only viewport width and height are evaluated; anything else
-  // answers "no" rather than guessing.
-  function __mediaApplies(cond) {
-    const c = __s_trim(__s_toLowerCase(String(cond || '')));
-    if (!c || c === 'all' || c === 'screen') return true;
-    if (/print|speech/.test(c)) return false;
-    if (/prefers-color-scheme:\s*dark/.test(c)) return false;
-    if (/prefers-reduced-motion:\s*reduce/.test(c)) return false;
-    let ok = true;
-    const px = (v) => parseFloat(v) || 0;
-    for (const m of c.matchAll(/\((min|max)-(width|height):\s*([\d.]+)px\)/g)) {
-      const have = m[2] === 'width' ? LAYOUT.W : LAYOUT.H;
-      ok = ok && (m[1] === 'min' ? have >= px(m[3]) : have <= px(m[3]));
-    }
-    return ok;
+  // Media queries (Media Queries 4) as Chrome 151 answers them, for @media
+  // and matchMedia: media types with `not`/`only`, `and`/`or`/`not`
+  // conditions, plain and range features, calc() of lengths, em and rem,
+  // ratios and resolutions; the screen is this window's. A feature Chrome
+  // does not know, or a value it would not take, answers false. The text
+  // prints as Chrome prints it (lowercase, `a / b`, calc folded).
+  // Built at first use: CSS parsed while the runtime starts reaches here
+  // before the lines below have run.
+  function __mqFeatures() {
+    if (__mqFeatures.map) return __mqFeatures.map;
+    const W = () => LAYOUT.W, H = () => LAYOUT.H;
+    const scr = (k, d) => { try { const v = globalThis.screen && globalThis.screen[k]; return typeof v === 'number' ? v : d; } catch (e) { return d; } };
+    const dpr = () => { const v = globalThis.devicePixelRatio; return typeof v === 'number' && v > 0 ? v : 1; };
+    const range = (kind, get) => ({ range: true, kind, get });
+    const pick = (value, ...others) => ({ range: false, kind: 'ident', get: () => value, known: new Set([value, ...others]) });
+    return (__mqFeatures.map = new Map([
+      ['width', range('length', W)], ['height', range('length', H)],
+      ['device-width', range('length', () => scr('width', LAYOUT.W))], ['device-height', range('length', () => scr('height', LAYOUT.H))],
+      ['aspect-ratio', range('ratio', () => W() / H())], ['device-aspect-ratio', range('ratio', () => scr('width', 1) / scr('height', 1))],
+      ['resolution', range('resolution', dpr)], ['-webkit-device-pixel-ratio', range('number', dpr)],
+      ['color', range('int', () => 8)], ['color-index', range('int', () => 0)], ['monochrome', range('int', () => 0)],
+      ['grid', { range: false, kind: 'int', get: () => 0 }],
+      ['-webkit-transform-3d', { range: false, kind: 'int', get: () => 1 }],
+      ['orientation', { range: false, kind: 'ident', get: () => (W() >= H() ? 'landscape' : 'portrait'), known: new Set(['landscape', 'portrait']) }],
+      ['color-gamut', { range: false, kind: 'ident', get: () => 'srgb', known: new Set(['srgb', 'p3', 'rec2020']), test: (v) => v === 'srgb' }],
+      ['dynamic-range', pick('standard', 'high')],
+      ['prefers-color-scheme', pick('light', 'dark')],
+      ['prefers-reduced-motion', pick('no-preference', 'reduce')],
+      ['prefers-reduced-transparency', pick('no-preference', 'reduce')],
+      ['prefers-reduced-data', pick('no-preference', 'reduce')],
+      ['prefers-contrast', pick('no-preference', 'more', 'less', 'custom')],
+      ['forced-colors', pick('none', 'active')], ['inverted-colors', pick('none', 'inverted')],
+      ['hover', pick('hover', 'none')], ['any-hover', pick('hover', 'none')],
+      ['pointer', pick('fine', 'coarse', 'none')], ['any-pointer', pick('fine', 'coarse', 'none')],
+      ['display-mode', pick('browser', 'fullscreen', 'standalone', 'minimal-ui', 'window-controls-overlay', 'picture-in-picture')],
+      ['scripting', pick('enabled', 'initial-only', 'none')], ['update', pick('fast', 'slow', 'none')],
+      ['overflow-block', pick('scroll', 'none', 'paged', 'optional-paged')], ['overflow-inline', pick('scroll', 'none')],
+      ['device-posture', pick('continuous', 'folded')],
+      ['horizontal-viewport-segments', range('int', () => 1)], ['vertical-viewport-segments', range('int', () => 1)],
+    ]));
   }
+  function __mqTokens(text) {
+    const s = String(text), out = [];
+    const NUM = /[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?([a-zA-Z%]*)/y, ID = /-?[a-zA-Z_][a-zA-Z0-9_-]*/y;
+    let i = 0;
+    while (i < s.length) {
+      const c = s[i];
+      if (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f') { i++; continue; }
+      if (c === '(' || c === ')' || c === ',' || c === ':' || c === '/' || c === '=') { out.push({ t: c }); i++; continue; }
+      if (c === '<' || c === '>') { if (s[i + 1] === '=') { out.push({ t: c + '=' }); i += 2; } else { out.push({ t: c }); i++; } continue; }
+      NUM.lastIndex = i;
+      let m = /[\d.]/.test(c) || ((c === '+' || c === '-') && /[\d.]/.test(s[i + 1] || '')) ? NUM.exec(s) : null;
+      if (m) { out.push({ t: 'num', v: parseFloat(m[0]), u: __s_toLowerCase(m[1]), raw: __s_toLowerCase(m[0]) }); i += m[0].length; continue; }
+      ID.lastIndex = i;
+      m = ID.exec(s);
+      if (m) {
+        const name = __s_toLowerCase(m[0]);
+        let j = i + m[0].length;
+        if (s[j] === '(') {
+          let depth = 0;
+          for (; j < s.length; j++) { if (s[j] === '(') depth++; else if (s[j] === ')' && --depth === 0) break; }
+          out.push({ t: 'fn', v: name, body: __s_slice(s, i + m[0].length + 1, j) });
+          i = j + 1;
+          continue;
+        }
+        out.push({ t: 'id', v: name });
+        i = j;
+        continue;
+      }
+      out.push({ t: 'bad', v: c });
+      i++;
+    }
+    return out;
+  }
+  // calc() of numbers and lengths: [px value, printed] when it folds.
+  function __mqCalc(body) {
+    const toks = __mqTokens(__s_replace(body, /([*+\/-])/g, ' $1 '));
+    let i = 0, unit = null, bad = false;
+    const atom = () => {
+      const t = toks[i++];
+      if (!t) { bad = true; return 0; }
+      if (t.t === '(') { const v = sum(); if (!toks[i] || toks[i].t !== ')') bad = true; i++; return v; }
+      if (t.t === 'num') { const px = __mqLength(t); if (px === null) { bad = true; return 0; } if (t.u) unit = 'px'; return px; }
+      bad = true;
+      return 0;
+    };
+    const prod = () => { let v = atom(); while (toks[i] && (toks[i].t === 'bad' && toks[i].v === '*' || toks[i].t === '/')) { const op = toks[i++]; const r = atom(); v = op.t === '/' ? v / r : v * r; } return v; };
+    const sum = () => { let v = prod(); while (toks[i] && toks[i].t === 'bad' && (toks[i].v === '+' || toks[i].v === '-')) { const op = toks[i++].v; const r = prod(); v = op === '+' ? v + r : v - r; } return v; };
+    const v = sum();
+    if (bad || i !== toks.length || !isFinite(v)) return null;
+    return [v, 'calc(' + (Math.round(v * 1e6) / 1e6) + (unit || '') + ')'];
+  }
+  function __mqLength(t) {
+    if (t.t === 'fn' && t.v === 'calc') { const c = __mqCalc(t.body); return c ? c[0] : null; }
+    if (t.t !== 'num') return null;
+    switch (t.u) {
+      case 'px': return t.v;
+      case 'em': case 'rem': return t.v * 16;
+      case 'in': return t.v * 96;
+      case 'cm': return t.v * 96 / 2.54;
+      case 'mm': return t.v * 96 / 25.4;
+      case 'pt': return t.v * 4 / 3;
+      case 'pc': return t.v * 16;
+      case 'vw': return t.v * LAYOUT.W / 100;
+      case 'vh': return t.v * LAYOUT.H / 100;
+      case '': return t.v === 0 ? 0 : null;
+      default: return null;
+    }
+  }
+  // A media query list parsed: [{ text, test() }] per comma-separated query.
+  function __mqParse(text) {
+    const all = __mqTokens(text), queries = [];
+    let cur = [], depth = 0;
+    for (const t of all) {
+      if (t.t === '(') depth++;
+      else if (t.t === ')') depth--;
+      if (t.t === ',' && depth === 0) { queries.push(cur); cur = []; continue; }
+      cur.push(t);
+    }
+    queries.push(cur);
+    if (queries.length === 1 && !queries[0].length) return [];
+    return queries.map(__mqQuery);
+  }
+  function __mqQuery(toks) {
+    const __MQ_FALSE = { text: 'not all', test: () => false };
+    let i = 0;
+    const peek = () => toks[i], id = (v) => toks[i] && toks[i].t === 'id' && toks[i].v === v;
+    const value = (fromList) => {
+      const t = toks[i];
+      if (!t) return null;
+      if (t.t === 'num' && toks[i + 1] && toks[i + 1].t === '/' && toks[i + 2] && toks[i + 2].t === 'num') {
+        i += 3;
+        return { k: 'ratio', v: t.v / toks[i - 1].v, text: t.raw + ' / ' + toks[i - 1].raw };
+      }
+      if (t.t === 'num') { i++; return { k: 'num', t, text: t.raw }; }
+      if (t.t === 'id') { i++; return { k: 'id', v: t.v, text: t.v }; }
+      if (t.t === 'fn' && t.v === 'calc') { i++; const c = __mqCalc(t.body); return c ? { k: 'num', t: { t: 'num', v: c[0], u: 'px', raw: c[1] }, calc: true, text: c[1] } : { k: 'bad', text: 'calc(' + t.body + ')' }; }
+      i++;
+      return { k: 'bad', text: t.v || t.t };
+    };
+    // A feature's value as the feature's kind wants it, or null.
+    const asKind = (kind, v) => {
+      if (!v || v.k === 'bad') return null;
+      if (kind === 'length') return v.k === 'num' ? __mqLength(v.t) : null;
+      if (kind === 'ratio') return v.k === 'ratio' ? v.v : v.k === 'num' && !v.t.u ? v.t.v : null;
+      if (kind === 'resolution') {
+        if (v.k !== 'num') return null;
+        const u = v.t.u;
+        return u === 'dppx' || u === 'x' ? v.t.v : u === 'dpi' ? v.t.v / 96 : u === 'dpcm' ? v.t.v * 2.54 / 96 : null;
+      }
+      if (kind === 'int' || kind === 'number') return v.k === 'num' && !v.t.u && (kind === 'number' || Number.isInteger(v.t.v)) ? v.t.v : null;
+      return null;
+    };
+    const cmp = (a, op, b) => {
+      const e = Math.abs(a - b) < 1e-9;
+      return op === '=' ? e : op === '<' ? a < b && !e : op === '<=' ? a < b || e : op === '>' ? a > b && !e : a > b || e;
+    };
+    const flip = { '<': '>', '<=': '>=', '>': '<', '>=': '<=', '=': '=' };
+    const feature = () => {
+      // Inside the parentheses, up to the matching ')'.
+      const start = i;
+      let depth = 0, end = i;
+      for (; end < toks.length; end++) { if (toks[end].t === '(') depth++; else if (toks[end].t === ')') { if (depth === 0) break; depth--; } }
+      const inner = toks.slice(start, end);
+      i = end;
+      const isOp = (t) => t && (t.t === '<' || t.t === '<=' || t.t === '>' || t.t === '>=' || t.t === '=');
+      const unknown = (text) => ({ text, test: () => false });
+      if (inner.length === 1 && inner[0].t === 'id') {
+        const name = inner[0].v, f = __mqFeatures().get(name);
+        return { text: name, test: () => { if (!f) return false; const v = f.get(); return v !== 0 && v !== 'none' && v !== 'no-preference'; } };
+      }
+      if (inner.length >= 3 && inner[0].t === 'id' && inner[1].t === ':') {
+        let name = inner[0].v;
+        const sub = toks; const save = i;
+        toks = inner; i = 2; const v = value(); const after = i; toks = sub; i = save;
+        const rest = after < inner.length;
+        const text = name + ': ' + (v ? v.text : '') + (rest ? ' ' + inner.slice(after).map((t) => t.raw || t.v || t.t).join(' ') : '');
+        let pre = null;
+        if (/^-webkit-(min|max)-device-pixel-ratio$/.test(name)) { pre = name.indexOf('-min-') > 0 ? 'min' : 'max'; name = '-webkit-device-pixel-ratio'; }
+        else if (/^(min|max)-/.test(name)) { pre = __s_slice(name, 0, 3); name = __s_slice(name, 4); }
+        const f = __mqFeatures().get(name);
+        if (!f || rest || (pre && !f.range)) return unknown(text);
+        if (f.kind === 'ident') {
+          if (!v || v.k !== 'id' || !f.known.has(v.v)) return unknown(text);
+          return { text, test: () => (f.test ? f.test(v.v) : f.get() === v.v) };
+        }
+        const want = asKind(f.kind, v);
+        if (want === null) return unknown(text);
+        return { text, test: () => cmp(f.get(), pre === 'min' ? '>=' : pre === 'max' ? '<=' : '=', want) };
+      }
+      // Ranges: `width >= 600px`, `600px <= width`, `600px <= width <= 900px`.
+      {
+        const sub = toks, save = i;
+        toks = inner; i = 0;
+        const parts = [];
+        while (i < inner.length) { if (isOp(inner[i])) { parts.push({ op: inner[i].t }); i++; } else parts.push(value()); }
+        toks = sub; i = save;
+        const text = parts.map((p) => (p.op ? p.op : p.text)).join(' ');
+        const nameAt = parts.findIndex((p) => p && p.k === 'id' && __mqFeatures().has(p.v));
+        if (nameAt < 0) return unknown(text);
+        const f = __mqFeatures().get(parts[nameAt].v);
+        if (!f.range) return unknown(text);
+        const tests = [];
+        if (parts.length === 3 && parts[1].op) {
+          const other = nameAt === 0 ? parts[2] : parts[0], op = nameAt === 0 ? parts[1].op : flip[parts[1].op];
+          const want = asKind(f.kind, other);
+          if (want === null) return unknown(text);
+          tests.push([op, want]);
+        } else if (parts.length === 5 && nameAt === 2 && parts[1].op && parts[3].op) {
+          const lo = asKind(f.kind, parts[0]), hi = asKind(f.kind, parts[4]);
+          const a = parts[1].op, b = parts[3].op;
+          if (lo === null || hi === null || a[0] !== b[0] || a === '=' || b === '=') return unknown(text);
+          tests.push([flip[a], lo], [b, hi]);
+        } else return unknown(text);
+        return { text, test: () => tests.every(([op, w]) => cmp(f.get(), op, w)) };
+      }
+    };
+    const inParens = () => {
+      if (!toks[i] || toks[i].t !== '(') return null;
+      i++;
+      let node;
+      if (toks[i] && (toks[i].t === '(' || (toks[i].t === 'id' && toks[i].v === 'not' && toks[i + 1] && toks[i + 1].t === '('))) {
+        node = cond(true);
+        if (!node) return null;
+        node = { text: '(' + node.text + ')', test: node.test };
+      } else {
+        const f = feature();
+        node = { text: '(' + f.text + ')', test: f.test };
+      }
+      if (!toks[i] || toks[i].t !== ')') return null;
+      i++;
+      return node;
+    };
+    const cond = (orOk) => {
+      if (id('not')) {
+        i++;
+        const n = inParens();
+        return n ? { text: 'not ' + n.text, test: () => !n.test() } : null;
+      }
+      const first = inParens();
+      if (!first) return null;
+      const list = [first];
+      let op = null;
+      while (id('and') || (orOk && id('or'))) {
+        const o = toks[i].v;
+        if (op && op !== o) return null;
+        op = o;
+        i++;
+        const n = inParens();
+        if (!n) return null;
+        list.push(n);
+      }
+      if (list.length === 1) return first;
+      return { text: list.map((n) => n.text).join(' ' + op + ' '), test: op === 'and' ? () => list.every((n) => n.test()) : () => list.some((n) => n.test()) };
+    };
+    let out = null;
+    const t0 = peek();
+    if (t0 && t0.t === 'id' && !(t0.v === 'not' && toks[1] && toks[1].t === '(')) {
+      let pre = '';
+      if (t0.v === 'not' || t0.v === 'only') { pre = t0.v; i++; }
+      const type = toks[i] && toks[i].t === 'id' ? toks[i].v : null;
+      if (!type || type === 'and' || type === 'or' || type === 'not' || type === 'only') return __MQ_FALSE;
+      i++;
+      let c = null;
+      if (id('and')) { i++; c = cond(false); if (!c) return __MQ_FALSE; }
+      const typeOk = type === 'all' || type === 'screen';
+      const text = (pre ? pre + ' ' : '') + type + (c ? ' and ' + c.text : '');
+      out = { text, test: () => { const r = typeOk && (!c || c.test()); return pre === 'not' ? !r : r; } };
+    } else {
+      out = cond(true);
+      if (!out) return __MQ_FALSE;
+    }
+    return i === toks.length ? out : __MQ_FALSE;
+  }
+  function __mqList(text) {
+    const k = String(text);
+    let memo = __mqList.memo;
+    if (!memo || memo.size > 2000) memo = __mqList.memo = new Map();
+    let q = memo.get(k);
+    if (!q) { q = __mqParse(k); memo.set(k, q); }
+    return q;
+  }
+  function __mediaApplies(cond) {
+    const list = __mqList(cond == null ? '' : cond);
+    return !list.length || list.some((q) => q.test());
+  }
+  // An @supports condition (CSS Conditional 4): `not`, `and`, `or` (not
+  // mixed), parentheses, a declaration of a property the engine knows,
+  // `selector()`, `font-tech()`, `font-format()`; anything else is false.
+  // Values are not checked yet: `(display: foo)` passes.
+  const __FONT_TECH = new Set(['features-opentype', 'features-aat', 'features-graphite', 'color-colrv0', 'color-colrv1', 'color-svg', 'color-sbix', 'color-cbdt', 'variations', 'palettes', 'incremental']);
+  const __FONT_FORMAT = new Set(['collection', 'embedded-opentype', 'opentype', 'svg', 'truetype', 'woff', 'woff2']);
+  function __supportsCond(text) {
+    const s = __s_trim(String(text == null ? '' : text));
+    // [start, end) of each top-level part, and the words between them.
+    const parts = [], words = [];
+    let depth = 0, from = -1, q = null;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (q) { if (c === '\\') i++; else if (c === q) q = null; continue; }
+      if (c === '"' || c === "'") { q = c; continue; }
+      if (c === '(') { if (depth === 0 && from < 0) from = i; depth++; continue; }
+      if (c === ')') { depth--; if (depth < 0) return null; if (depth === 0 && from >= 0) { parts.push(__s_slice(s, from, i + 1)); from = -1; } continue; }
+      if (depth > 0) continue;
+      if (/\s/.test(c)) continue;
+      const m = /^[A-Za-z-][\w-]*/.exec(__s_slice(s, i));
+      if (!m) return null;
+      if (s[i + m[0].length] === '(') { from = i; i += m[0].length - 1; continue; }
+      words.push([parts.length, __s_toLowerCase(m[0])]);
+      i += m[0].length - 1;
+    }
+    if (depth !== 0 || q || from >= 0 || !parts.length) return null;
+    const one = (p) => {
+      if (p[0] !== '(') {
+        const m = /^([\w-]+)\((.*)\)$/s.exec(p);
+        if (!m) return false;
+        const fn = __s_toLowerCase(m[1]), arg = __s_trim(m[2]);
+        if (fn === 'selector') return !!arg && __selCompiled(arg) !== null && __selValid(arg);
+        if (fn === 'font-tech') return __FONT_TECH.has(__s_toLowerCase(arg));
+        if (fn === 'font-format') return __FONT_FORMAT.has(__s_toLowerCase(arg));
+        return false;
+      }
+      const inner = __s_trim(__s_slice(p, 1, -1));
+      if (inner[0] === '(' || /^not\s*\(/i.test(inner) || /^[\w-]+\(/.test(inner)) {
+        const r = __supportsCond(inner);
+        return r === null ? false : r;
+      }
+      const d = /^(--[\w-]*|-?[A-Za-z][\w-]*)\s*:\s*([\s\S]*?)\s*(!\s*important)?$/i.exec(inner);
+      if (!d || !d[2]) return false;
+      const name = d[1];
+      return __s_lastIndexOf(name, '--', 0) === 0 || (typeof globalThis.__pt_cssKnown === 'function' && globalThis.__pt_cssKnown(name));
+    };
+    if (words.length === 1 && words[0][0] === 0 && words[0][1] === 'not' && parts.length === 1) return !one(parts[0]);
+    if (words.length !== parts.length - 1) return null;
+    let op = null;
+    for (let k = 0; k < words.length; k++) {
+      const [at, w] = words[k];
+      if (at !== k + 1 || (w !== 'and' && w !== 'or') || (op && op !== w)) return null;
+      op = w;
+    }
+    if (!op) return one(parts[0]);
+    return op === 'and' ? parts.every(one) : parts.some(one);
+  }
+  Object.defineProperty(globalThis, '__pt_supportsCond', { value: (q) => __supportsCond(q), configurable: true, enumerable: false, writable: true });
+  Object.defineProperty(globalThis, '__pt_mqMatch', { value: (q) => __mediaApplies(q), configurable: true, enumerable: false, writable: true });
+  Object.defineProperty(globalThis, '__pt_mqText', { value: (q) => __mqList(q).map((x) => x.text).join(', '), configurable: true, enumerable: false, writable: true });
 
   let __rules = [];                       // {root, sel, spec, order, style}
   let __foreignRules = new WeakMap();     // document -> its rules
@@ -12023,7 +12359,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
           continue;
         }
         if (kind === 'media' || kind === 'supports') {
-          if (kind !== 'media' || __mediaApplies(st.cond)) take(root, st.kids, layer);
+          if (kind === 'media' ? __mediaApplies(st.cond) : __supportsCond(st.cond) === true) take(root, st.kids, layer);
           continue;
         }
         if (kind === 'layer-statement') { for (const n of st.names) layerOf(layer, n); continue; }   // @layer a, b;
@@ -13089,10 +13425,31 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // Grid item placement: explicit (`grid-area: 1/1`, `grid-column: 2`) and
   // row-wise auto-placement into free cells; as many columns as needed
   // (implicit ones auto). Shared by layout and max-content.
-  function __gridPlacement(flow, nTracks) {
-    const lineOf = (c, prop) => { const v = __s_trim(String(__cascadeFor(c).get(prop) || 'auto')); const m = /^(\d+)$/.exec(v); return m ? +m[1] : null; };
+  // A grid line given by a name (a custom ident: not auto, a number or span).
+  function __gridIdent(v) { return !!v && /^-?[A-Za-z_\u0080-\uFFFF][\w\u0080-\uFFFF-]*$/.test(v) && !/^(auto|span|inherit|initial|unset)$/i.test(v); }
+  // A named area (`grid-area: main` with `grid-template-areas: "nav main"`)
+  // places an item at the area's first row and column.
+  function __gridAreas(raw) {
+    const map = new Map();
+    let cols = 0;
+    const rows = String(raw == null ? '' : raw).match(/"[^"]*"|'[^']*'/g) || [];
+    rows.forEach((row, r) => {
+      const cells = __s_split(__s_trim(__s_slice(row, 1, -1)), /\s+/).filter(Boolean);
+      cols = Math.max(cols, cells.length);
+      cells.forEach((name, k) => { if (name !== '.' && !/^\.+$/.test(name) && !map.has(name)) map.set(name, { r, k }); });
+    });
+    return { map, cols };
+  }
+  function __gridPlacement(flow, nTracks, areas) {
+    const lineOf = (c, prop) => {
+      const v = __s_trim(String(__cascadeFor(c).get(prop) || 'auto'));
+      const m = /^(\d+)$/.exec(v);
+      if (m) return +m[1];
+      const a = areas && v !== 'auto' && areas.map.get(v);
+      return a ? (prop === 'grid-column-start' ? a.k : a.r) + 1 : null;
+    };
     const want = flow.map((c) => ({ col: lineOf(c, 'grid-column-start'), row: lineOf(c, 'grid-row-start') }));
-    let n = Math.max(nTracks, ...want.map((w) => w.col || 0));
+    let n = Math.max(nTracks, areas ? areas.cols : 0, ...want.map((w) => w.col || 0));
     const taken = new Set(); const place = new Array(flow.length);
     want.forEach((w, i) => { if (w.col && w.row) { place[i] = { k: w.col - 1, r: w.row - 1 }; taken.add((w.row - 1) + ':' + (w.col - 1)); } });
     want.forEach((w, i) => { if (place[i] || !w.row) return; let k = 0; while (taken.has((w.row - 1) + ':' + k)) k++; if (k >= n) n = k + 1; place[i] = { k, r: w.row - 1 }; taken.add((w.row - 1) + ':' + k); });
@@ -14147,7 +14504,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const cols = tmplCols === 'none' || tmplCols === 'auto' || tmplCols === '' ? [{ auto: true }] : __gridTracks(cs.get('grid-template-columns'), cw, colGap, fs);
       // Explicit placement (`grid-area: 1/1`, `grid-column: 2`) and row-wise
       // auto-placement into free cells; implicit columns are `auto`.
-      const { place, n, want } = __gridPlacement(flow, cols.length);
+      const { place, n, want } = __gridPlacement(flow, cols.length, __gridAreas(cs.get('grid-template-areas')));
       while (cols.length < n) cols.push({ auto: true });
       const marg = (c, a, b) => {
         const ccs = __cascadeFor(c), cfs = __usedFontSize(c);
@@ -14868,14 +15225,43 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       const a = parts[0] || 'normal';
       return [['align-' + kind, a], ['justify-' + kind, parts[1] || a]];
     }
+    // An omitted part repeats a name given before it (`grid-area: main` is
+    // main in all four), else is auto.
     if (prop === 'grid-area') {
       const p = __s_split(v, '/').map((x) => __s_trim(x));
-      const names = ['grid-row-start', 'grid-column-start', 'grid-row-end', 'grid-column-end'];
-      return names.map((n, i) => [n, p[i] || 'auto']).filter(([, x]) => x);
+      const rs = p[0] || 'auto', cs0 = p[1] || (__gridIdent(rs) ? rs : 'auto');
+      const re = p[2] || (__gridIdent(rs) ? rs : 'auto'), ce = p[3] || (__gridIdent(cs0) ? cs0 : 'auto');
+      return [['grid-row-start', rs], ['grid-column-start', cs0], ['grid-row-end', re], ['grid-column-end', ce]];
+    }
+    // `grid-template`: none, rows / columns, or area strings each with an
+    // optional row size, then / columns.
+    if (prop === 'grid-template') {
+      const t = __s_trim(v);
+      if (/^none$/i.test(t)) return [['grid-template-rows', 'none'], ['grid-template-columns', 'none'], ['grid-template-areas', 'none']];
+      let depth = 0, slash = -1;
+      for (let i = 0; i < t.length; i++) {
+        const ch = t[i];
+        if (ch === '(' || ch === '[') depth++;
+        else if (ch === ')' || ch === ']') depth--;
+        else if (ch === '"' || ch === "'") { const j = __s_indexOf(t, ch, i + 1); i = j < 0 ? t.length : j; }
+        else if (ch === '/' && depth === 0) { slash = i; break; }
+      }
+      const head = __s_trim(slash < 0 ? t : __s_slice(t, 0, slash)), cols = slash < 0 ? 'none' : __s_trim(__s_slice(t, slash + 1)) || 'none';
+      if (!/["']/.test(head)) return [['grid-template-rows', head || 'none'], ['grid-template-columns', cols], ['grid-template-areas', 'none']];
+      const strs = [], sizes = [];
+      const re = /("[^"]*"|'[^']*')|([^\s"']+(?:\([^)]*\))?)/g;
+      let m, pending = false;
+      while ((m = re.exec(head))) {
+        if (m[1]) { if (pending) sizes.push('auto'); strs.push(m[1]); pending = true; }
+        else if (pending && m[2][0] !== '[') { sizes.push(m[2]); pending = false; }
+      }
+      if (pending) sizes.push('auto');
+      return [['grid-template-rows', sizes.join(' ')], ['grid-template-columns', cols], ['grid-template-areas', strs.join(' ')]];
     }
     if (prop === 'grid-row' || prop === 'grid-column') {
       const p = __s_split(v, '/').map((x) => __s_trim(x));
-      return [[prop + '-start', p[0] || 'auto'], [prop + '-end', p[1] || 'auto']];
+      const a = p[0] || 'auto';
+      return [[prop + '-start', a], [prop + '-end', p[1] || (__gridIdent(a) ? a : 'auto')]];
     }
     if (prop === 'list-style') {
       for (const t of parts) {
@@ -15581,13 +15967,17 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     set('place-items', two(g('align-items'), g('justify-items')));
     set('place-self', two(g('align-self'), g('justify-self')));
     // Grid parts are slash-separated; an empty end is omitted.
+    // The shortest form: a part that would come back as it is omitted.
+    const implied = (part, from) => (__gridIdent(from) ? part === from : part === 'auto');
     for (const axis of ['row', 'column']) {
       const a = g('grid-' + axis + '-start'), b = g('grid-' + axis + '-end');
-      set('grid-' + axis, !b || b === 'auto' || b === a ? a : a + ' / ' + b);
+      set('grid-' + axis, !b || implied(b, a) ? a : a + ' / ' + b);
     }
     {
-      const quad = [g('grid-row-start'), g('grid-column-start'), g('grid-row-end'), g('grid-column-end')];
-      set('grid-area', quad.every((x) => x === 'auto') ? 'auto' : quad.join(' / '));
+      const q = [g('grid-row-start'), g('grid-column-start'), g('grid-row-end'), g('grid-column-end')];
+      let n = 4;
+      if (implied(q[3], q[1])) { n = 3; if (implied(q[2], q[0])) { n = 2; if (implied(q[1], q[0])) n = 1; } }
+      set('grid-area', q.slice(0, n).join(' / '));
     }
     set('grid-template', g('grid-template-rows') === 'none' && g('grid-template-columns') === 'none' &&
       g('grid-template-areas') === 'none' ? 'none' : '');

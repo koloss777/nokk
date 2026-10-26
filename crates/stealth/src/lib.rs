@@ -10144,6 +10144,12 @@ const FETCH_TEMPLATE: &str = r#"(() => {
         const known = (n) => (__s_lastIndexOf(String(n), '--', 0) === 0
           || (globalThis.__pt_cssKnown ? __pt_cssKnown(n) : /^[-a-zA-Z]+$/.test(n)));
         if (b !== undefined) return /^[-a-zA-Z]+$/.test(String(a)) && String(b).length > 0 && known(a);
+        // A condition (`(display: grid) and selector(:has(a))`), else a bare
+        // declaration taken as one in parentheses.
+        if (typeof globalThis.__pt_supportsCond === 'function') {
+          const r = globalThis.__pt_supportsCond(String(a));
+          return r === null ? globalThis.__pt_supportsCond('(' + String(a) + ')') === true : r;
+        }
         const m = /^\s*(--[-a-zA-Z0-9_]+|[-a-zA-Z]+)\s*:\s*([^;]+?)\s*$/.exec(String(a));
         return !!m && known(m[1]);
       },
@@ -14360,6 +14366,12 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
                && (maxH === null || h <= maxH) && (minH === null || h >= minH);
       }
     }
+    // The DOM's media query evaluator, when there is a DOM: what the regexes
+    // above answer only for single features.
+    let media = query;
+    if (typeof globalThis.__pt_mqMatch === 'function') {
+      try { matches = !!globalThis.__pt_mqMatch(query); media = globalThis.__pt_mqText(query); } catch (e) {}
+    }
     const listeners = [];
     // An interface object, not a literal: pages read
     // `Object.prototype.toString.call(matchMedia(...))`.
@@ -14369,7 +14381,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     // write, otherwise `Object.assign` fails on our own interface.
     const mql = Object.create(proto);
     __pt_write(mql, 'matches', matches);
-    __pt_write(mql, 'media', query);
+    __pt_write(mql, 'media', media);
     return Object.assign(mql, {
       onchange: null,
       addListener: (f) => { if (f) listeners.push(f); },

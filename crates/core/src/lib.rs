@@ -13473,6 +13473,88 @@ href|http://www.w3.org/1999/xlink href|http://www.w3.org/1999/xlink".into()));
         assert_eq!(out, Value::String("0 1 null".into()));
     }
 
+    /// Media queries and @supports answer as in Chrome 151 (values measured
+    /// there): media types, `not`/`only`, `and`/`or`, ranges, calc(), em,
+    /// resolutions and boolean features; the text prints as Chrome prints it;
+    /// a supports condition is parsed, and an @supports rule applies only
+    /// when it holds. `grid-template` expands into its longhands.
+    #[tokio::test]
+    async fn media_queries_and_supports_answer_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<!doctype html><style>@media screen and (max-width: calc(100px - 1px)) { .a { color: red } }\
+             @media (MIN-WIDTH:1PX) , print { .b { color: red } }\
+             @supports (display: grid) and (not (display: inline-grid)) { .c { color: red } }\
+             @supports selector(:has(a)) { .d { color: red } }\
+             .g { grid-template: \"x y\" 40px / 100px 1fr }</style>\
+             <p class=a id=a>a</p><p class=b id=b>b</p><p class=c id=c>c</p><p class=d id=d>d</p><div class=g id=g></div>",
+        )
+        .await
+        .unwrap();
+        let out = ctx
+            .evaluate(
+                r#"(() => { const m = (q) => (matchMedia(q).matches ? 1 : 0);
+            const mq = ['screen', 'all', 'print', 'not print', 'only screen', 'print, screen', 'not all and (monochrome)', '(width)', '(color)', '(color: 8)',
+              '(monochrome)', '(grid: 0)', '(min-width: calc(100px + 1px))', '(min-width: 1em)', '(width >= 1px)', '(1px <= width <= 100000px)', '(hover)',
+              '(pointer: fine)', '(any-pointer: coarse)', '(prefers-color-scheme)', '(prefers-reduced-motion)', '(-webkit-transform-3d)', '(foo: bar)',
+              '(min-width: 100)', '(min-width: 0)', 'not (hover: none)', '(hover) or (pointer: coarse)', '(video-dynamic-range: standard)', ''].map(m).join('');
+            const text = ['(MIN-WIDTH:100PX)', '  SCREEN  ', '(aspect-ratio: 16/9)', '(min-width: calc(100px + 1px))', 'screen and'].map((q) => matchMedia(q).media).join(' | ');
+            const sup = ['(display: grid)', '(display: grid) or (foo: bar)', 'selector(:has(a))', 'selector(:foo)', 'display: grid', '((display: flex))',
+              '(color: red) and (color: blue) or (color: green)', 'font-format(woff2)', 'font-tech(color-COLRv1)', '(--x: y)', 'not selector(:has(a))', 'foo: bar', ''].map((q) => (CSS.supports(q) ? 1 : 0)).join('');
+            const css = ['a', 'b', 'c', 'd'].map((i) => getComputedStyle(document.getElementById(i)).color === 'rgb(255, 0, 0)' ? 1 : 0).join('');
+            const rules = [...document.styleSheets[0].cssRules].slice(0, 2).map((r) => r.conditionText).join(' | ');
+            const g = getComputedStyle(document.getElementById('g'));
+            return [mq, text, sup, css, rules, g.gridTemplateAreas].join(' # '); })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            Value::String(
+                "11011111110111111101010011101 # (min-width: 100px) | screen | (aspect-ratio: 16 / 9) | (min-width: calc(101px)) | not all # \
+                 1110110111000 # 0101 # screen and (max-width: calc(99px)) | (min-width: 1px), print # \"x y\""
+                    .into()
+            )
+        );
+    }
+
+    /// Named grid areas place items as in Chrome 151, and the grid
+    /// shorthands expand and print as there: `grid-area: a` is `a` in all
+    /// four parts, an omitted end repeats a name, area strings print
+    /// double-quoted.
+    #[tokio::test]
+    async fn named_grid_areas_place_items_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<!doctype html><style>.g { display: grid; grid-template-areas: 'a b'; column-gap: 24px; width: 600px }\
+             .a { grid-area: a } .b { grid-area: b } .c { grid-area: 2 / 1 } .d { grid-row: x } .e { grid-area: a / 2 / 3 }</style>\
+             <div class=g id=g><div class=b id=b style='width: 70px'></div><div class=a id=a style='width: 50px'></div></div>\
+             <div class=c id=c></div><div class=d id=d></div><div class=e id=e></div>",
+        )
+        .await
+        .unwrap();
+        let out = ctx
+            .evaluate(
+                r#"['a','b'].map(i => { const r = document.getElementById(i).getBoundingClientRect(); return i + ':' + r.x + ',' + r.width; }).join(' ')
+            + ' | ' + ['a','c','d','e'].map(i => { const c = getComputedStyle(document.getElementById(i)); return c.gridArea + ' ; ' + c.gridRow + ' ; ' + c.gridColumn + ' ; ' + c.gridRowEnd; }).join(' | ')
+            + ' | ' + getComputedStyle(document.getElementById('g')).gridTemplateAreas"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            Value::String(
+                "a:8,50 b:310,70 | a ; a ; a ; a | 2 / 1 ; 2 ; 1 ; auto | x / auto ; x ; auto ; x | a / 2 / 3 ; a / 3 ; 2 ; 3 | \"a b\"".into()
+            )
+        );
+    }
+
     /// Line heights, UA margins and line breaks as Chrome 151 lays them out
     /// (values measured there): a multiplier is of the used font size, not
     /// a percentage resolved against the width; a list in a list has no UA
