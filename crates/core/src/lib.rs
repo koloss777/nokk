@@ -13463,6 +13463,57 @@ href|http://www.w3.org/1999/xlink href|http://www.w3.org/1999/xlink".into()));
         assert_eq!(out, Value::String("0 1 null".into()));
     }
 
+    /// A form answers its controls by name and index as Chrome 151's does:
+    /// the names before its own members, a shared name as a live
+    /// RadioNodeList, a renamed control under its old name until it leaves,
+    /// one live `elements`. FormData reads the form, `reset` restores the
+    /// defaults, and a method called on the form names it in the stack.
+    #[tokio::test]
+    async fn forms_answer_their_controls_by_name_and_index() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<!doctype html><form id=f name=login action=/go><input name=q id=qid value=1><input name=action value=A>\
+             <input type=radio name=r value=a><input type=radio name=r value=b checked><input type=checkbox name=c checked>\
+             <textarea name=t>x\ny</textarea><input type=image name=img><img name=pic></form><input form=f name=out value=o>\
+             <script>window.where = { m() { return new Error().stack.split('\\n')[1].trim().split(' ')[1]; } }.m;</script>",
+        )
+        .await
+        .unwrap();
+        let out = ctx
+            .evaluate(
+                r#"(() => { const f = document.getElementById('f'), e = f.elements, r = [];
+            r.push(f.q === f[0], f.qid === f.q, String(f.action), f.length, String(f.img), String(f.pic), String(f.out));
+            r.push(Object.prototype.toString.call(f.r), f.r.length, f.r.value, f.r === e.r, e === f.elements, e.namedItem('q') === f.q);
+            f.r.value = 'a'; r.push(f.r[0].checked);
+            r.push(Object.keys(f).join(','), Object.getOwnPropertyNames(e).slice(-9).join(','), 'q' in f, String(f[99]));
+            f.q.name = 'q2'; r.push(f.q === f.q2, String(e.q));
+            const n = document.createElement('input'); n.name = 'dyn'; f.appendChild(n); r.push(f.dyn === n, e.length, f.r.length); n.remove(); r.push(String(f.dyn));
+            r.push(document.forms.login === f, [...new FormData(f)].map(([k, v]) => k + '=' + v).join('&'));
+            f.q2.value = '9'; f.t.value = 'z'; f.reset(); r.push(f.q2.value, f.t.value);
+            f.m = window.where; r.push(f.m());
+            try { Object.defineProperty(f, 'q2', { value: 1 }); } catch (x) { r.push(x.message); }
+            return r.join(' '); })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            Value::String(
+                "true true [object HTMLInputElement] 7 undefined [object HTMLImageElement] [object HTMLInputElement] \
+                 [object RadioNodeList] 2 b true true true true \
+                 0,1,2,3,4,5,6 5,6,qid,q,action,r,c,t,out true undefined \
+                 true undefined true 8 2 undefined \
+                 true q2=1&action=A&r=a&c=on&t=x\ny&out=o \
+                 1 x\ny HTMLFormElement.m \
+                 Failed to set a named property 'q2' on 'HTMLFormElement': Named property setter is not supported."
+                    .into()
+            )
+        );
+    }
+
     /// What a stylesheet loads, and what `load` waits for, as measured in
     /// Chrome 151: an `@import` (its rules in the cascade), a background image
     /// resolved against the importing sheet and fetched with it as referrer,

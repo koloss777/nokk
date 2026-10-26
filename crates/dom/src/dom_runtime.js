@@ -322,11 +322,42 @@
 
   // An array wrapped as HTMLCollection: length/item/namedItem/iterator, not an
   // Array (`Array.isArray` is false on a real collection).
-  function __collection(arr) {
+  function __collection(arr, named) {
     const list = Object.create(__link('HTMLCollection', __collectionProto));
     for (let i = 0; i < arr.length; i++) list[i] = arr[i];
     Object.defineProperty(list, '__ptLen', { value: arr.length, enumerable: false, configurable: true });
+    // Named members, as `document.forms.login`: each element's id, then the
+    // name of an HTML element; the first element wins. Hidden from for-in,
+    // and never over the prototype's members (`length`, `item`). Only for
+    // the lists pages read by name: on `children` of a long list the names
+    // cost five times the list.
+    if (named) for (let i = 0; i < arr.length; i++) {
+      const e = arr[i];
+      if (!e || e.__ptType !== ELEMENT_NODE) continue;
+      const id = __ptGetA(e, 'id');
+      if (id) __collectionName(list, id, e);
+      if (e.__ptNS === undefined || e.__ptNS === 'http://www.w3.org/1999/xhtml') {
+        const name = __ptGetA(e, 'name');
+        if (name) __collectionName(list, name, e);
+      }
+    }
     return list;
+  }
+  function __collectionName(list, k, e) {
+    if (k in list || __arrayIndex(k) >= 0) return;
+    Object.defineProperty(list, k, { value: e, writable: false, enumerable: false, configurable: true });
+  }
+  // The array index a property key names, or -1.
+  function __arrayIndex(k) {
+    const n = k.length;
+    if (n === 0 || n > 10) return -1;
+    let v = 0;
+    for (let i = 0; i < n; i++) {
+      const d = __s_charCodeAt(k, i) - 48;
+      if (d < 0 || d > 9 || (i === 0 && d === 0 && n > 1)) return -1;
+      v = v * 10 + d;
+    }
+    return v < 4294967295 ? v : -1;
   }
   // `querySelectorAll` returns a static NodeList, unlike live childNodes; they
   // answer `Object.prototype.toString` differently.
@@ -1854,6 +1885,41 @@
     }
   }
 
+  // A form is a proxy over its element that answers its controls by name and
+  // index (the forms block below makes it). The engine reads the form's own
+  // members through `__formGet`, past any control of the same name.
+  let __formProxy = null;
+  const __formTargets = new WeakMap();
+  // Every value an id or a name attribute has had: a key not in it names no
+  // control, without a look at the tree. A page that keeps making new ids
+  // fills it once; past that every key is looked up.
+  const __namesSet = new Set();
+  let __namesFull = false;
+  const __namesSeen = {
+    add(v) { if (__namesFull) return; if (__namesSet.size >= 65536) { __namesFull = true; __namesSet.clear(); } else __namesSet.add(v); },
+    has(k) { return __namesFull || __namesSet.has(k); },
+  };
+  // Bumped by the changes that can move a control between forms or rename
+  // it, so a form works out its controls again only then.
+  let __formSeq = 0;
+  const __FORM_TREE = new Set(['form', 'img', 'button', 'fieldset', 'input', 'object', 'output', 'select', 'textarea']);
+  const __formNoteTree = (n) => {
+    if (!n || n.__ptType !== ELEMENT_NODE && n.__ptType !== 11) return;
+    if (__FORM_TREE.has(n.__ptLocal)) { __formSeq++; return; }
+    const st = [n];
+    while (st.length) {
+      const kids = st.pop().__ptKids;
+      if (kids) for (let i = 0; i < kids.length; i++) {
+        const k = kids[i];
+        if (k.__ptType !== ELEMENT_NODE) continue;
+        if (__FORM_TREE.has(k.__ptLocal)) { __formSeq++; return; }
+        if (k.__ptKids.length) st.push(k);
+      }
+    }
+  };
+  const __formNoteAttr = (name) => { if (name === 'id' || name === 'name' || name === 'form' || name === 'type') __formSeq++; };
+  const __formGet = (f, k) => Reflect.get(__formTargets.get(f) || f, k, f);
+
   class Element extends Node {
     moveBefore(node, child) { __moveBefore(this, arguments, 'Element'); }
     constructor(tag) {
@@ -1864,6 +1930,7 @@
       this.__ptTag = __s_toUpperCase(String(tag));
       this.__ptLocal = __s_toLowerCase(String(tag));
       this.__ptAttrs = new Map();
+      if (this.__ptLocal === 'form' && __formProxy) return __formProxy(this);
     }
     get nodeName() { return this.tagName; }
     get tagName() { return this.__ptTag; }
@@ -1892,6 +1959,7 @@
       if (name === 'src' && this.__ptLocal === 'script') v = __pt_ttSink('TrustedScriptURL', 'HTMLScriptElement src', v, "Failed to execute 'setAttribute' on 'Element'");
       else if (name === 'srcdoc' && this.__ptLocal === 'iframe') v = __pt_ttSink('TrustedHTML', 'HTMLIFrameElement srcdoc', v, "Failed to execute 'setAttribute' on 'Element'");
       this.__ptAttrs.set(name, String(v));
+      if (name === 'id' || name === 'name') __namesSeen.add(String(v));
       if (old === undefined) __attrMapSync(this);
       __styleTouchAttr(this, name, old, String(v));
       __ptOnTouched(this, name);
@@ -1953,6 +2021,7 @@
       const q = was !== null ? was : prefix !== null ? prefix + ':' + local : local;
       const old = this.__ptAttrs.get(q), val = String(v);
       this.__ptAttrs.set(q, val);
+      if (q === 'id' || q === 'name') __namesSeen.add(val);
       if (old === undefined) __attrMapSync(this);
       if (was === null) { if (N !== null) __attrNsMap(this).set(q, [N, prefix, local]); else if (this.__ptAttrNS) this.__ptAttrNS.delete(q); }
       __styleTouchAttr(this, q, old, val);
@@ -2293,7 +2362,7 @@
       if (!u) return;
       try { u[part] = v; __ptSetA(this, 'href', u.href); } catch (e) {}
     }
-    get action() { return this.__ptUrlAttr('action') || ((this.ownerDocument || document).URL || ''); }
+    get action() { return this.__ptUrlAttr('action') || ((__formGet(this, 'ownerDocument') || document).URL || ''); }
     set action(v) { __ptSetA(this, 'action', v); }
     // Form: `method`/`enctype` are enumerated, `elements` are its fields,
     // `submit()` goes to the action URL without an event, `requestSubmit()`
@@ -2308,30 +2377,78 @@
       return __collection(out);
     }
     get length() { return this.__ptLocal === 'form' ? this.elements.length : undefined; }
-    __ptFormData(submitter) {
+    // The form's entry list as Chrome builds it for FormData and submission:
+    // a control under a disabled fieldset (outside its first legend) is
+    // disabled, a file input without files sends an empty File, `dirname`
+    // adds the text direction, a hidden `_charset_` sends UTF-8. Then
+    // `formdata` fires with the list in `fd`, and what listeners add is kept.
+    __ptFormData(submitter, fd) {
       const pairs = [];
-      for (const el of this.elements) {
-        const tag = el.__ptLocal, name = __ptGetA(el, 'name');
-        if (!name || __ptHasA(el, 'disabled') || tag === 'fieldset' || tag === 'object' || tag === 'output') continue;
+      for (const el of __formGet(this, 'elements')) {
+        const tag = el.__ptLocal;
+        if (tag === 'fieldset' || tag === 'object' || tag === 'output' || __isDisabled(el)) continue;
+        let skip = false;
+        for (let p = el.__ptParent; p && !skip; p = p.__ptParent) if (p.__ptLocal === 'datalist') skip = true;
+        if (skip) continue;
+        const type = tag === 'input' ? __inputType(el) : tag === 'button' ? __s_toLowerCase(String(__ptGetA(el, 'type') || 'submit')) : '';
+        const name = __ptGetA(el, 'name');
+        if (tag === 'button' || (tag === 'input' && (type === 'submit' || type === 'button' || type === 'reset' || type === 'image'))) {
+          if (el !== submitter) continue;
+          if (type === 'image') { const pre = name ? name + '.' : ''; pairs.push([pre + 'x', '0'], [pre + 'y', '0']); continue; }
+        }
+        if (!name) continue;
+        if (tag === 'select') {
+          for (const o of el.options || []) {
+            const g = o.__ptParent;
+            if (o.selected && !__ptHasA(o, 'disabled') && !(g && g.__ptLocal === 'optgroup' && __ptHasA(g, 'disabled'))) pairs.push([name, o.value]);
+          }
+          continue;
+        }
         if (tag === 'input') {
-          const type = __inputType(el);
-          if (type === 'submit' || type === 'button' || type === 'reset' || type === 'image') { if (el === submitter) pairs.push([name, el.value || '']); continue; }
           if ((type === 'checkbox' || type === 'radio') && !el.checked) continue;
-          if (type === 'file') continue;
-          pairs.push([name, String(el.value == null ? '' : el.value)]);
-        } else if (tag === 'button') { if (el === submitter) pairs.push([name, el.value || '']); }
-        else if (tag === 'select') { for (const o of el.options || []) if (o.selected) pairs.push([name, o.value]); }
-        else pairs.push([name, String(el.value == null ? '' : el.value)]);
+          if (type === 'file') {
+            const files = el.files;
+            if (files && files.length) { for (let i = 0; i < files.length; i++) pairs.push([name, files[i]]); }
+            else if (typeof File === 'function') pairs.push([name, new File([], '', { type: 'application/octet-stream' })]);
+            continue;
+          }
+          if (type === 'hidden' && __s_toLowerCase(name) === '_charset_') { pairs.push([name, 'UTF-8']); continue; }
+        }
+        pairs.push([name, String(el.value == null ? '' : el.value)]);
+        const dirname = __ptGetA(el, 'dirname');
+        if (dirname && (tag === 'textarea' || /^(text|search|tel|url|email|password|submit|reset|button|hidden)$/.test(type))) {
+          let dir = 'ltr';
+          for (let p = el; p && p.__ptType === ELEMENT_NODE; p = p.__ptParent) {
+            const d = __s_toLowerCase(String(__ptGetA(p, 'dir') || ''));
+            if (d === 'rtl' || d === 'ltr') { dir = d; break; }
+          }
+          pairs.push([dirname, dir]);
+        }
       }
-      return pairs;
+      const data = fd || (typeof FormData === 'function' ? new FormData() : null);
+      if (!data || !globalThis.FormDataEvent) return pairs;
+      data.__ptD = pairs;
+      __formGet(this, 'dispatchEvent').call(this, __ptTrust(new FormDataEvent('formdata', { bubbles: true, formData: data })));
+      return data.__ptD;
+    }
+    // `new FormData(form, submitter)`: the submitter must be a submit button
+    // of this form.
+    __ptEntryList(submitter, fd) {
+      if (submitter !== undefined && submitter !== null) {
+        if (submitter.__ptType !== ELEMENT_NODE) throw __pt_mkErr(TypeError, "Failed to construct 'FormData': parameter 2 is not of type 'HTMLElement'.");
+        const tag = submitter.__ptLocal, type = tag === 'input' ? __inputType(submitter) : __s_toLowerCase(String(__ptGetA(submitter, 'type') || 'submit'));
+        if (!((tag === 'button' && type === 'submit') || (tag === 'input' && (type === 'submit' || type === 'image')))) throw __pt_mkErr(TypeError, "Failed to construct 'FormData': The specified element is not a submit button.");
+        if (submitter.form !== this) throw __pt_mkErr(globalThis.DOMException || Error, "Failed to construct 'FormData': The specified element is not owned by this form element.", 'NotFoundError');
+      }
+      return this.__ptFormData(submitter || null, fd);
     }
     __ptSubmit(submitter) {
-      if (this.__ptLocal !== 'form' || !this.isConnected) return;
-      const method = this.method;
+      if (this.__ptLocal !== 'form' || !__formGet(this, 'isConnected')) return;
+      const method = __formGet(this, 'method');
       if (method === 'dialog') return;
-      let action = this.action;
-      try { if (submitter && __ptHasA(submitter, 'formaction')) action = new URL(__ptGetA(submitter, 'formaction'), (this.ownerDocument || document).baseURI).href; } catch (e) {}
-      const pairs = this.__ptFormData(submitter);
+      let action = __formGet(this, 'action');
+      try { if (submitter && __ptHasA(submitter, 'formaction')) action = new URL(__ptGetA(submitter, 'formaction'), (this.__ptDoc || document).baseURI).href; } catch (e) {}
+      const pairs = this.__ptFormData(submitter).map(([k, v]) => [k, typeof v === 'string' ? v : String(v && v.name || '')]);
       const enc = (s) => __s_replace(__s_replace(encodeURIComponent(s), /%20/g, '+'), /[!'()~]/g, (c) => '%' + __s_toUpperCase(__s_charCodeAt(c, 0).toString(16)));
       const query = pairs.map(([k, v]) => enc(k) + '=' + enc(v)).join('&');
       if (typeof globalThis.__pt_navSubmit !== 'function') return;
@@ -2343,14 +2460,14 @@
       // Only this window (or the top, which it is for the page) navigates.
       let target = submitter && __ptHasA(submitter, 'formtarget') ? __ptGetA(submitter, 'formtarget') : __ptGetA(this, 'target');
       if (!target) {
-        const base = __docTags(this.ownerDocument || document, 'base').find((b) => __ptHasA(b, 'target'));
+        const base = __docTags(__formGet(this, 'ownerDocument') || document, 'base').find((b) => __ptHasA(b, 'target'));
         target = base ? __ptGetA(base, 'target') : '';
       }
       const kw = __s_toLowerCase(target || '');
       if (kw && kw !== '_self' && kw !== '_top' && kw !== '_parent') {
         // A frame of that name loads the response; the page stays. A new window
         // (`_blank`, an unknown name) without a user's click is a blocked popup.
-        const frame = kw === '_blank' ? null : __docTags(this.ownerDocument || document, 'iframe').find((f) => __ptGetA(f, 'name') === target);
+        const frame = kw === '_blank' ? null : __docTags(__formGet(this, 'ownerDocument') || document, 'iframe').find((f) => __ptGetA(f, 'name') === target);
         if (!frame) return;
         if (method === 'post') frame.__ptNavigate(action, 'POST', query, 'application/x-www-form-urlencoded');
         else frame.__ptNavigate(getUrl, 'GET', null, '');
@@ -2366,7 +2483,7 @@
       // The browser sends `submit`, so it is trusted even when a script asked
       // for submission (`isTrusted` true in Chrome).
       const ev = __ptTrust(new (globalThis.SubmitEvent || Event)('submit', { bubbles: true, cancelable: true, submitter: submitter || null }));
-      if (!this.dispatchEvent(ev)) return;
+      if (!__formGet(this, 'dispatchEvent').call(this, ev)) return;
       this.__ptSubmit(submitter || null);
     }
     __ptUrlAttr(n) {
@@ -2374,7 +2491,7 @@
       if (raw == null) return '';
       // An empty frame takes its base URL from the creator: `s.src = 'x.js'`
       // resolves against the parent, not `about://x.js`.
-      const base = (this.ownerDocument || document).baseURI || (globalThis.location && location.href) || 'about:blank';
+      const base = (__formGet(this, 'ownerDocument') || document).baseURI || (globalThis.location && location.href) || 'about:blank';
       try { return new URL(raw, base).href; } catch (e) { return raw; }
     }
 
@@ -2928,7 +3045,13 @@
     }
     // Form-field value (reflects the `value` attribute until edited). Generic so
     // input/textarea typing works; harmless on other elements.
-    get value() { return this.__ptValue !== undefined ? this.__ptValue : (__ptGetA(this, 'value') || ''); }
+    get value() {
+      if (this.__ptValue !== undefined) return this.__ptValue;
+      const v = __ptGetA(this, 'value');
+      if (v != null) return v;
+      // A checkbox or radio button without a value is "on".
+      return this.__ptLocal === 'input' && (__inputType(this) === 'checkbox' || __inputType(this) === 'radio') ? 'on' : '';
+    }
     // Form state is styled (`:checked ~ x`, `:placeholder-shown`): new layout.
     set value(v) { this.__ptValue = String(v); __markDirty(this); }
     // Common form-field surface, reflected from attributes — drivers gate `fill`
@@ -2984,7 +3107,26 @@
       try { return globalThis.__pt_imageSizeOf ? __pt_imageSizeOf(this.__ptImgAt) : null; } catch (e) { return null; }
     }
     get checked() { return this.__ptChecked !== undefined ? this.__ptChecked : __ptHasA(this, 'checked'); }
-    set checked(v) { this.__ptChecked = !!v; __markDirty(this); }
+    set checked(v) {
+      this.__ptChecked = !!v;
+      // Checking a radio button unchecks the others of its group: the same
+      // name, the same form (or none, in the same tree).
+      if (v && this.__ptLocal === 'input' && __inputType(this) === 'radio') {
+        const name = __ptGetA(this, 'name');
+        if (name) {
+          const owner = this.form || null;
+          let root = owner;
+          if (!root) { root = this; while (root.__ptParent) root = root.__ptParent; }
+          __walkTree(root, (k) => {
+            if (k !== this && k.__ptLocal === 'input' && k.__ptChecked !== false && __ptGetA(k, 'name') === name && __inputType(k) === 'radio' && (k.form || null) === owner && (k.__ptChecked || __ptHasA(k, 'checked'))) {
+              k.__ptChecked = false;
+              __markDirty(k);
+            }
+          });
+        }
+      }
+      __markDirty(this);
+    }
     get selectionStart() { return String(this.value || '').length; }
     get selectionEnd() { return String(this.value || '').length; }
     select() {}
@@ -3121,17 +3263,17 @@
     // same line and must be a string ('' for a direct load), not `undefined`.
     // Document collections are HTMLCollection, not arrays: `Array.isArray` is
     // false, and fingerprinters bucket arrays by their string value.
-    get scripts() { return __collection(__docTags(this, 'script')); }
-    get forms() { return __collection(__docTags(this, 'form')); }
-    get images() { return __collection(__docTags(this, 'img')); }
-    get embeds() { return __collection(__docTags(this, 'embed')); }
-    get plugins() { return __collection(__docTags(this, 'embed')); }
+    get scripts() { return __collection(__docTags(this, 'script'), true); }
+    get forms() { return __collection(__docTags(this, 'form'), true); }
+    get images() { return __collection(__docTags(this, 'img'), true); }
+    get embeds() { return __collection(__docTags(this, 'embed'), true); }
+    get plugins() { return __collection(__docTags(this, 'embed'), true); }
     // `links` is `<a>`/`<area>` *with an href*, and `anchors` is `<a>` with a name.
     get links() {
       return __collection(__docTags(this, 'a').concat(__docTags(this, 'area'))
-        .filter(e => __ptHasA(e, 'href')));
+        .filter(e => __ptHasA(e, 'href')), true);
     }
-    get anchors() { return __collection(__docTags(this, 'a').filter(e => __ptHasA(e, 'name'))); }
+    get anchors() { return __collection(__docTags(this, 'a').filter(e => __ptHasA(e, 'name')), true); }
     get styleSheets() { return __styleSheetList(__sheetOwners(this)); }
     // The declared charset, not always UTF-8: a page without a declaration is
     // parsed as windows-1252, and Chrome reports that.
@@ -6786,8 +6928,9 @@
         const formId = __ptGetA(el, 'form');
         if (formId && globalThis.document) f = document.getElementById(formId) || f;
         if (!f) return;
-        if (btype === 'reset') { if (typeof f.reset === 'function') f.reset(); }
-        else if (typeof f.requestSubmit === 'function') f.requestSubmit(el);
+        const reset = __formGet(f, 'reset'), request = __formGet(f, 'requestSubmit');
+        if (btype === 'reset') { if (typeof reset === 'function') reset.call(f); }
+        else if (typeof request === 'function') request.call(f, el);
         return;
       }
       if (tag === 'button') return;
@@ -6913,6 +7056,7 @@
   // mode (quirks or not) the doctype gave.
   function __parseDocumentInto(doc, markup, live) {
     const r = __ptJSON.parse(__pt_parseHtmlDocument(String(markup)));
+    __formSeq++;
     doc.__ptKids = [];
     doc.__ptDocEl = null;
     doc.__ptDoctype = null;
@@ -7184,8 +7328,8 @@
     const kids = (el) => (el && el.__ptKids ? el.__ptKids : []).filter((k) => k.__ptType === ELEMENT_NODE);
     const local = (el) => __s_toLowerCase(String(el.__ptLocal || ''));
     const isTag = (el, ...names) => el && el.__ptType === ELEMENT_NODE && __s_includes(names, local(el));
-    const branded = (arr, name) => {
-      const c = __collection(arr);
+    const branded = (arr, name, named) => {
+      const c = __collection(arr, named);
       try { const I = globalThis[name]; if (I && I.prototype) Object.setPrototypeOf(c, I.prototype); } catch (e) {}
       return c;
     };
@@ -7253,7 +7397,7 @@
     // The select an options collection is of, for its setters.
     const selOfOpts = new WeakMap();
     globalThis.__pt_optsSelect = (c) => selOfOpts.get(c) || null;
-    defGet(SEL, 'options', function () { const c = branded(selOptions(this), 'HTMLOptionsCollection'); selOfOpts.set(c, this); return c; });
+    defGet(SEL, 'options', function () { const c = branded(selOptions(this), 'HTMLOptionsCollection', true); selOfOpts.set(c, this); return c; });
     // add(option or optgroup, before: an element in it, an option index, or null).
     const selAdd = (sel, el, before, on) => {
       const fail = (what, name) => __pt_mkErr(name ? (globalThis.DOMException || Error) : TypeError, "Failed to execute 'add' on '" + on + "': " + what, name);
@@ -7335,19 +7479,33 @@
     defFn(SEL, 'item', function item(i) { return selOptions(this)[i | 0] || null; });
     defFn(SEL, 'namedItem', function namedItem(n) { return selOptions(this).find((o) => o.id === n || __ptGetA(o, 'name') === n) || null; });
     const DL = proto('HTMLDataListElement');
-    defGet(DL, 'options', function () { const out = []; __walkTree(this, (n) => { if (isTag(n, 'option')) out.push(n); }); return __collection(out); });
+    defGet(DL, 'options', function () { const out = []; __walkTree(this, (n) => { if (isTag(n, 'option')) out.push(n); }); return __collection(out, true); });
     // Forms and their elements.
     const LISTED = new Set(['button', 'fieldset', 'input', 'object', 'output', 'select', 'textarea']);
+    // The form owner: with a `form` attribute and in a document, the form of
+    // that id in the element's tree (or none); else the nearest form around
+    // it in the same tree, not across a shadow root.
     const formOf = (el) => {
       const id = __ptGetA(el, 'form');
-      if (id != null && el.ownerDocument && el.ownerDocument.getElementById) return el.ownerDocument.getElementById(id) || null;
-      for (let p = el.__ptParent; p; p = p.__ptParent) { if (isTag(p, 'form')) return p; if (p.__ptType === 11 && p.__ptHost) { p = p.__ptHost; } }
+      if (id != null) {
+        let root = el;
+        while (root.__ptParent) root = root.__ptParent;
+        let top = root;
+        while (top && top.__ptType === 11 && top.__ptHost) { top = top.__ptHost; while (top.__ptParent) top = top.__ptParent; }
+        if (top && top.__ptType === 9) {
+          let found = null;
+          __walkTree(root, (n) => { if (!found && n !== root && n.__ptType === ELEMENT_NODE && __ptGetA(n, 'id') === id) found = n; });
+          return found && isTag(found, 'form') ? found : null;
+        }
+      }
+      for (let p = el.__ptParent; p; p = p.__ptParent) if (isTag(p, 'form')) return p;
       return null;
     };
+    // The form's tree, not the document: a detached form has its own controls.
     const formControls = (form) => {
       const out = [];
-      const doc = form.ownerDocument;
-      const root = doc && doc.documentElement ? doc.documentElement : form;
+      let root = form;
+      while (root.__ptParent) root = root.__ptParent;
       __walkTree(root, (n) => {
         if (!n || n.__ptType !== ELEMENT_NODE || !LISTED.has(local(n))) return;
         if (local(n) === 'input' && __s_toLowerCase(String(__ptGetA(n, 'type') || '')) === 'image') return;
@@ -7355,9 +7513,226 @@
       });
       return out;
     };
+    // Named and indexed members, as Chrome's interceptors answer them. A form
+    // answers `form.q` and `form[0]` before its own members (an input named
+    // "action" hides form.action), a name two controls share is a live
+    // RadioNodeList, and a control keeps answering to a name it had until it
+    // leaves the form (the past names map). Each form's names are worked out
+    // once per DOM change.
+    const R_get = Reflect.get, R_set = Reflect.set, R_has = Reflect.has, R_keys = Reflect.ownKeys;
+    const R_desc = Reflect.getOwnPropertyDescriptor, R_def = Reflect.defineProperty, R_del = Reflect.deleteProperty;
+    const arrayIndex = __arrayIndex;
+    const engineKey = (k) => __s_charCodeAt(k, 0) === 95 && __s_charCodeAt(k, 1) === 95;
+    const isHtmlForm = (t) => t.__ptLocal === 'form' && (t.__ptNS === undefined || t.__ptNS === 'http://www.w3.org/1999/xhtml');
+    const addName = (m, k, el) => {
+      if (!k) return;
+      const v = m.get(k);
+      if (v === undefined) m.set(k, el);
+      else if (Array.isArray(v)) { if (v[v.length - 1] !== el) v.push(el); }
+      else if (v !== el) m.set(k, [v, el]);
+    };
+    const namesOf = (list) => {
+      const m = new Map();
+      for (const el of list) { addName(m, __ptGetA(el, 'id'), el); addName(m, __ptGetA(el, 'name'), el); }
+      return m;
+    };
+    const formMemo = new WeakMap(), pastNames = new WeakMap(), radioLists = new WeakMap(), controlLists = new WeakMap();
+    const formState = (form) => {
+      let st = formMemo.get(form);
+      if (st && st.seq === __formSeq) return st;
+      const ctrls = formControls(form);
+      st = { seq: __formSeq, ctrls, names: namesOf(ctrls), imgs: null };
+      formMemo.set(form, st);
+      return st;
+    };
+    // An image belongs to the form around it.
+    const imgOwner = (el) => { for (let p = el.__ptParent; p; p = p.__ptParent) if (isTag(p, 'form')) return p; return null; };
+    const namedList = (form, k) => {
+      const v = formState(form).names.get(k);
+      return v === undefined ? [] : Array.isArray(v) ? v : [v];
+    };
+    const radioList = (form, k) => {
+      let m = radioLists.get(form);
+      if (!m) radioLists.set(form, m = new Map());
+      let l = m.get(k);
+      if (!l) { l = liveList(globalThis.RadioNodeList.prototype, () => namedList(form, k), null, 'RadioNodeList'); m.set(k, l); }
+      return l;
+    };
+    const formNamed = (form, k) => {
+      const st = formState(form);
+      let v = st.names.get(k);
+      if (v === undefined) {
+        if (!st.imgs) {
+          const imgs = [];
+          __walkTree(form, (n) => { if (isTag(n, 'img') && imgOwner(n) === form) imgs.push(n); });
+          st.imgs = namesOf(imgs);
+        }
+        v = st.imgs.get(k);
+      }
+      let past = pastNames.get(form);
+      if (v === undefined) {
+        const el = past && past.get(k);
+        if (el === undefined) return undefined;
+        if ((isTag(el, 'img') ? imgOwner(el) : formOf(el)) === form) return el;
+        past.delete(k);
+        return undefined;
+      }
+      if (Array.isArray(v)) return radioList(form, k);
+      if (!past) pastNames.set(form, past = new Map());
+      past.set(k, v);
+      return v;
+    };
+    const noSetter = (iface, k, i) => __pt_mkErr(TypeError, i >= 0
+      ? "Failed to set an indexed property [" + i + "] on '" + iface + "': Indexed property setter is not supported."
+      : "Failed to set a named property '" + k + "' on '" + iface + "': Named property setter is not supported.");
+    // A live list: its indices (and `names`, when given) come from `items()`
+    // at each read, so a list a page holds follows the document.
+    function liveList(proto, items, names, iface) {
+      // The base interfaces get their members on first use (`__link`).
+      if (names) __link('HTMLCollection', __collectionProto); else __link('NodeList', __nodeListProto);
+      formIfaces();
+      const t = Object.create(proto);
+      const named = (k) => (!names || engineKey(k) || !__namesSeen.has(k) ? undefined : names().get(k));
+      const value = (o, k) => {
+        if (typeof k !== 'string') return undefined;
+        const i = arrayIndex(k);
+        if (i >= 0) return items()[i];
+        const v = named(k);
+        return Array.isArray(v) ? t.__ptNamedList(k) : v;
+      };
+      return __ptProxy(t, {
+        get(o, k, r) {
+          if (k === '__ptLen') return items().length;
+          if (typeof k === 'string' && !(k in o)) { const v = value(o, k); if (v !== undefined) return v; if (arrayIndex(k) >= 0) return undefined; }
+          return R_get(o, k, r);
+        },
+        has(o, k) { return value(o, k) !== undefined || R_has(o, k); },
+        getOwnPropertyDescriptor(o, k) {
+          const v = R_desc(o, k) ? undefined : value(o, k);
+          return v === undefined ? R_desc(o, k) : { value: v, writable: false, enumerable: true, configurable: true };
+        },
+        ownKeys(o) {
+          const out = [], n = items().length;
+          for (let i = 0; i < n; i++) out.push(String(i));
+          if (names) for (const k of names().keys()) if (arrayIndex(k) < 0 && !R_desc(o, k)) out.push(k);
+          for (const k of R_keys(o)) out.push(k);
+          return out;
+        },
+        // No setters: an index or a name is not assigned (a strict-mode page
+        // gets no error either, unlike Chrome).
+        set(o, k, v, r) { return (typeof k === 'string' && arrayIndex(k) >= 0) || (value(o, k) !== undefined && !R_desc(o, k)) ? true : R_set(o, k, v, r); },
+        defineProperty(o, k, d) {
+          if (typeof k === 'string') {
+            const i = arrayIndex(k);
+            if (i >= 0 || (value(o, k) !== undefined && !R_desc(o, k))) throw noSetter(iface, k, i);
+          }
+          return R_def(o, k, d);
+        },
+        deleteProperty(o, k) {
+          if (typeof k === 'string' && arrayIndex(k) >= 0) return value(o, k) === undefined;
+          return R_del(o, k);
+        },
+      });
+    }
+    const controlsOf = (form) => {
+      let l = controlLists.get(form);
+      if (!l) {
+        l = liveList(globalThis.HTMLFormControlsCollection.prototype, () => formState(form).ctrls, () => formState(form).names, 'HTMLFormControlsCollection');
+        Object.defineProperty(l, '__ptNamedList', { value: (k) => radioList(form, k), configurable: true });
+        Object.defineProperty(l, '__ptForm', { value: form, configurable: true });
+        controlLists.set(form, l);
+      }
+      return l;
+    };
+    __formProxy = (el) => {
+      const named = (t, k) => {
+        if (typeof k !== 'string' || engineKey(k) || !isHtmlForm(t)) return undefined;
+        const i = arrayIndex(k);
+        return i >= 0 ? formState(px).ctrls[i] : __namesSeen.has(k) ? formNamed(px, k) : undefined;
+      };
+      const px = __ptProxy(el, {
+        get(t, k, r) { const v = named(t, k); return v !== undefined || (typeof k === 'string' && !engineKey(k) && arrayIndex(k) >= 0 && isHtmlForm(t)) ? v : R_get(t, k, r); },
+        has(t, k) { return named(t, k) !== undefined || R_has(t, k); },
+        getOwnPropertyDescriptor(t, k) {
+          const v = named(t, k);
+          if (v === undefined) return R_desc(t, k);
+          return { value: v, writable: false, enumerable: arrayIndex(k) >= 0, configurable: true };
+        },
+        ownKeys(t) {
+          const out = [];
+          if (isHtmlForm(t)) { const n = formState(px).ctrls.length; for (let i = 0; i < n; i++) out.push(String(i)); }
+          for (const k of R_keys(t)) out.push(k);
+          return out;
+        },
+        set(t, k, v, r) { return named(t, k) !== undefined || (typeof k === 'string' && !engineKey(k) && isHtmlForm(t) && arrayIndex(k) >= 0) ? true : R_set(t, k, v, r); },
+        defineProperty(t, k, d) {
+          if (typeof k === 'string' && !engineKey(k) && isHtmlForm(t)) {
+            const i = arrayIndex(k);
+            if (i >= 0 || named(t, k) !== undefined) throw noSetter('HTMLFormElement', k, i);
+          }
+          return R_def(t, k, d);
+        },
+        deleteProperty(t, k) {
+          if (typeof k === 'string' && !engineKey(k) && isHtmlForm(t) && arrayIndex(k) >= 0) return named(t, k) === undefined;
+          return named(t, k) !== undefined ? true : R_del(t, k);
+        },
+      });
+      __formTargets.set(px, el);
+      return px;
+    };
     const F = proto('HTMLFormElement');
-    defGet(F, 'elements', function () { return branded(formControls(this), 'HTMLFormControlsCollection'); });
-    defGet(F, 'length', function () { return formControls(this).length; });
+    // `reset` fires a cancelable event, then each control goes back to its
+    // default: the value and checkedness its attributes give, a drop-down's
+    // selected options.
+    defFn(F, 'reset', function reset() {
+      if (!__formGet(this, 'dispatchEvent').call(this, __ptTrust(new Event('reset', { bubbles: true, cancelable: true })))) return;
+      for (const el of formState(this).ctrls) {
+        const t = local(el);
+        if (t === 'input' || t === 'textarea') { el.__ptValue = undefined; el.__ptChecked = undefined; }
+        else if (t === 'select') {
+          for (const o of selOptions(el)) o.__ptSelected = undefined;
+          __ptSelReset(el);
+        }
+      }
+      __markDirty(this);
+    });
+    defGet(F, 'elements', function () { return controlsOf(this); });
+    defGet(F, 'length', function () { return formState(this).ctrls.length; });
+    // HTMLFormControlsCollection.namedItem and RadioNodeList.value. Those
+    // interfaces come later in the bootstrap, so the members are put on
+    // them at the first list, as `__link` does.
+    let ifacesDone = false;
+    const radios = (l) => { const out = []; for (let i = 0, n = l.length; i < n; i++) { const el = l[i]; if (isTag(el, 'input') && __inputType(el) === 'radio') out.push(el); } return out; };
+    const formIfaces = () => {
+      if (ifacesDone) return;
+      ifacesDone = true;
+      const nat = globalThis.__pt_native || ((f) => f);
+      const named = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return nat(f); };
+      const FCC = globalThis.HTMLFormControlsCollection && HTMLFormControlsCollection.prototype;
+      const RNL = globalThis.RadioNodeList && RadioNodeList.prototype;
+      const brand = (P, t) => { if (t === null || typeof t !== 'object' || !P.isPrototypeOf(t)) throw __pt_mkErr(TypeError, 'Illegal invocation'); };
+      if (FCC) {
+        defFn(FCC, 'namedItem', named(function (name) {
+          brand(FCC, this);
+          __needArgs(arguments.length, 1, 'namedItem', 'HTMLFormControlsCollection');
+          const form = this.__ptForm;
+          if (!form) return null;
+          const k = String(name), list = namedList(form, k);
+          return list.length === 0 ? null : list.length === 1 ? list[0] : radioList(form, k);
+        }, 'namedItem'));
+      }
+      // The checked radio button's value; setting it checks the first radio
+      // button with that value.
+      if (RNL) {
+        try {
+          Object.defineProperty(RNL, 'value', {
+            get: named(function () { brand(RNL, this); for (const el of radios(this)) if (el.checked) return el.value; return ''; }, 'get value'),
+            set: named(function (v) { brand(RNL, this); const s = String(v); for (const el of radios(this)) if (el.value === s) { el.checked = true; return; } }, 'set value'),
+            enumerable: true, configurable: true,
+          });
+        } catch (e) {}
+      }
+    };
     const labelsOf = (el) => {
       const out = [];
       const doc = el.ownerDocument;
@@ -7408,6 +7783,11 @@
     defPair(proto('HTMLStyleElement'), 'disabled',
       function () { const sh = this.sheet; return sh ? !!sh.disabled : false; },
       function (v) { const sh = this.sheet; if (sh) sh.disabled = !!v; });
+    // A textarea's value is its text until edited, with line breaks as \n.
+    const lf = (v) => __s_replace(String(v), /\r\n?/g, '\n');
+    defPair(proto('HTMLTextAreaElement'), 'value',
+      function () { return this.__ptValue !== undefined ? this.__ptValue : lf(this.textContent); },
+      function (v) { this.__ptValue = lf(v); __markDirty(this); });
     // The default value of a textarea is its text.
     defPair(proto('HTMLTextAreaElement'), 'defaultValue',
       function () { return this.textContent; },
@@ -9003,6 +9383,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const scratch = new Document();
     const root = __parseDocumentInto(scratch, html == null ? '' : html, true);
     if (root) __pt_cspFromMeta(root);
+    __formSeq++;
     document.__ptKids = [];
     document.__ptDocEl = null;
     document.__ptDoctype = null;
@@ -9023,6 +9404,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
 
   globalThis.__pt_installDocument = (tree, dt, markup, mode, before, after) => {
     if (typeof markup === 'string') { try { Object.defineProperty(document, '__ptMarkup', { value: markup, configurable: true, writable: true }); } catch (e) {} }
+    __formSeq++;
     document.__ptKids = [];
     document.__ptDocEl = null;
     document.__ptCurScript = null;
@@ -10796,11 +11178,13 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // styles (Blink does the same with its invalidation sets).
   const __hasMut = { any: false, nodes: [], attrs: [] };
   function __hasNoteTree(n) {
+    __formNoteTree(n);
     if (__hasMut.any || !n) return;
     if (__hasMut.nodes.length >= 256) { __hasMut.any = true; __hasMut.nodes = []; return; }
     __hasMut.nodes.push(n);
   }
   function __hasNoteAttr(name, oldV, newV) {
+    __formNoteAttr(name);
     if (__hasMut.any) return;
     if (__hasMut.attrs.length >= 256) { __hasMut.any = true; __hasMut.attrs = []; return; }
     __hasMut.attrs.push([__s_toLowerCase(String(name)), oldV == null ? null : String(oldV), newV == null ? null : String(newV)]);

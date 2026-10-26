@@ -254,6 +254,13 @@ Keep in JS (the advantage is real):
 - 🔲 **Origin of srcdoc and about:blank frames.** A `srcdoc` frame inherits its
   parent's origin in Chrome (`http://host`); nokk reports `null`, so IndexedDB is
   refused inside it with a SecurityError.
+- 🔲 **Named properties of the document and the window.** A form answers its controls
+  by name and index as in Chrome, and `document.forms`, `images`, `links`, `embeds`,
+  `scripts`, `anchors` and `select.options` by name; but `document.login` (a form,
+  image, embed or object by name), `window.someId` (any element by id) and named
+  members of `children` and `getElementsByTagName` are undefined. `document.forms`
+  is a new list on every read (`document.forms === document.forms` is false), and
+  a strict-mode `form[0] = x` is ignored where Chrome throws.
 
 - ✅ **A fresh global per document.** Every navigation builds a new V8 context, so
   one page's `var`s and patched built-ins no longer show through on the next.

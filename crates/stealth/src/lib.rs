@@ -7179,7 +7179,7 @@ const STACK_TEMPLATE: &str = r##"(() => {
   // exactly this to everything, after which `Function.prototype.toString`
   // looped through an endless prototype chain.
   // Captured up front: the trap must not call anything the page may wrap.
-  const __pxGPO = Reflect.getPrototypeOf, __pxSPO = Reflect.setPrototypeOf, __pxProxy = Proxy;
+  const __pxGPO = Reflect.getPrototypeOf, __pxSPO = Reflect.setPrototypeOf, __pxProxy = Proxy, __pxGOPD = Reflect.getOwnPropertyDescriptor;
   const __pxOurs = new WeakSet(), __pxFrameType = new WeakMap();
   // The type a builtin's frame is named after when the receiver inherits
   // from one of our proxies: V8 stops its constructor lookup at a proxy
@@ -7214,6 +7214,31 @@ const STACK_TEMPLATE: &str = r##"(() => {
     },
     writable: true, enumerable: false, configurable: true,
   });
+  // A method called on one of our proxies (a form answers its controls by
+  // name through one) is named after the proxy by V8 ("Proxy.m"); Chrome's
+  // form is an ordinary object there, "HTMLFormElement.m". A strict-mode
+  // function shows no receiver, so its frame keeps "Proxy".
+  const CALLSITE = ['getThis', 'getTypeName', 'getFunction', 'getFunctionName', 'getMethodName', 'getFileName', 'getLineNumber', 'getColumnNumber',
+    'getEvalOrigin', 'isToplevel', 'isEval', 'isNative', 'isConstructor', 'isAsync', 'isPromiseAll', 'getPromiseIndex', 'getScriptNameOrSourceURL',
+    'getScriptHash', 'getEnclosingColumnNumber', 'getEnclosingLineNumber', 'getPosition'];
+  const asNode = (site) => {
+    try {
+      const t = site.getThis();
+      if (t === null || typeof t !== 'object' || !__pxOurs.has(t) || site.getTypeName() !== 'Proxy') return site;
+      let type = null;
+      for (let q = __pxGPO(t), i = 0; q && i < 32 && !type; i++, q = __pxGPO(q)) {
+        const d = __pxGOPD(q, 'constructor');
+        if (d && typeof d.value === 'function' && d.value.name) type = d.value.name;
+      }
+      if (!type) return site;
+      const out = {};
+      for (const k of CALLSITE) out[k] = (...a) => site[k](...a);
+      out.getTypeName = () => type;
+      const label = String(site);
+      out.toString = () => __s_replace(label, /^(async )?Proxy\./, (m, a) => (a || '') + type + '.');
+      return out;
+    } catch (e) { return site; }
+  };
   globalThis.__pt_formatStack = (err, sites) => {
     let keep = sites;
     // Raw stack, for debugging our own breakage: shows where in the engine a
@@ -7267,7 +7292,7 @@ const STACK_TEMPLATE: &str = r##"(() => {
           if (ty && fn) swap[i] = fake(fn, ty + '.' + fn);
         }
         keep = [];
-        for (let i = 0; i < sites.length; i++) if (!hidden[i]) keep.push(swap[i] || sites[i]);
+        for (let i = 0; i < sites.length; i++) if (!hidden[i]) keep.push(swap[i] || asNode(sites[i]));
         // Captured with headroom (`__pt_mkErr`): emit no more than the page's limit.
         try { const lim = Error.stackTraceLimit; if (typeof lim === 'number' && keep.length > lim) keep = __s_slice(keep, 0, Math.max(0, Math.floor(lim))); } catch (e) {}
       } catch (e) {}
@@ -14586,7 +14611,7 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
     };
   }
   if (!globalThis.FormData) {
-    globalThis.FormData = class FormData { constructor() { this.__ptD = []; } append(k, v, f) { this.__ptD.push(f === undefined ? [String(k), v] : [String(k), v, String(f)]); } set(k, v, f) { this.delete(k); this.append(k, v, f); } get(k) { const e = this.__ptD.find((x) => x[0] === k); return e ? e[1] : null; } getAll(k) { return this.__ptD.filter((x) => x[0] === k).map((x) => x[1]); } has(k) { return this.__ptD.some((x) => x[0] === k); } delete(k) { this.__ptD = this.__ptD.filter((x) => x[0] !== k); } forEach(f) { for (const [k, v] of this.__ptD) f(v, k, this); } keys() { return __pt_pairIter('FormData', () => this.__ptD, 1); } values() { return __pt_pairIter('FormData', () => this.__ptD, 2); } entries() { return __pt_pairIter('FormData', () => this.__ptD, 0); } toString() { return this.__ptD.map(([k, v]) => k + '=' + v).join('&'); } };
+    globalThis.FormData = class FormData { constructor() { this.__ptD = []; const form = arguments[0]; if (form !== undefined) { if (form === null || typeof form !== 'object' || form.__ptLocal !== 'form' || typeof form.__ptEntryList !== 'function') throw __pt_mkErr(TypeError, "Failed to construct 'FormData': parameter 1 is not of type 'HTMLFormElement'."); this.__ptD = form.__ptEntryList(arguments[1], this); } } append(k, v, f) { this.__ptD.push(f === undefined ? [String(k), v] : [String(k), v, String(f)]); } set(k, v, f) { this.delete(k); this.append(k, v, f); } get(k) { const e = this.__ptD.find((x) => x[0] === k); return e ? e[1] : null; } getAll(k) { return this.__ptD.filter((x) => x[0] === k).map((x) => x[1]); } has(k) { return this.__ptD.some((x) => x[0] === k); } delete(k) { this.__ptD = this.__ptD.filter((x) => x[0] !== k); } forEach(f) { for (const [k, v] of this.__ptD) f(v, k, this); } keys() { return __pt_pairIter('FormData', () => this.__ptD, 1); } values() { return __pt_pairIter('FormData', () => this.__ptD, 2); } entries() { return __pt_pairIter('FormData', () => this.__ptD, 0); } toString() { return this.__ptD.map(([k, v]) => k + '=' + v).join('&'); } };
     Object.defineProperty(FormData.prototype, Symbol.iterator, { value: FormData.prototype.entries, writable: true, enumerable: false, configurable: true });
   }
 
