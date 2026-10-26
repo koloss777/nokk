@@ -4281,6 +4281,16 @@ impl BrowserContext {
             let _ = self
                 .eval_in(index, &format!("__pt_markAsFrame({id}, {});", js_str(op["name"].as_str().unwrap_or(""))))
                 .await;
+            // A same-origin frame on the page's thread is one with it, as in a
+            // browser: `parent` is the page's window, `frameElement` its
+            // <iframe>, and the page reaches the frame's window and document.
+            if !cross && place == self.worker {
+                let page = self.idx();
+                let linked = self.engine.pool.dispatch(place, move |iso| iso.link_frame(page, raw_index, id)).await;
+                if let Ok(Err(e)) = linked {
+                    tracing::debug!(target: "nokk::frame", frame = id, error = %e, "same-origin link");
+                }
+            }
             // Third-party status and referrer: in a third-party frame Chrome answers "denied"
             // to permissions, and `document.referrer` under strict-origin-when-cross-origin is
             // just the parent's origin.

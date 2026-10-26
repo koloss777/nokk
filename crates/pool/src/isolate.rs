@@ -887,6 +887,38 @@ impl Isolate {
         self.eval_named(index, source, None)
     }
 
+    /// Join a same-origin frame to its page, as one browser would: the two
+    /// contexts share a security token, so each may touch the other's objects,
+    /// and each gets the other's window — the frame its `parent` and its
+    /// `<iframe>` as `frameElement`, the page the frame's `contentWindow`.
+    /// Both must live in this isolate.
+    pub fn link_frame(&mut self, page: usize, frame: usize, frame_id: u32) -> Result<(), String> {
+        let pg = self.context(page)?;
+        let fr = self.context(frame)?;
+        let (page_win, owner) = {
+            v8::scope_with_context!(scope, &mut self.isolate, &pg);
+            let token = scope.get_current_context().get_security_token(scope);
+            v8::Local::new(scope, &fr).set_security_token(token);
+            let win: v8::Local<v8::Value> = scope.get_current_context().global(scope).into();
+            let id: v8::Local<v8::Value> = v8::Integer::new_from_unsigned(scope, frame_id).into();
+            let el = call_global(scope, "__pt_frameOwnerEl", &[id]).ok_or("no <iframe> for the frame")?;
+            (v8::Global::new(scope, win), v8::Global::new(scope, el))
+        };
+        let frame_win = {
+            v8::scope_with_context!(scope, &mut self.isolate, &fr);
+            let win = v8::Local::new(scope, &page_win);
+            let el = v8::Local::new(scope, &owner);
+            call_global(scope, "__pt_linkParent", &[win, el]).ok_or("frame refused the link")?;
+            let mine: v8::Local<v8::Value> = scope.get_current_context().global(scope).into();
+            v8::Global::new(scope, mine)
+        };
+        v8::scope_with_context!(scope, &mut self.isolate, &pg);
+        let id: v8::Local<v8::Value> = v8::Integer::new_from_unsigned(scope, frame_id).into();
+        let fw = v8::Local::new(scope, &frame_win);
+        call_global(scope, "__pt_linkChild", &[id, fw]).ok_or("page refused the link")?;
+        Ok(())
+    }
+
     /// Same, but the script is named by its URL, as Chrome does. The name goes
     /// into `ScriptOrigin` rather than `//# sourceURL`: the former is visible to a
     /// nested `eval`'s parent frame, the latter is not.
@@ -1545,6 +1577,21 @@ fn resolve_module<'a>(
         reg.modules.get(&target)?.clone()
     };
     Some(v8::Local::new(scope, &handle))
+}
+
+/// Call a function on the current context's global; `None` when it is
+/// missing or threw.
+fn call_global<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+    args: &[v8::Local<'s, v8::Value>],
+) -> Option<v8::Local<'s, v8::Value>> {
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, name)?;
+    let f = v8::Local::<v8::Function>::try_from(global.get(scope, key.into())?).ok()?;
+    v8::tc_scope!(tc, scope);
+    let undef: v8::Local<v8::Value> = v8::undefined(tc).into();
+    f.call(tc, undef, args)
 }
 
 /// Compile and run `source` in the current context, returning its result as a

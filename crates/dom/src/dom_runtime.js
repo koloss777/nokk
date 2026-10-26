@@ -2627,7 +2627,7 @@
       // at first, and navigates afterwards). Waiting for the load was enough to
       // make widgets that poll this synchronously give up and start over.
       const st = __frames.get(this.__ptFrameId);
-      if (st) return st.win;
+      if (st) return st.real || st.win;
       return this.__ptRealmWindow();
     }
     get contentDocument() {
@@ -2636,7 +2636,10 @@
       // limitation, and a networked frame's document lives in another context we
       // cannot hand back. A blank same-origin frame is a different matter: it has
       // a real realm of its own (below), and its document comes with it.
-      if (st) return st.ready && st.sameOrigin ? st.doc || null : null;
+      if (st) {
+        if (st.real) { try { return st.real.document || null; } catch (e) { return null; } }
+        return st.ready && st.sameOrigin ? st.doc || null : null;
+      }
       const w = this.__ptRealmWindow();
       return w ? w.document || null : null;
     }
@@ -10648,7 +10651,64 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // a browser; answering `undefined` would give us away, so the object simply
   // carries what is allowed. Messages sent before the document exists are held
   // and flushed on ready, as a browser queues them against `about:blank`.
-  const __frameWindow = (id, st) => ({
+  // A window of another origin, as Chrome exposes it: the handful of members a
+  // page may use across origins (postMessage, closed, frames, length, parent,
+  // self, top, window, opener, blur, focus, close, location, child frames by
+  // index or name), `undefined` for `then` and the fallback symbols, and a
+  // SecurityError for anything else. `restricted()` false: no restriction
+  // yet (a frame's first document is same-origin about:blank).
+  const __xoAllowed = new Set(['postMessage', 'closed', 'frames', 'length', 'parent', 'self', 'top', 'window', 'opener', 'blur', 'focus', 'close', 'location']);
+  const __xoUndefined = new Set(['then', Symbol.toStringTag, Symbol.hasInstance, Symbol.isConcatSpreadable]);
+  function __ptCrossWindow(base, opts) {
+    const blocked = (what) => __pt_mkErr(globalThis.DOMException || Error,
+      what + ': Blocked a frame with origin "' + ((globalThis.location && location.origin) || 'null') + '" from accessing a cross-origin frame.', 'SecurityError');
+    const named = (k) => typeof k === 'symbol' ? "Failed to read a named property from 'Window'" : "Failed to read a named property '" + k + "' from 'Window'";
+    const isIndex = (k) => typeof k === 'string' && /^(0|[1-9][0-9]*)$/.test(k);
+    const extra = { blur() {}, focus() {}, close() {}, opener: null, location: { replace() {}, set href(v) {} } };
+    const child = (k) => (typeof k === 'string' && opts.child ? opts.child(k) : undefined);
+    const read = (k) => {
+      if (__xoUndefined.has(k)) return undefined;
+      if (typeof k === 'string' && __xoAllowed.has(k)) return k in base ? base[k] : extra[k];
+      const w = child(k);
+      if (w) return w;
+      throw blocked(isIndex(k) ? "Failed to read an indexed property [" + k + "] from 'Window'" : named(k));
+    };
+    return __ptProxy({}, {
+      get(t, k) { return opts.restricted() ? read(k) : base[k]; },
+      set(t, k, v) {
+        if (!opts.restricted()) { base[k] = v; return true; }
+        if (k === 'location') return true;
+        throw blocked("Failed to set a named property '" + String(k) + "' on 'Window'");
+      },
+      has(t, k) {
+        if (!opts.restricted()) return k in base;
+        return (typeof k === 'string' && __xoAllowed.has(k)) || child(k) !== undefined;
+      },
+      getPrototypeOf() { return opts.restricted() ? null : Object.getPrototypeOf(base); },
+      ownKeys() {
+        if (!opts.restricted()) return Reflect.ownKeys(base);
+        const n = opts.length ? opts.length() : 0, out = [];
+        for (let i = 0; i < n; i++) out.push(String(i));
+        return out;
+      },
+      getOwnPropertyDescriptor(t, k) {
+        if (!opts.restricted()) return Reflect.getOwnPropertyDescriptor(base, k);
+        return { value: read(k), writable: false, enumerable: isIndex(k), configurable: true };
+      },
+      defineProperty(t, k) {
+        if (!opts.restricted()) return false;
+        throw blocked("Failed to set a named property '" + String(k) + "' on 'Window'");
+      },
+      deleteProperty(t, k) {
+        if (!opts.restricted()) return delete base[k];
+        throw blocked("Failed to delete a named property '" + String(k) + "' from 'Window'");
+      },
+    });
+  }
+  const __frameWindow = (id, st) => __ptCrossWindow(__frameWindowBase(id, st), {
+    restricted: () => st.ready && !st.sameOrigin && !st.real,
+  });
+  const __frameWindowBase = (id, st) => ({
     postMessage: (data, targetOrigin, transfer) => {
       const origin = (targetOrigin && typeof targetOrigin === 'object') ? targetOrigin.targetOrigin : targetOrigin;
       const op = { op: 'post', id, data: __pt_cloneEncode(data), toParent: false, targetOrigin: String(origin || '*'),
@@ -10708,6 +10768,18 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // goes back up. The engine calls this right after creating the child context
   // and before its document exists — a context cannot know it is a frame while
   // its own bootstrap is still running.
+  // Joined to a same-origin parent by the engine: the real windows replace
+  // the message-only stand-ins, and the <iframe> is reachable.
+  globalThis.__pt_linkParent = (win, el) => {
+    try {
+      Object.defineProperty(globalThis, 'parent', { value: win, configurable: true });
+      Object.defineProperty(globalThis, 'top', { value: win.top || win, configurable: true });
+      const g = function () { return el; };
+      try { Object.defineProperty(g, 'name', { value: 'get frameElement', configurable: true }); } catch (e) {}
+      Object.defineProperty(globalThis, 'frameElement', { get: globalThis.__pt_native ? __pt_native(g) : g, set: undefined, enumerable: true, configurable: true });
+    } catch (e) { return false; }
+    return true;
+  };
   globalThis.__pt_markAsFrame = (id, name) => {
     globalThis.__pt_frameId = id;
     // `window.name` is the element's `name`: a frame can derive a sibling's name
@@ -10743,21 +10815,22 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const f = /^\d+$/.test(k) ? siblings[Number(k)] : siblings.find((x) => x.name && x.name === k);
       return f ? sibling(f.id) : undefined;
     };
-    const up = {
+    const base = {
       postMessage: (data, targetOrigin, transfer) => {
         __pushFrameOp({ op: 'post', data: __pt_cloneEncode(data), toParent: true,
           ports: __transferPorts(__transferOf(targetOrigin, transfer)) });
       },
       get closed() { return false; },
       get length() { return siblings.length; },
+      get frames() { return up; },
+      get parent() { return up; },
+      get top() { return up; },
       get self() { return up; },
       get window() { return up; },
     };
-    const framesOf = new Proxy(up, {
-      get(t, k) { if (k in t) return t[k]; return frameAt(k); },
-      has(t, k) { return (k in t) || frameAt(k) !== undefined; },
-    });
-    Object.defineProperty(up, 'frames', { get: () => framesOf, configurable: true });
+    // A parent of another origin: what a browser lets through, and a
+    // SecurityError for the rest. (A same-origin parent is joined for real.)
+    const up = __ptCrossWindow(base, { restricted: () => true, child: frameAt, length: () => siblings.length });
     try {
       Object.defineProperty(globalThis, 'parent', { value: up, configurable: true });
       Object.defineProperty(globalThis, 'top', { value: up, configurable: true });
@@ -16128,19 +16201,22 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     } catch (e) {}
     return __ptJSON.stringify(out);
   };
-  // The node id of the <iframe> a frame lives in (0 if not in this document).
+  // The <iframe> a frame lives in, and its node id (0 if not in this document).
+  globalThis.__pt_frameOwnerEl = (id) => {
+    const st = __frames.get(id);
+    return (st && st.el) || null;
+  };
   globalThis.__pt_frameOwner = (id) => {
-    const walk = (n) => {
-      for (let c = n.firstChild; c; c = c.nextSibling) {
-        if (c.__ptType !== ELEMENT_NODE) continue;
-        if (c.__ptLocal === 'iframe' && c.__ptFrameId === id) return c;
-        const found = (c.__ptShadow && walk(c.__ptShadow)) || walk(c);
-        if (found) return found;
-      }
-      return null;
-    };
-    const el = globalThis.document && walk(globalThis.document);
+    const el = globalThis.__pt_frameOwnerEl(id);
     return el ? globalThis.__pt_nodeId(el) : 0;
+  };
+  // A same-origin frame joined to this page: its real window from now on.
+  globalThis.__pt_linkChild = (id, win) => {
+    const st = __frames.get(id);
+    if (st) st.real = win;
+    // window[i] holds the window as a value: take the real one.
+    try { if (typeof globalThis.__pt_syncFrameSlots === 'function') __pt_syncFrameSlots(); } catch (e) {}
+    return true;
   };
   globalThis.__pt_frameRectById = (id) => {
     const walk = (n) => {

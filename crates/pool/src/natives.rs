@@ -88,6 +88,7 @@ pub fn install(scope: &mut v8::PinScope) {
     bind(scope, "__pt_rtcStart", rtc_start);
     bind(scope, "__pt_rtcPoll", rtc_poll);
     bind(scope, "__pt_focusSeq", focus_seq);
+    bind(scope, "__pt_callerWindow", caller_window);
 
     // Optional real 2D rasterization (the `render` feature). Their presence is the
     // signal the JS canvas checks to use real pixels instead of synthesis.
@@ -1522,6 +1523,15 @@ fn focus_seq(scope: &mut v8::PinScope, _args: v8::FunctionCallbackArguments, mut
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     rv.set(v8::Number::new(scope, n as f64).into());
+}
+
+/// `__pt_callerWindow()`: the window whose script is running — the context
+/// that was entered, which stays the caller's when it calls into another
+/// window's function. `postMessage` takes its `source` and origin from it, as
+/// Chrome does: a frame posting to `parent` is the message's source.
+fn caller_window(scope: &mut v8::PinScope, _args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
+    let ctx = scope.get_entered_or_microtask_context();
+    rv.set(ctx.global(scope).into());
 }
 
 pub(crate) fn bind(scope: &mut v8::PinScope, name: &str, cb: impl v8::MapFnTo<v8::FunctionCallback>) {

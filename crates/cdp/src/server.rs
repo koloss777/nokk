@@ -3181,6 +3181,17 @@ mod tests {
         assert_eq!(focused_frame(&ctx).await, Some(frame));
         remote_eval(&ctx, &dev_value(focus), true, false).await;
         assert_eq!(focused_frame(&ctx).await, None);
+        // A same-origin frame is joined to its page, as in Chrome: each side
+        // reaches the other's real window, document and element.
+        let v = remote_eval(&ctx, &dev_value("(() => { const f = document.querySelector('iframe'); return [f.contentDocument.body.textContent, f.contentWindow.parent === window, window[0] === f.contentWindow].join(); })()"), true, false).await;
+        assert_eq!(v["result"]["value"], json!("x,true,true"), "{v}");
+        let v = frame_eval(&ctx, frame, &dev_value("[frameElement.tagName, frameElement.ownerDocument === parent.document, parent === top].join()"), true, false).await;
+        assert_eq!(v["result"]["value"], json!("IFRAME,true,true"), "{v}");
+        // A frame posting to its parent is the message's source.
+        remote_eval(&ctx, &dev_value("addEventListener('message', (e) => { globalThis.got = [e.data, e.source === document.querySelector('iframe').contentWindow].join(); })"), true, false).await;
+        frame_eval(&ctx, frame, &dev_value("parent.postMessage('up', '*')"), true, false).await;
+        ctx.run_event_loop().await.unwrap();
+        assert_eq!(remote_eval(&ctx, &dev_value("globalThis.got"), true, false).await["result"]["value"], json!("up,true"));
         // A frame's boxes move by where its <iframe> sits.
         let mut q = json!({ "content": [1, 2, 3, 4], "width": 5, "height": 6 });
         shift_quads(&mut q, 10.0, 20.0);

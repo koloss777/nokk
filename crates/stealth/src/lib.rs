@@ -3322,6 +3322,12 @@ const SHAPE_FIXES: &str = r#"(() => {
       if (targetOrigin && typeof targetOrigin === 'object') { if (targetOrigin.targetOrigin !== undefined) origin = String(targetOrigin.targetOrigin); }
       else if (targetOrigin !== undefined) origin = String(targetOrigin);
       const mine = (globalThis.location && location.origin) || 'null';
+      // The window whose script called: a same-origin frame posting to its
+      // parent is the message's source and origin, as in Chrome.
+      let from = globalThis;
+      try { const c = typeof __pt_callerWindow === 'function' ? __pt_callerWindow() : null; if (c) from = c; } catch (e) {}
+      let fromOrigin = mine;
+      try { if (from !== globalThis) fromOrigin = from.location.origin; } catch (e) {}
       if (origin !== '*' && origin !== '/') {
         let ok = false;
         try { ok = new URL(origin).origin === mine; } catch (e) {
@@ -3332,7 +3338,7 @@ const SHAPE_FIXES: &str = r#"(() => {
       const data = typeof structuredClone === 'function' ? structuredClone(message) : message;
       const deliver = () => {
         let ev;
-        try { ev = new MessageEvent('message', { data, origin: mine, lastEventId: '', source: globalThis, ports: [] }); } catch (e) { return; }
+        try { ev = new MessageEvent('message', { data, origin: fromOrigin, lastEventId: '', source: from, ports: [] }); } catch (e) { return; }
         try { if (globalThis.__pt_trustEvent) __pt_trustEvent(ev); } catch (e) {}
         try { globalThis.dispatchEvent(ev); } catch (e) {}
       };
