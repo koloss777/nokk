@@ -17873,6 +17873,44 @@ variationSettings,weight",
         );
     }
 
+    /// Editing as Chrome 151 answers it: inherited from the nearest element
+    /// that says, `false` stops it, an unknown value defers, designMode turns
+    /// on every element. `<body>` without the attribute was editable, and
+    /// keyboard input over CDP replaced the page's body with the typed text.
+    #[tokio::test]
+    async fn content_editable_is_inherited_as_in_chrome() {
+        let _serial = serial().await;
+        let engine = Engine::new(EngineConfig::default()).expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<body><div id=a contenteditable><p id=a1>x</p><span id=a2 contenteditable=false><i id=a3>y</i></span></div>\
+             <div id=b contenteditable=plaintext-only></div><div id=c contenteditable=bogus></div><div id=d contenteditable=TRUE></div><p id=e>z</p></body>",
+        )
+        .await
+        .unwrap();
+        let got = ctx
+            .evaluate(
+                r#"(() => { const r = {};
+                for (const id of ['a', 'a1', 'a2', 'a3', 'b', 'c', 'd', 'e']) r[id] = document.getElementById(id).isContentEditable;
+                r.body = document.body.isContentEditable;
+                const d = document.createElement('div'); d.contentEditable = 'TRUE';
+                r.set = [d.getAttribute('contenteditable'), d.contentEditable, d.isContentEditable];
+                try { d.contentEditable = 'bogus'; r.bad = 'no throw'; } catch (e) { r.bad = e.name; }
+                d.setAttribute('contenteditable', 'x'); r.unknown = d.contentEditable;
+                document.designMode = 'ON'; r.design = [document.designMode, document.getElementById('a2').isContentEditable, document.body.isContentEditable];
+                return JSON.stringify(r); })()"#,
+            )
+            .await
+            .unwrap();
+        let got: Value = serde_json::from_str(got.as_str().unwrap()).unwrap();
+        assert_eq!(
+            got,
+            serde_json::json!({ "a": true, "a1": true, "a2": false, "a3": false, "b": true, "c": false, "d": true, "e": false,
+                "body": false, "set": ["true", "true", true], "bad": "SyntaxError", "unknown": "inherit", "design": ["on", true, true] })
+        );
+    }
+
     #[tokio::test]
     async fn websocket_to_a_dead_port_errors_and_closes_like_a_browser() {
         let _serial = serial().await;

@@ -268,6 +268,11 @@ struct Target {
     /// Puppeteer's isolated "utility" worlds: (worldName, current context id).
     /// Re-created on each navigation so isolated-realm evaluates resolve.
     iso_worlds: Vec<(String, i64)>,
+    /// Worlds a child frame can have, by name; the position numbers the
+    /// world's context in every frame. `true`: a new frame gets it by itself,
+    /// as Chrome does for `addScriptToEvaluateOnNewDocument`'s `worldName`
+    /// (Playwright's utility world); `false`: only on `createIsolatedWorld`.
+    frame_worlds: Vec<(String, bool)>,
     /// `Page.addScriptToEvaluateOnNewDocument` sources — Puppeteer injects its
     /// query utilities (`cssQuerySelector`, …) this way; we run them on every nav.
     init_scripts: Vec<String>,
@@ -431,17 +436,20 @@ fn parse_proxy_server(s: &str) -> Option<ProxyConfig> {
 
 /// A JS expression resolving the CDP node referenced by `params` (an `objectId`
 /// handle or a `backendNodeId`/`nodeId`) to its live DOM node, or `null`.
-fn node_ref(params: &Value) -> String {
+/// The frame it lives in comes along: a frame's handles and nodes are marked.
+fn node_ref(params: &Value) -> (Option<u32>, String) {
     if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
-        format!("__pt_objGet({})", js_str(oid))
+        let (f, raw) = split_oid(oid);
+        (f, format!("__pt_objGet({})", js_str(raw)))
     } else if let Some(bid) = params
         .get("backendNodeId")
         .or_else(|| params.get("nodeId"))
         .and_then(|v| v.as_i64())
     {
-        format!("__pt_nodeById({bid})")
+        let (f, bid) = split_node_id(bid);
+        (f, format!("__pt_nodeById({bid})"))
     } else {
-        "null".to_string()
+        (None, "null".to_string())
     }
 }
 
@@ -602,6 +610,12 @@ impl Conn {
             // Announce frames as they appear and disappear. Without this a client
             // never learns a page has any: `page.frames()` shows one, and there is
             // no execution context to evaluate inside.
+            // Not while a navigation's own events are still to go out: its
+            // frameNavigated and executionContextsCleared would drop a frame
+            // announced first (Playwright then calls it detached).
+            if t.navigating.load(Ordering::Acquire) {
+                continue;
+            }
             let live = t.ctx.frame_list();
             let session = Some(t.session_id.clone());
             for f in &live {
@@ -640,6 +654,10 @@ impl Conn {
                 ] {
                     let _ = tx.send(Message::Text(m.to_string()));
                 }
+                for (k, (name, _)) in t.frame_worlds.iter().enumerate().filter(|(_, (_, auto))| *auto) {
+                    let m = frame_world_created(&session, f.id, k, name, &f.origin, &fid);
+                    let _ = tx.send(Message::Text(m.to_string()));
+                }
             }
             let gone: Vec<u32> = t
                 .known_frames
@@ -650,6 +668,14 @@ impl Conn {
             for id in gone {
                 t.known_frames.remove(&id);
                 let fid = child_frame_id(&t.target_id, id);
+                for k in 0..t.frame_worlds.len() {
+                    let m = event(
+                        "Runtime.executionContextDestroyed",
+                        &session,
+                        json!({ "executionContextId": frame_world_ctx_id(id, k) }),
+                    );
+                    let _ = tx.send(Message::Text(m.to_string()));
+                }
                 for m in [
                     event(
                         "Runtime.executionContextDestroyed",
@@ -690,6 +716,7 @@ impl Conn {
                     exec_ctx_id: IDS.fetch_add(1, Ordering::Relaxed) as i64,
                     url,
                     iso_worlds: Vec::new(),
+                    frame_worlds: Vec::new(),
                     init_scripts: Vec::new(),
                     browser_context_id,
                     ran_js: Arc::new(AtomicBool::new(false)),
@@ -1393,6 +1420,13 @@ impl Conn {
                     self.targets[idx].ctx.add_init_script(src.to_string());
                     self.targets[idx].ctx.add_frame_init_script(src.to_string());
                 }
+                if let Some(w) = params.get("worldName").and_then(|v| v.as_str()).filter(|w| !w.is_empty()) {
+                    let worlds = &mut self.targets[idx].frame_worlds;
+                    match worlds.iter_mut().find(|(n, _)| n == w) {
+                        Some(e) => e.1 = true,
+                        None => worlds.push((w.to_string(), true)),
+                    }
+                }
                 let ident = format!("initscript-{}", self.targets[idx].init_scripts.len());
                 vec![ok(id, session, json!({ "identifier": ident }))]
             }
@@ -1402,10 +1436,9 @@ impl Conn {
                     .and_then(|v| v.as_str())
                     .unwrap_or("__isolated__")
                     .to_string();
-                // Asked for a world inside a child frame, hand back that frame's
-                // context. There are no separate isolated realms per frame here, so
-                // this is its main world — closer to right than the *page's* world,
-                // which is what a client would otherwise be handed.
+                // A world inside a child frame: a context of its own, announced as
+                // Chrome does. There are no separate isolated realms per frame
+                // here, so it evaluates in the frame's main world.
                 if let Some(fid) = params.get("frameId").and_then(|v| v.as_str()) {
                     if let Some(f) = self.targets[idx]
                         .ctx
@@ -1413,11 +1446,18 @@ impl Conn {
                         .into_iter()
                         .find(|f| child_frame_id(&self.targets[idx].target_id, f.id) == fid)
                     {
-                        return vec![ok(
-                            id,
-                            session,
-                            json!({ "executionContextId": frame_ctx_id(f.id) }),
-                        )];
+                        let worlds = &mut self.targets[idx].frame_worlds;
+                        let k = match worlds.iter().position(|(n, _)| *n == world_name) {
+                            Some(k) => k,
+                            None => {
+                                worlds.push((world_name.clone(), false));
+                                worlds.len() - 1
+                            }
+                        };
+                        return vec![
+                            ok(id, session, json!({ "executionContextId": frame_world_ctx_id(f.id, k) })),
+                            frame_world_created(session, f.id, k, &world_name, &f.origin, fid),
+                        ];
                     }
                 }
                 let iso_id = IDS.fetch_add(1, Ordering::Relaxed) as i64;
@@ -1765,10 +1805,14 @@ impl Conn {
                     .get("awaitPromise")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                // `this` is the handle's object (by objectId) or the global.
-                let this_js = match params.get("objectId").and_then(|v| v.as_str()) {
-                    Some(oid) => format!("__pt_objGet({})", js_str(oid)),
-                    None => "globalThis".to_string(),
+                // `this` is the handle's object (by objectId) or the global. A
+                // handle from a frame carries the frame, and the call goes there.
+                let (this_frame, this_js) = match params.get("objectId").and_then(|v| v.as_str()) {
+                    Some(oid) => {
+                        let (f, raw) = split_oid(oid);
+                        (f, format!("__pt_objGet({})", js_str(raw)))
+                    }
+                    None => (None, "globalThis".to_string()),
                 };
                 // Resolve each argument: a handle (objectId) or a literal value.
                 let args_js: Vec<String> = params
@@ -1777,7 +1821,7 @@ impl Conn {
                     .map(|a| {
                         a.iter()
                             .map(|o| match o.get("objectId").and_then(|v| v.as_str()) {
-                                Some(oid) => format!("__pt_objGet({})", js_str(oid)),
+                                Some(oid) => format!("__pt_objGet({})", js_str(split_oid(oid).1)),
                                 None => serde_json::to_string(
                                     &o.get("value").cloned().unwrap_or(Value::Null),
                                 )
@@ -1793,10 +1837,14 @@ impl Conn {
                 // the call into that frame. This is how `frame.evaluate(…)` reaches
                 // the right document — a client calls a function, it does not
                 // evaluate a string.
+                // Without a context id the call runs where its object lives, as
+                // in Chrome: Playwright makes its helper in a frame by
+                // `Runtime.evaluate` and then calls methods on that handle alone.
                 let frame = params
                     .get("executionContextId")
                     .and_then(|v| v.as_i64())
-                    .and_then(frame_of_ctx_id);
+                    .and_then(frame_of_ctx_id)
+                    .or(this_frame);
                 // A handle from a document the page has since left: Chrome's
                 // answer, which clients take as "re-resolve", not a value.
                 if frame.is_none() {
@@ -1839,13 +1887,18 @@ impl Conn {
                 tokio::spawn(async move {
                     let props = match oid {
                         Some(oid) => {
-                            let js = format!("JSON.stringify(__pt_getProps({}))", js_str(&oid));
-                            match ctx.evaluate(&js).await {
+                            let (f, raw) = split_oid(&oid);
+                            let js = format!("JSON.stringify(__pt_getProps({}))", js_str(raw));
+                            let mut props = match run_in(&ctx, f, &js).await {
                                 Ok(Value::String(s)) => {
                                     serde_json::from_str(&s).unwrap_or(json!([]))
                                 }
                                 _ => json!([]),
+                            };
+                            if let Some(f) = f {
+                                tag_frame_refs(&mut props, f);
                             }
+                            props
                         }
                         None => json!([]),
                     };
@@ -1864,9 +1917,8 @@ impl Conn {
                     (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
                     if let Some(oid) = oid {
-                        let _ = ctx
-                            .evaluate(&format!("__pt_release({})", js_str(&oid)))
-                            .await;
+                        let (f, raw) = split_oid(&oid);
+                        let _ = run_in(&ctx, f, &format!("__pt_release({})", js_str(raw))).await;
                     }
                     let _ = tx.send(Message::Text(ok(id, &session, json!({})).to_string()));
                 });
@@ -1880,19 +1932,32 @@ impl Conn {
                     .map(str::to_string);
                 let (ctx, session, tx) =
                     (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
+                let target_id = self.targets[idx].target_id.clone();
                 tokio::spawn(async move {
                     let node = match oid {
                         Some(oid) => {
+                            let (f, raw) = split_oid(&oid);
                             let js = format!(
                                 "JSON.stringify(__pt_describe(__pt_objGet({})))",
-                                js_str(&oid)
+                                js_str(raw)
                             );
-                            match ctx.evaluate(&js).await {
+                            let mut node = match run_in(&ctx, f, &js).await {
                                 Ok(Value::String(s)) => {
                                     serde_json::from_str(&s).unwrap_or(Value::Null)
                                 }
                                 _ => Value::Null,
+                            };
+                            if let Some(f) = f {
+                                tag_frame_refs(&mut node, f);
                             }
+                            // An <iframe>'s own frame, by the id frames are
+                            // announced under (`frame_locator` waits for it).
+                            if let Some(m) = node.as_object_mut() {
+                                if let Some(inner) = m.remove("ptFrame").and_then(|v| v.as_u64()) {
+                                    m.insert("frameId".into(), json!(child_frame_id(&target_id, inner as u32)));
+                                }
+                            }
+                            node
                         }
                         None => Value::Null,
                     };
@@ -1909,19 +1974,48 @@ impl Conn {
                 tokio::spawn(async move {
                     let obj = match bid {
                         Some(bid) => {
+                            let (f, bid) = split_node_id(bid);
                             let js =
                                 format!("JSON.stringify(__pt_wrap(__pt_nodeById({bid}), false))");
-                            match ctx.evaluate(&js).await {
+                            let mut obj = match run_in(&ctx, f, &js).await {
                                 Ok(Value::String(s)) => serde_json::from_str(&s)
                                     .unwrap_or(json!({ "type": "undefined" })),
                                 _ => json!({ "type": "undefined" }),
+                            };
+                            if let Some(f) = f {
+                                tag_frame_refs(&mut obj, f);
                             }
+                            obj
                         }
                         None => json!({ "type": "undefined" }),
                     };
                     let _ = tx.send(Message::Text(
                         ok(id, &session, json!({ "object": obj })).to_string(),
                     ));
+                });
+                vec![]
+            }
+            // The <iframe> element a frame lives in: Playwright checks a click
+            // point in a frame against it.
+            "DOM.getFrameOwner" => {
+                let fid = params.get("frameId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let t = &self.targets[idx];
+                let Some(f) = t.ctx.frame_list().into_iter().find(|f| child_frame_id(&t.target_id, f.id) == fid) else {
+                    return vec![err(id, session, -32000, "Frame with the given id was not found.")];
+                };
+                let (ctx, session, tx) = (t.ctx.clone(), session.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let bid = run_in(&ctx, None, &format!("__pt_frameOwner({})", f.id))
+                        .await
+                        .ok()
+                        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+                        .unwrap_or(0);
+                    let msg = if bid > 0 {
+                        ok(id, &session, json!({ "backendNodeId": bid, "nodeId": 0 }))
+                    } else {
+                        err(id, &session, -32000, "Frame with the given id was not found.")
+                    };
+                    let _ = tx.send(Message::Text(msg.to_string()));
                 });
                 vec![]
             }
@@ -1937,15 +2031,19 @@ impl Conn {
             // Puppeteer/Playwright can compute a clickable point. An empty box
             // (hidden/detached) → the "not clickable" errors the drivers expect.
             "DOM.getBoxModel" => {
-                let nref = node_ref(params);
+                let (frame, nref) = node_ref(params);
                 let (ctx, session, tx) =
                     (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
                     let js = format!("JSON.stringify(__pt_boxModel({nref}))");
-                    let msg = match ctx.evaluate(&js).await {
+                    let msg = match run_in(&ctx, frame, &js).await {
                         Ok(Value::String(ref s)) if s != "null" => {
                             match serde_json::from_str::<Value>(s) {
-                                Ok(model) if !model.is_null() => {
+                                Ok(mut model) if !model.is_null() => {
+                                    if let Some(f) = frame {
+                                        let (dx, dy) = frame_offset(&ctx, f).await;
+                                        shift_quads(&mut model, dx, dy);
+                                    }
                                     ok(id, &session, json!({ "model": model }))
                                 }
                                 _ => err(id, &session, -32000, "Could not compute box model."),
@@ -1958,15 +2056,19 @@ impl Conn {
                 vec![]
             }
             "DOM.getContentQuads" => {
-                let nref = node_ref(params);
+                let (frame, nref) = node_ref(params);
                 let (ctx, session, tx) =
                     (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
                     let js = format!("JSON.stringify(__pt_contentQuads({nref}))");
-                    let quads = match ctx.evaluate(&js).await {
+                    let mut quads = match run_in(&ctx, frame, &js).await {
                         Ok(Value::String(s)) => serde_json::from_str(&s).unwrap_or(json!([])),
                         _ => json!([]),
                     };
+                    if let Some(f) = frame {
+                        let (dx, dy) = frame_offset(&ctx, f).await;
+                        shift_quads(&mut quads, dx, dy);
+                    }
                     let _ = tx.send(Message::Text(
                         ok(id, &session, json!({ "quads": quads })).to_string(),
                     ));
@@ -1974,22 +2076,22 @@ impl Conn {
                 vec![]
             }
             "DOM.focus" => {
-                let nref = node_ref(params);
+                let (frame, nref) = node_ref(params);
                 let (ctx, session, tx) =
                     (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
-                    let _ = ctx.evaluate(&format!("__pt_focusNode({nref})")).await;
+                    let _ = run_in(&ctx, frame, &format!("__pt_focusNode({nref})")).await;
                     let _ = tx.send(Message::Text(ok(id, &session, json!({})).to_string()));
                 });
                 vec![]
             }
             // Clients scroll an element into view before they click it.
             "DOM.scrollIntoViewIfNeeded" => {
-                let nref = node_ref(params);
+                let (frame, nref) = node_ref(params);
                 let (ctx, session, tx) = (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
                     let js = format!("(n => {{ if (n && n.scrollIntoViewIfNeeded) n.scrollIntoViewIfNeeded(true); return ''; }})({nref})");
-                    let _ = ctx.evaluate(&js).await;
+                    let _ = run_in(&ctx, frame, &js).await;
                     let _ = tx.send(Message::Text(ok(id, &session, json!({})).to_string()));
                 });
                 vec![]
@@ -2085,7 +2187,8 @@ impl Conn {
                         kc,
                         js_str(&text)
                     );
-                    let _ = ctx.evaluate(&js).await;
+                    let frame = focused_frame(&ctx).await;
+                    let _ = run_in(&ctx, frame, &js).await;
                     let _ = ctx.run_event_loop().await;
                     let _ = tx.send(Message::Text(ok(id, &session, json!({})).to_string()));
                 });
@@ -2100,9 +2203,8 @@ impl Conn {
                 let (ctx, session, tx) =
                     (self.targets[idx].ctx.clone(), session.clone(), tx.clone());
                 tokio::spawn(async move {
-                    let _ = ctx
-                        .evaluate(&format!("__pt_insertText({})", js_str(&text)))
-                        .await;
+                    let frame = focused_frame(&ctx).await;
+                    let _ = run_in(&ctx, frame, &format!("__pt_insertText({})", js_str(&text))).await;
                     let _ = ctx.run_event_loop().await;
                     let _ = tx.send(Message::Text(ok(id, &session, json!({})).to_string()));
                 });
@@ -2164,7 +2266,9 @@ async fn frame_eval(ctx: &BrowserContext, frame: u32, value: &str, by_value: boo
             "(() => {{ const s = globalThis.{slot}; delete globalThis.{slot}; \
                return JSON.stringify(s && s.rej ? __pt_exc(s.v, !s.sync, {by}) : __pt_wrap(s && s.done ? s.v : undefined, {by})); }})()"
         );
-        return eval_reply(ctx.evaluate_in_frame(frame, &read).await.ok());
+        let mut v = eval_reply(ctx.evaluate_in_frame(frame, &read).await.ok());
+        tag_frame_refs(&mut v, frame);
+        return v;
     }
     let wrap = |value: &str| {
         format!(
@@ -2172,7 +2276,9 @@ async fn frame_eval(ctx: &BrowserContext, frame: u32, value: &str, by_value: boo
                catch (e) {{ return JSON.stringify(__pt_exc(e, false, {by})); }} }})()"
         )
     };
-    eval_reply(ctx.evaluate_in_frame(frame, &wrap(value)).await.ok())
+    let mut v = eval_reply(ctx.evaluate_in_frame(frame, &wrap(value)).await.ok());
+    tag_frame_refs(&mut v, frame);
+    v
 }
 
 /// The body of a `Runtime.evaluate`/`callFunctionOn` reply from the JSON the
@@ -2540,9 +2646,132 @@ fn object_is_stale(oid: &str, page_ctx: usize) -> bool {
         .unwrap_or(false)
 }
 
-/// The frame behind an execution context id, if it names one.
+// A handle or a node from a frame names its frame: `f<frame>:obj-…` and
+// backend node ids past `(frame + 1) * NODE_STRIDE`. Context indices alone are
+// per thread, and a frame on another thread can share the page's.
+const NODE_STRIDE: i64 = 1 << 32;
+
+/// The frame a handle comes from, and the handle as its document knows it.
+fn split_oid(oid: &str) -> (Option<u32>, &str) {
+    oid.strip_prefix('f')
+        .and_then(|r| r.split_once(':'))
+        .and_then(|(f, raw)| Some((Some(f.parse().ok()?), raw)))
+        .unwrap_or((None, oid))
+}
+
+fn split_node_id(bid: i64) -> (Option<u32>, i64) {
+    if bid >= NODE_STRIDE {
+        (Some((bid / NODE_STRIDE - 1) as u32), bid % NODE_STRIDE)
+    } else {
+        (None, bid)
+    }
+}
+
+/// Mark every handle and node in a frame's answer with the frame.
+fn tag_frame_refs(v: &mut Value, frame: u32) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m.iter_mut() {
+                match (k.as_str(), &*x) {
+                    ("objectId", Value::String(s)) => *x = Value::String(format!("f{frame}:{s}")),
+                    ("backendNodeId", Value::Number(n)) => {
+                        if let Some(n) = n.as_i64() {
+                            *x = json!((frame as i64 + 1) * NODE_STRIDE + n);
+                        }
+                    }
+                    _ => tag_frame_refs(x, frame),
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(|x| tag_frame_refs(x, frame)),
+        _ => {}
+    }
+}
+
+/// The frame that has keyboard focus, `None` for the page: whichever document
+/// took focus last. A page and its frames are separate contexts, each with
+/// its own active element.
+async fn focused_frame(ctx: &BrowserContext) -> Option<u32> {
+    // The engine hands script results back as text.
+    let stamp = |v: Result<Value, nokk::EngineError>| {
+        v.ok().and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok())).unwrap_or(0.0)
+    };
+    let mut best = (stamp(ctx.evaluate("__pt_focusAt()").await), None);
+    for f in ctx.frame_list() {
+        let at = stamp(ctx.evaluate_in_frame(f.id, "__pt_focusAt()").await);
+        if at > best.0 {
+            best = (at, Some(f.id));
+        }
+    }
+    best.1
+}
+
+/// Run engine JS in the page or in one of its frames.
+async fn run_in(ctx: &BrowserContext, frame: Option<u32>, js: &str) -> Result<Value, nokk::EngineError> {
+    match frame {
+        Some(f) => ctx.evaluate_in_frame(f, js).await,
+        None => ctx.evaluate(js).await,
+    }
+}
+
+/// Where a frame's `<iframe>` sits in the page: its content's coordinates plus
+/// this are the page's, which is what Chrome reports for a node in a frame.
+async fn frame_offset(ctx: &BrowserContext, frame: u32) -> (f64, f64) {
+    let r = ctx.evaluate(&format!("__pt_frameRectById({frame})")).await.ok();
+    let v: Value = r
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(Value::Null);
+    (v["x"].as_f64().unwrap_or(0.0), v["y"].as_f64().unwrap_or(0.0))
+}
+
+/// Shift every point of quads (flat `[x1, y1, x2, y2, …]` arrays) by `(dx, dy)`.
+fn shift_quads(v: &mut Value, dx: f64, dy: f64) {
+    match v {
+        Value::Array(a) if a.iter().all(|x| x.is_number()) => {
+            for (i, x) in a.iter_mut().enumerate() {
+                let n = x.as_f64().unwrap_or(0.0) + if i % 2 == 0 { dx } else { dy };
+                *x = json!(n);
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(|x| shift_quads(x, dx, dy)),
+        Value::Object(m) => {
+            for (k, x) in m.iter_mut() {
+                if k != "width" && k != "height" {
+                    shift_quads(x, dx, dy);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The frame behind an execution context id, if it names one: its main
+/// world or one of its isolated worlds.
 fn frame_of_ctx_id(ctx_id: i64) -> Option<u32> {
-    (ctx_id >= 1_000_000).then(|| (ctx_id - 1_000_000) as u32)
+    (ctx_id >= 1_000_000).then(|| ((ctx_id - 1_000_000) % FRAME_WORLD_STRIDE) as u32)
+}
+
+/// Frame ids stay below this; world `k` of a frame is its main-world id plus
+/// `(k + 1)` strides.
+const FRAME_WORLD_STRIDE: i64 = 100_000_000;
+
+fn frame_world_ctx_id(frame_id: u32, k: usize) -> i64 {
+    frame_ctx_id(frame_id) + (k as i64 + 1) * FRAME_WORLD_STRIDE
+}
+
+/// `Runtime.executionContextCreated` for world `k` of a frame.
+fn frame_world_created(session: &Option<String>, frame_id: u32, k: usize, name: &str, origin: &str, fid: &str) -> Value {
+    let cid = frame_world_ctx_id(frame_id, k);
+    event(
+        "Runtime.executionContextCreated",
+        session,
+        json!({ "context": {
+            "id": cid, "origin": origin, "name": name, "uniqueId": format!("{cid}.1"),
+            "auxData": { "isDefault": false, "type": "isolated", "frameId": fid },
+        }}),
+    )
 }
 
 /// The execution context id a frame's evaluates run in. Kept in a range of its
@@ -2932,6 +3161,30 @@ mod tests {
         assert_eq!(v["exceptionDetails"]["text"], json!("Uncaught (in promise) Error: no"));
         // Without awaitPromise a promise is an object, as in Chrome.
         assert_eq!(frame_eval(&ctx, frame, &dev_value(expr), true, false).await["result"]["type"], json!("object"));
+        // A handle made in the frame leads a later call back to the frame,
+        // which is how Playwright's frame.evaluate reaches it; the page's own
+        // handles stay the page's.
+        let v = frame_eval(&ctx, frame, &dev_value("({ where: document.body.textContent })"), false, false).await;
+        let oid = v["result"]["objectId"].as_str().expect("a handle").to_string();
+        let (f, raw) = split_oid(&oid);
+        assert_eq!(f, Some(frame), "{oid}");
+        let call = format!("__pt_devCall({}, __pt_objGet({}), [])", js_str("function () { return this.where; }"), js_str(raw));
+        assert_eq!(frame_eval(&ctx, frame, &call, true, false).await["result"]["value"], json!("x"));
+        let v = remote_eval(&ctx, &dev_value("({})"), false, false).await;
+        assert_eq!(split_oid(v["result"]["objectId"].as_str().unwrap()).0, None);
+        assert_eq!(split_node_id((frame as i64 + 1) * NODE_STRIDE + 7), (Some(frame), 7));
+        assert_eq!(split_node_id(7), (None, 7));
+        // Keyboard input goes to the document that took focus last.
+        let focus = "(() => { const i = document.createElement('input'); document.body.append(i); i.focus(); return 1; })()";
+        assert_eq!(focused_frame(&ctx).await, None);
+        frame_eval(&ctx, frame, &dev_value(focus), true, false).await;
+        assert_eq!(focused_frame(&ctx).await, Some(frame));
+        remote_eval(&ctx, &dev_value(focus), true, false).await;
+        assert_eq!(focused_frame(&ctx).await, None);
+        // A frame's boxes move by where its <iframe> sits.
+        let mut q = json!({ "content": [1, 2, 3, 4], "width": 5, "height": 6 });
+        shift_quads(&mut q, 10.0, 20.0);
+        assert_eq!(q, json!({ "content": [11.0, 22.0, 13.0, 24.0], "width": 5, "height": 6 }));
     }
 
     /// A throw or a rejection comes back as Chrome sends it: `exceptionDetails`

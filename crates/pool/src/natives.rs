@@ -87,6 +87,7 @@ pub fn install(scope: &mut v8::PinScope) {
     bind(scope, "__pt_isBoot", fn_is_boot);
     bind(scope, "__pt_rtcStart", rtc_start);
     bind(scope, "__pt_rtcPoll", rtc_poll);
+    bind(scope, "__pt_focusSeq", focus_seq);
 
     // Optional real 2D rasterization (the `render` feature). Their presence is the
     // signal the JS canvas checks to use real pixels instead of synthesis.
@@ -1511,6 +1512,16 @@ pub fn external_refs() -> std::borrow::Cow<'static, [v8::ExternalReference]> {
         RefsSlice(Box::leak(list.into_boxed_slice()))
     });
     std::borrow::Cow::Borrowed(v.0)
+}
+
+/// `__pt_focusSeq()`: a number that grows with every call, in every context
+/// and on every thread. Each document stamps its focus with it, and keyboard
+/// input goes to whichever focused last: a page and its frames are separate
+/// contexts that cannot see each other's focus.
+fn focus_seq(scope: &mut v8::PinScope, _args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    rv.set(v8::Number::new(scope, n as f64).into());
 }
 
 pub(crate) fn bind(scope: &mut v8::PinScope, name: &str, cb: impl v8::MapFnTo<v8::FunctionCallback>) {

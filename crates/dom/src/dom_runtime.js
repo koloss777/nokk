@@ -3016,6 +3016,12 @@
     }
     focus() {
       const doc = this.ownerDocument || globalThis.document;
+      // Focus inside a frame makes its <iframe> the parent's active element,
+      // as in Chrome; keyboard input follows that chain down.
+      if (doc && doc === globalThis.document) {
+        __ptFocusHost();
+        try { if (typeof __pt_focusSeq === 'function') doc.__ptFocusAt = __pt_focusSeq(); } catch (e) {}
+      }
       if (!doc || doc.activeElement === this) return;
       const prev = doc.activeElement;
       // Chrome's order: `blur` and `focusout` on the old element, then `focus`
@@ -3132,7 +3138,37 @@
     select() {}
     setSelectionRange() {}
     setRangeText() {}
-    get isContentEditable() { const v = __s_toLowerCase(__ptGetA(this, 'contenteditable') || ''); return v === '' || v === 'true'; }
+    // Reflects `contenteditable`, case-insensitively: "true" for an empty
+    // value, "inherit" for none or an unknown one.
+    get contentEditable() {
+      const a = __ptGetA(this, 'contenteditable');
+      if (a == null) return 'inherit';
+      const v = __s_toLowerCase(String(a));
+      return v === '' || v === 'true' ? 'true' : v === 'false' || v === 'plaintext-only' ? v : 'inherit';
+    }
+    set contentEditable(v) {
+      const s = String(v), m = __s_toLowerCase(s);
+      if (m === 'inherit') { __ptDelA(this, 'contenteditable'); return; }
+      if (m !== 'true' && m !== 'false' && m !== 'plaintext-only') {
+        throw __pt_mkErr(globalThis.DOMException || Error, "Failed to set the 'contentEditable' property on 'HTMLElement': The value provided ('" + s + "') is not one of 'true', 'false', 'plaintext-only', or 'inherit'.", 'SyntaxError');
+      }
+      __ptSetA(this, 'contenteditable', m);
+    }
+    // Inherited from the nearest element that says: "", "true" or
+    // "plaintext-only" turn editing on, "false" off, anything else defers to
+    // the parent. designMode makes the whole document editable.
+    get isContentEditable() {
+      const doc = this.ownerDocument;
+      if (doc && doc.__ptDesign) return true;
+      for (let e = this; e && e.__ptType === ELEMENT_NODE; e = e.__ptParent) {
+        const a = __ptGetA(e, 'contenteditable');
+        if (a == null) continue;
+        const v = __s_toLowerCase(String(a));
+        if (v === '' || v === 'true' || v === 'plaintext-only') return true;
+        if (v === 'false') return false;
+      }
+      return false;
+    }
     click() {
       const ok = this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
       if (ok) __ptActivate(this);
@@ -3304,8 +3340,12 @@
       return this.__ptDoctype ? 'CSS1Compat' : 'BackCompat';
     }
     get doctype() { return this.__ptDoctype || null; }
-    get designMode() { return 'off'; }
-    set designMode(v) {}
+    get designMode() { return this.__ptDesign ? 'on' : 'off'; }
+    set designMode(v) {
+      const m = __s_toLowerCase(String(v));
+      if (m !== 'on' && m !== 'off') return;
+      try { Object.defineProperty(this, '__ptDesign', { value: m === 'on', writable: true, configurable: true, enumerable: false }); } catch (e) {}
+    }
     // Chrome's format is MM/DD/YYYY HH:MM:SS, not a localised string.
     get lastModified() {
       const d = new Date(), p2 = (n) => __s_padStart(String(n), 2, '0');
@@ -10150,7 +10190,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     return {
       backendNodeId: globalThis.__pt_nodeId(n), nodeId: 0, nodeType: n.__ptType,
       nodeName: n.nodeName || '', localName: n.localName || '', nodeValue: n.nodeValue || '',
-      childNodeCount: (n.__ptKids || []).length, attributes: attrs
+      childNodeCount: (n.__ptKids || []).length, attributes: attrs,
+      // The frame an <iframe> holds; the server names it as Chrome does.
+      ptFrame: n.__ptLocal === 'iframe' && n.__ptFrameId ? n.__ptFrameId : undefined
     };
   };
   // ---- synthetic layout + interaction (no real rendering) ------------------
@@ -15977,6 +16019,20 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     } catch (e) {}
     return __ptJSON.stringify(out);
   };
+  // The node id of the <iframe> a frame lives in (0 if not in this document).
+  globalThis.__pt_frameOwner = (id) => {
+    const walk = (n) => {
+      for (let c = n.firstChild; c; c = c.nextSibling) {
+        if (c.__ptType !== ELEMENT_NODE) continue;
+        if (c.__ptLocal === 'iframe' && c.__ptFrameId === id) return c;
+        const found = (c.__ptShadow && walk(c.__ptShadow)) || walk(c);
+        if (found) return found;
+      }
+      return null;
+    };
+    const el = globalThis.document && walk(globalThis.document);
+    return el ? globalThis.__pt_nodeId(el) : 0;
+  };
   globalThis.__pt_frameRectById = (id) => {
     const walk = (n) => {
       for (let c = n.firstChild; c; c = c.nextSibling) {
@@ -16175,6 +16231,28 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     el.dispatchEvent(__ptTrust(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' })));
     return true;
   }
+  // The parent document's side of focus moving into this frame: its focused
+  // element blurs and the <iframe> becomes active, up through every ancestor.
+  function __ptFocusHost() {
+    let fe = null;
+    try { fe = globalThis.frameElement; } catch (e) {}
+    const pdoc = fe && fe.ownerDocument;
+    if (!pdoc || pdoc.__ptActive === fe) return;
+    const pprev = pdoc.__ptActive;
+    if (pprev && pprev !== pdoc.body && pprev.dispatchEvent) {
+      pprev.dispatchEvent(__ptFocusEvent('blur', null));
+      pprev.dispatchEvent(__ptFocusEvent('focusout', null, true));
+    }
+    pdoc.__ptActive = fe;
+    try { const up = pdoc.defaultView && pdoc.defaultView.__pt_focusHost; if (typeof up === 'function') up(); } catch (e) {}
+  }
+  globalThis.__pt_focusHost = __ptFocusHost;
+  // When this document last took focus (0: nothing focused). The engine sends
+  // keyboard input to the page or frame that did so last.
+  globalThis.__pt_focusAt = () => {
+    const d = globalThis.document, a = d && d.__ptActive;
+    return a && a !== d.body ? (d.__ptFocusAt || 0) : 0;
+  };
   globalThis.__pt_insertText = (text) => {
     const el = globalThis.document && globalThis.document.activeElement;
     return __editable(el) ? __insertInto(el, String(text)) : false;
