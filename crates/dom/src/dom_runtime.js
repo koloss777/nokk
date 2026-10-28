@@ -4560,6 +4560,41 @@
     }
     return out.join(', ');
   };
+  // `list-style` as Chrome 151 reads it: each part at most once, a `none`
+  // for the type when it is not given, else for the image (two for both);
+  // null when invalid. Parts left out are null.
+  const __listStyleParts = (v) => {
+    const parts = __ptCssParts(__s_trim(String(v)));
+    if (parts.length === 1 && /^(inherit|initial|unset|revert|revert-layer)$/i.test(parts[0])) {
+      const k = __s_toLowerCase(parts[0]);
+      return { p: k, i: k, t: k, wide: true };
+    }
+    let p = null, i = null, t = null, nones = 0;
+    for (const x of parts) {
+      const low = __s_toLowerCase(x);
+      if (low === 'inside' || low === 'outside') { if (p) return null; p = low; }
+      else if (low === 'none') nones++;
+      else if (/^(url|(repeating-)?(linear|radial|conic)-gradient|(-webkit-)?image-set)\(/i.test(x)) { if (i) return null; i = x; }
+      else if (/^["']/.test(x) || /^-?[_a-zA-Z][\w-]*$/.test(x)) {
+        if (t || /^(inherit|initial|unset|revert|revert-layer|default)$/i.test(x)) return null;
+        t = __CSS_COUNTER_STYLES.has(low) ? low : x;
+      } else return null;
+    }
+    if (nones > 2 || (nones === 2 && (i || t)) || (nones === 1 && i && t)) return null;
+    if (nones === 2) { i = 'none'; t = 'none'; }
+    else if (nones === 1) { if (!t) t = 'none'; else i = 'none'; }
+    return { p, i, t, wide: false };
+  };
+  // Counter styles Chrome predefines: their names print in lower case.
+  const __CSS_COUNTER_STYLES = new Set(['disc', 'circle', 'square', 'disclosure-open', 'disclosure-closed', 'decimal',
+    'decimal-leading-zero', 'lower-roman', 'upper-roman', 'lower-greek', 'lower-alpha', 'lower-latin', 'upper-alpha',
+    'upper-latin', 'arabic-indic', 'armenian', 'bengali', 'cambodian', 'cjk-decimal', 'cjk-earthly-branch',
+    'cjk-heavenly-stem', 'cjk-ideographic', 'devanagari', 'ethiopic-numeric', 'georgian', 'gujarati', 'gurmukhi',
+    'hebrew', 'hiragana', 'hiragana-iroha', 'japanese-formal', 'japanese-informal', 'kannada', 'katakana',
+    'katakana-iroha', 'khmer', 'korean-hangul-formal', 'korean-hanja-formal', 'korean-hanja-informal', 'lao',
+    'lower-armenian', 'malayalam', 'mongolian', 'myanmar', 'oriya', 'persian', 'simp-chinese-formal',
+    'simp-chinese-informal', 'tamil', 'telugu', 'thai', 'tibetan', 'trad-chinese-formal', 'trad-chinese-informal',
+    'upper-armenian']);
   const __cssValueRaw = (prop, value) => {
     // Custom property values are stored as written.
     if (__s_charCodeAt(prop, 0) === 45 && __s_charCodeAt(prop, 1) === 45) return __s_trim(String(value));
@@ -4602,6 +4637,11 @@
     if (prop === 'stroke-dasharray') return __s_replace(v, /\s*,\s*/g, ', ');
     // The initial `transition-property` is not printed.
     if (prop === 'transition') return __s_replace(v, /^all\s+/i, '');
+    // Position, image, type, each only when given.
+    if (prop === 'list-style') {
+      const l = __listStyleParts(v);
+      return !l ? v : l.wide ? l.p : [l.p, l.i, l.t].filter((x) => x).join(' ');
+    }
     // Background prints in its own order: image first, colour last; a bare
     // URL gets quoted.
     if (prop === 'background') {
@@ -4948,7 +4988,7 @@
         let raw = __s_slice(decl, colon + 1);
         const im = /!\s*important\s*$/i.exec(raw);
         if (im) raw = __s_slice(raw, 0, im.index);
-        if (__cssStrayBang(prop, raw)) continue;
+        if (__cssInvalid(prop, raw)) continue;
         // A later normal declaration does not undo an earlier important one.
         if (!im && map.__ptImp && map.__ptImp.has(prop)) continue;
         map.delete(prop);
@@ -5066,6 +5106,13 @@
   function __cssStrayBang(prop, v) {
     if (__s_indexOf(v, '!') < 0 || __s_startsWith(prop, '--')) return false;
     return __s_indexOf(__s_replace(v, /"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'/g, ''), '!') >= 0;
+  }
+  // A value Chrome rejects, so the declaration is dropped (one with var()
+  // is checked when it is used).
+  function __cssInvalid(prop, v) {
+    if (__cssStrayBang(prop, v)) return true;
+    if (prop === 'list-style') return __s_indexOf(v, 'var(') < 0 && !__listStyleParts(v);
+    return false;
   }
   const __cssImportantIn = (v) => typeof v === 'string' && /!\s*important\s*$/i.test(v);
   // The exact value is kept next to the printed one: Chrome stores the parsed
@@ -5856,6 +5903,7 @@
       if (pr !== '' && pr !== 'important') return;
       if (__cssImportantIn(v)) return;
       const m = s.read(), k = __cssKey(p);
+      if (v !== '' && v != null && __cssInvalid(k, String(v))) return;
       // An empty value removes the property rather than leaving `opacity: `,
       // a string Chrome never produces (the widget frame reads its `style`
       // tens of thousands of times).
@@ -5966,6 +6014,7 @@
           if (!s || s.computed) return;
           const m = s.read();
           if (__cssImportantIn(v)) return;
+          if (v !== '' && v != null && __cssInvalid(key, String(v))) return;
           if (v === '' || v == null) __cssDrop(m, key); else { __cssStore(m, key, v); __cssImp(m).delete(key); }
           s.write(m);
         },
@@ -6007,7 +6056,7 @@
       let v = __s_trim(__s_slice(part, i + 1));
       const im = /!\s*important\s*$/i.exec(v);
       if (im) v = __s_trim(__s_slice(v, 0, im.index));
-      if (__cssStrayBang(k, v)) continue;
+      if (__cssInvalid(k, v)) continue;
       if (k) { m.set(k, v); if (im) __cssImp(m).add(k); }
     }
     return m;
@@ -6077,6 +6126,7 @@
         const m = read(), k = dash(String(p));
         // Chrome rejects a value with `!important` set via a property.
         if (__cssImportantIn(v)) return true;
+        if (v !== '' && v != null && __cssInvalid(k, String(v))) return true;
         if (v === '' || v == null) __cssDrop(m, k); else { __cssStore(m, k, v); __cssImp(m).delete(k); }
         write(m); return true;
       },
@@ -15538,13 +15588,9 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
       return [[prop + '-start', a], [prop + '-end', p[1] || (__gridIdent(a) ? a : 'auto')]];
     }
     if (prop === 'list-style') {
-      for (const t of parts) {
-        const low = __s_toLowerCase(t);
-        if (low === 'inside' || low === 'outside') out.push(['list-style-position', low]);
-        else if (/^(url|linear-gradient|image-set)\(/i.test(t) || low === 'none') out.push(['list-style-image', low === 'none' ? 'none' : t]);
-        else out.push(['list-style-type', t]);
-      }
-      return out;
+      const l = __listStyleParts(v);
+      if (!l) return [];
+      return [['list-style-position', l.p || 'initial'], ['list-style-image', l.i || 'initial'], ['list-style-type', l.t || 'initial']];
     }
     if (prop === 'transition') {
       // First layer only: lists print per layer, and pages almost always have one.

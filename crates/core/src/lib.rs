@@ -13515,6 +13515,39 @@ href|http://www.w3.org/1999/xlink href|http://www.w3.org/1999/xlink".into()));
         assert_eq!(out, Value::String("right 5px top|20px|repeat-x|calc(100% - 5px) 0%|calc(100% - 5px)|20px|repeat-x|content-box / |||-20px 0px|-20px|auto|no-repeat|padding-box / 10% 20px, left bottom|initial, initial|initial, no-repeat|10% 20px, 0% 100%|10%, 0%|auto, auto|repeat, no-repeat|padding-box, padding-box / right 10% bottom|||90% 100%|90%|auto|repeat|padding-box / |calc(100% - 5px) 0%|calc(100% - 5px)|20px|repeat-x|padding-box|padding-box / center center|50% 50%|50%|contain|no-repeat|content-box|padding-box / 24px 36px / 3 1px".into()));
     }
 
+    /// `list-style` reads and prints as in Chrome 151 (values measured there):
+    /// parts left out are `initial`, a `none` is the type's unless the type is
+    /// given, the text prints position, image, type, and a repeated part drops
+    /// the declaration.
+    #[tokio::test]
+    async fn list_style_reads_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<!doctype html><body>").await.unwrap();
+        let out = ctx
+            .evaluate(
+                r#"['none', 'none inside', 'square none', 'url(x.png) none', 'none none', 'inside', 'Circle', 'circle circle', 'none none none', 'inherit'].map((v) => {
+            const d = document.createElement('li'); d.style.listStyle = 'disc'; d.style.listStyle = v; document.body.append(d);
+            const c = getComputedStyle(d), s = d.style;
+            const r = [s.cssText, s.listStyleType, s.listStyleImage, s.listStylePosition, c.listStyleType, c.listStyleImage.slice(0, 4), c.listStylePosition].join('|');
+            d.remove(); return r; }).join(' / ')"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            Value::String(
+                "list-style: none;|none|initial|initial|none|none|outside / list-style: inside none;|none|initial|inside|none|none|inside / \
+                 list-style: none square;|square|none|initial|square|none|outside / list-style: url(\"x.png\") none;|none|url(\"x.png\")|initial|none|url(|outside / \
+                 list-style: none none;|none|none|initial|none|none|outside / list-style: inside;|initial|initial|inside|disc|none|inside / \
+                 list-style: circle;|circle|initial|initial|circle|none|outside / list-style: disc;|disc|initial|initial|disc|none|outside / \
+                 list-style: disc;|disc|initial|initial|disc|none|outside / list-style: inherit;|inherit|inherit|inherit|disc|none|outside"
+                    .into()
+            )
+        );
+    }
+
     /// Media queries and @supports answer as in Chrome 151 (values measured
     /// there): media types, `not`/`only`, `and`/`or`, ranges, calc(), em,
     /// resolutions and boolean features; the text prints as Chrome prints it;
