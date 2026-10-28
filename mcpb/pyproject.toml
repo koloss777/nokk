@@ -3,10 +3,10 @@
 # its own beyond src/server.py.
 [project]
 name = "nokk-mcpb"
-version = "0.1.46a1"
+version = "0.1.47a1"
 description = "nokk MCP server as an MCP bundle"
 requires-python = ">=3.10"
-dependencies = ["nokk-mcp>=0.1.46a1", "nokk>=0.1.46a1"]
+dependencies = ["nokk-mcp>=0.1.47a1", "nokk>=0.1.47a1"]
 
 [tool.uv]
 package = false

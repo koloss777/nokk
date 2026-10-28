@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "nokk",
   "display_name": "nokk",
-  "version": "0.1.46-alpha.1",
+  "version": "0.1.47-alpha.1",
   "description": "Headless browser for AI agents with Chrome's fingerprint that passes Cloudflare challenges.",
   "long_description": "nokk is a headless browser engine in Rust (V8 and its own DOM) with Chrome 151's TLS, HTTP/2 and JavaScript fingerprint. It passes Cloudflare challenges without Chromium. An agent opens a page, reads its text or HTML, clicks, fills forms and runs JavaScript.",
   "author": {

@@ -5,13 +5,13 @@
   "description": "Headless browser for AI agents with Chrome's fingerprint that passes Cloudflare challenges.",
   "websiteUrl": "https://github.com/koloss777/nokk",
   "repository": { "url": "https://github.com/koloss777/nokk", "source": "github" },
-  "version": "0.1.46a1",
+  "version": "0.1.47a1",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "nokk-mcp",
-      "version": "0.1.46a1",
+      "version": "0.1.47a1",
       "runtimeHint": "uvx",
       "transport": { "type": "stdio" },
       "environmentVariables": [
