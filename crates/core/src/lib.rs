@@ -3107,7 +3107,7 @@ impl BrowserContext {
                     "document" if top_document => "navigation",
                     "document" | "iframe" => "iframe",
                     "stylesheet" => "link",
-                    "css" | "css-image" => "css",
+                    "css" | "css-image" | "css-mask" => "css",
                     "img" | "image" | "image-low" => "img",
                     "font" => "css",
                     "icon" | "websocket" | "beacon" => "other",
@@ -5650,7 +5650,7 @@ impl BrowserContext {
                         "typeof __pt_mediaBad === 'function' && __pt_mediaBad({});",
                         serde_json::to_string(&url).unwrap()
                     )
-                } else if matches!(kind.as_str(), "img" | "image" | "image-low" | "css-image" | "image-cors" | "image-cors-low")
+                } else if matches!(kind.as_str(), "img" | "image" | "image-low" | "css-image" | "css-mask" | "image-cors" | "image-cors-low")
                     && !is_image_bytes(&resp.body, &resp.headers)
                 {
                     // Not a picture at all: Chrome fires `error` on the element.
@@ -5902,6 +5902,8 @@ impl BrowserContext {
             "video" => (K::Video, Some(3), false),
             "audio" => (K::Audio, Some(3), false),
             "image-cors-low" => (K::ImageCors, Some(3), false),
+            // A CSS mask image: a CORS load, Low (Chrome 151).
+            "css-mask" => (K::ImageCors, Some(3), false),
             "icon" => (K::Subresource, Some(1), false),
             "stylesheet" | "link-style" | "css" => (K::Style, Some(0), false),
             "link-script" => (K::Script, Some(1), false),
@@ -13495,6 +13497,21 @@ href|http://www.w3.org/1999/xlink href|http://www.w3.org/1999/xlink".into()));
         ctx.load_html("https://example.com/", "<!doctype html><style>.m2{margin-left:7px !important !important}.m4{quotes:'!' '!';margin-left:1px}</style><div id=m1 style=\"margin-left:5px !important !important\"></div><div id=m2 class=m2></div><div id=m4 class=m4></div>").await.unwrap();
         let out = ctx.evaluate(r#"['m1', 'm2', 'm4'].map((i) => getComputedStyle(document.getElementById(i)).marginLeft).join(' ')"#).await.unwrap();
         assert_eq!(out, Value::String("0px 0px 1px".into()));
+    }
+
+    /// Background and mask shorthands, positions and `inherit` answer as in
+    /// Chrome 151 (values measured there): every part of a layer, what it
+    /// leaves out `initial`, positions as halves and computed to percentages
+    /// and calc(), `20px auto` as `20px`; `inherit` takes the parent's
+    /// computed size; a `;` inside a quoted url does not end a declaration.
+    #[tokio::test]
+    async fn background_and_mask_shorthands_answer_like_chrome() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<!doctype html><style>body{font:16px sans-serif}.s{background:url(x.png) -20px 0 no-repeat}.m{-webkit-mask:url(ic.svg) right 5px top / 20px auto repeat-x padding-box}</style><div id=a style=\"background:url(x.png) right 5px top/20px auto repeat-x fixed content-box padding-box red\"></div><div id=b class=s></div><div id=c style=\"background:url(a.png) 10% 20px, url(b.png) left bottom no-repeat\"></div><div id=d style=\"background-position:right 10% bottom\"></div><div id=e class=m></div><div id=f style=\"mask:url(x.svg) center/contain no-repeat content-box padding-box\"></div><div id=g style=\"font-size:1.5em;line-height:150%\"><span id=h style=\"font-size:inherit;line-height:inherit\">x</span></div><span id=i style=\"color:red;mask-image:url(&quot;data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg'/>&quot;);width:1px\"></span>").await.unwrap();
+        let out = ctx.evaluate(r#"["a","b","c","d"].map((i) => { const e = document.getElementById(i), s = getComputedStyle(e), t = e.style; return [t.backgroundPosition, t.backgroundSize, t.backgroundRepeat, s.backgroundPosition, s.backgroundPositionX, s.backgroundSize, s.backgroundRepeat, s.backgroundOrigin].join("|"); }).concat(["e","f"].map((i) => { const e = document.getElementById(i), s = getComputedStyle(e); return [e.style.maskPosition, s.maskPosition, s.webkitMaskPositionX, s.maskSize, s.maskRepeat, s.maskOrigin, s.maskClip].join("|"); })).concat([getComputedStyle(document.getElementById("h")).fontSize + " " + getComputedStyle(document.getElementById("h")).lineHeight, document.getElementById("i").style.length + " " + document.getElementById("i").style.width]).join(" / ")"#).await.unwrap();
+        assert_eq!(out, Value::String("right 5px top|20px|repeat-x|calc(100% - 5px) 0%|calc(100% - 5px)|20px|repeat-x|content-box / |||-20px 0px|-20px|auto|no-repeat|padding-box / 10% 20px, left bottom|initial, initial|initial, no-repeat|10% 20px, 0% 100%|10%, 0%|auto, auto|repeat, no-repeat|padding-box, padding-box / right 10% bottom|||90% 100%|90%|auto|repeat|padding-box / |calc(100% - 5px) 0%|calc(100% - 5px)|20px|repeat-x|padding-box|padding-box / center center|50% 50%|50%|contain|no-repeat|content-box|padding-box / 24px 36px / 3 1px".into()));
     }
 
     /// Media queries and @supports answer as in Chrome 151 (values measured

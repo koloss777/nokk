@@ -606,6 +606,23 @@
       try { __pt_imageBytes(url, __s_replace(payload, /[\s]/g, '')); } catch (e) {}
     }
   }
+  // A data: image named by CSS (a background or a mask): its size, and an
+  // SVG's markup for layout and painting, as a fetched one gets them.
+  function __dataCssImage(url) {
+    if (__s_slice(url, 0, 5) !== 'data:' || (globalThis.__pt_imageSizeOf && __pt_imageSizeOf(url))) return;
+    const comma = __s_indexOf(url, ',');
+    if (comma < 0) return;
+    const meta = __s_toLowerCase(__s_slice(url, 5, comma)), b64 = /;base64/.test(meta);
+    const payload = __s_slice(url, comma + 1);
+    if (__s_startsWith(meta, 'image/svg+xml')) {
+      if (typeof globalThis.__pt_svgImage !== 'function') return;
+      let text = null;
+      try { text = b64 ? (typeof globalThis.__pt_atob === 'function' ? __pt_atob(payload) : null) : decodeURIComponent(payload); } catch (e) { text = null; }
+      if (typeof text === 'string') { try { __pt_svgImage(url, text, false); } catch (e) {} }
+      return;
+    }
+    if (__s_startsWith(meta, 'image/')) __dataImageMeta(url, payload, b64);
+  }
   function __imgCurrent(el, url, later) {
     Object.defineProperty(el, '__ptCurWant', { value: url, writable: true, configurable: true, enumerable: false });
     const put = () => { if (el.__ptCurWant === url) Object.defineProperty(el, '__ptCurSrc', { value: url, writable: true, configurable: true, enumerable: false }); };
@@ -2158,7 +2175,7 @@
               const head = /;base64/.test(meta) ? globalThis.atob(__s_slice(payload, 0, 16)) : decodeURIComponent(__s_slice(payload, 0, 24));
               isImage = /^(\x89PNG|GIF8|\xff\xd8|RIFF|BM|\x00\x00\x01\x00|<svg|<\?xml)/.test(head);
               if (isImage) __dataImageMeta(url, payload, /;base64/.test(meta));
-            }
+            } else if (isImage) __dataCssImage(url);
           } else if (globalThis.__pt_blobs) {
             const b = __pt_blobs.get(url);
             if (b && !/^image\//.test(String(b.type || ''))) isImage = false;
@@ -5159,6 +5176,17 @@
         for (const [k, v] of pairs) if (k === key) return v;
       }
     }
+    // A position from its halves, layer by layer.
+    if (key === 'background-position' || key === 'mask-position' || key === '-webkit-mask-position') {
+      const bg = key === 'background-position';
+      const xs = m.get(bg ? 'background-position-x' : '-webkit-mask-position-x') || __longhandFrom(m, bg ? 'background-position-x' : '-webkit-mask-position-x');
+      const ys = m.get(bg ? 'background-position-y' : '-webkit-mask-position-y') || __longhandFrom(m, bg ? 'background-position-y' : '-webkit-mask-position-y');
+      if (!xs || !ys) return '';
+      if (xs === 'initial' && ys === 'initial') return 'initial';
+      const lx = __ptCssLayers(xs), ly = __ptCssLayers(ys);
+      if (lx.length !== ly.length) return '';
+      return lx.map((x, i) => x + ' ' + ly[i]).join(', ');
+    }
     // And the reverse: a shorthand assembled from longhands. `border: 1px
     // solid` gives `solid` for `borderStyle` since all four sides match;
     // mismatched sides are not printed as a shorthand.
@@ -5951,9 +5979,28 @@
   // A `style` attribute's declarations as a map, priority kept beside it:
   // `getPropertyValue` answers without `!important`, `getPropertyPriority`
   // with it.
+  // Declarations split at `;` outside strings, brackets and comments
+  // (`url("data:image/svg+xml;utf8,...")` is one value).
+  function __splitDecls(text) {
+    const t = String(text);
+    if (__s_indexOf(t, '"') < 0 && __s_indexOf(t, "'") < 0 && __s_indexOf(t, '(') < 0 && __s_indexOf(t, '/*') < 0) return __s_split(t, ';');
+    const out = [];
+    let depth = 0, q = null, start = 0;
+    for (let i = 0; i < t.length; i++) {
+      const c = t[i];
+      if (q) { if (c === q && !__cssEscaped(t, i)) q = null; continue; }
+      if (c === '"' || c === "'") { q = c; continue; }
+      if (c === '/' && t[i + 1] === '*') { const e = __s_indexOf(t, '*/', i + 2); i = e < 0 ? t.length : e + 1; continue; }
+      if (c === '(') depth++;
+      else if (c === ')') { if (depth) depth--; }
+      else if (c === ';' && depth === 0) { out.push(__s_slice(t, start, i)); start = i + 1; }
+    }
+    out.push(__s_slice(t, start));
+    return out;
+  }
   function __parseStyleText(text) {
     const m = new Map();
-    for (const part of __s_split(text, ';')) {
+    for (const part of __splitDecls(text)) {
       const i = __s_indexOf(part, ':');
       if (i < 0) continue;
       const k = __cssKey(__s_slice(part, 0, i));
@@ -12721,7 +12768,29 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
   }
 
+  // The mask image an element's own declarations give it (the last of
+  // mask-image, its -webkit- alias and the two shorthands).
+  const __MASK_KEYS = new Set(['mask-image', '-webkit-mask-image', 'mask', '-webkit-mask']);
+  function __maskImageOf(cs) {
+    let v = null;
+    for (const [k, x] of cs) if (__MASK_KEYS.has(k)) v = x;
+    return v != null && __s_indexOf(String(v), 'url(') >= 0 ? String(v) : null;
+  }
   function __cssImagesOf(cs) {
+    // A mask image is a CORS load (Origin sent, credentials same-origin),
+    // Low, as Chrome makes it.
+    const mask = __maskImageOf(cs);
+    if (mask) {
+      __CSS_URL.lastIndex = 0;
+      const m = __CSS_URL.exec(mask);
+      __CSS_URL.lastIndex = 0;
+      const u = m && (m[1] !== undefined ? m[1] : m[2] !== undefined ? m[2] : m[3]);
+      if (u && __s_slice(u, 0, 5) === 'data:') __dataCssImage(u);
+      else if (u && /^https?:/i.test(u) && !__imageSkipped(u) && !(globalThis.__pt_subresourceDone && __pt_subresourceDone(u))) {
+        const rel = __holdLoad('css-image ' + u);
+        __pt_subresource(u, 'css-mask', __cssUrlRef.get(u) || null, 'same-origin').then(rel, rel);
+      }
+    }
     const v = cs.get('background-image');
     if (v == null || __s_indexOf(String(v), 'url(') < 0) return;
     // `image-set()` offers alternatives; a 1x screen takes the first.
@@ -12738,6 +12807,7 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     }
     __CSS_URL.lastIndex = 0;
     for (const u of out) {
+      if (u && __s_slice(u, 0, 5) === 'data:') { __dataCssImage(u); continue; }
       if (!u || !/^https?:/i.test(u) || __imageSkipped(u)) continue;
       if (globalThis.__pt_subresourceDone && __pt_subresourceDone(u)) continue;
       const rel = __holdLoad('css-image ' + u);
@@ -13314,8 +13384,17 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     // Shorthands are expanded here, not on output: layout, used font size and
     // computed style all need `font: 14px/1.5 Georgia` to set `font-size`.
     const take = (n, v) => {
-      const pairs = typeof __ptExpand === 'function' ? __ptExpand(n, v) : null;
-      if (pairs) { for (const [k, val] of pairs) out.set(k, val); return; }
+      const pairs = typeof __ptExpand === 'function' ? __expandMemo(n, v) : null;
+      // A part a shorthand leaves out is reset to its initial value.
+      if (pairs) {
+        for (const [k, val] of pairs) {
+          if (val === 'initial') out.delete(k);
+          else if (typeof val === 'string' && __s_indexOf(val, 'initial') >= 0 && __LAYER_INITIAL[k] != null) {
+            out.set(k, __ptCssLayers(val).map((l) => (l === 'initial' ? __LAYER_INITIAL[k] : l)).join(', '));
+          } else out.set(k, val);
+        }
+        return;
+      }
       out.set(n, v);
     };
     // Custom properties (`--*`) and `var()` substitution.
@@ -13366,7 +13445,21 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (v === 'initial' || v === 'unset' || v === 'revert' || v === 'revert-layer') { decls[k][1] = null; continue; }
       if (v !== 'inherit') continue;
       const pc = parentOf();
-      const got = pc ? pc.get(decls[k][0]) : undefined;
+      const prop = decls[k][0];
+      let got = pc ? pc.get(prop) : undefined;
+      // `inherit` takes the parent's computed value: a relative size is
+      // resolved there, not again here (`font-size: 1.5em` on the parent
+      // and `inherit` on the child is 24px, not 36).
+      const up = el.__ptParent;
+      if (up && up.__ptType === ELEMENT_NODE) {
+        if (prop === 'font-size') got = __usedFontSize(up) + 'px';
+        else if (got != null && typeof got === 'string' && /(?:\d|\.)(?:em|%|ex|ch)\b|%/.test(got) && !/var\(|calc\(/.test(got)) {
+          const pfs = __usedFontSize(up);
+          const t = __s_trim(got);
+          if (prop === 'line-height' && /^[\d.]+%$/.test(t)) got = parseFloat(t) / 100 * pfs + 'px';
+          else if (/^-?[\d.]+em$/.test(t)) got = parseFloat(t) * pfs + 'px';
+        }
+      }
       decls[k][1] = got != null ? got : null;
     }
     let readsVars = mine.size > 0;
@@ -15176,6 +15269,106 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     void pick;
     return CS_SIDES.map((side, i) => [__s_replace(name, '*', side), order[i]]);
   };
+  // Initial values of the per-layer background and mask longhands.
+  const __LAYER_INITIAL = {
+    'background-image': 'none', 'background-position-x': '0%', 'background-position-y': '0%', 'background-position': '0% 0%',
+    'background-size': 'auto', 'background-repeat': 'repeat', 'background-attachment': 'scroll',
+    'background-origin': 'padding-box', 'background-clip': 'border-box',
+    'mask-image': 'none', '-webkit-mask-position-x': '0%', '-webkit-mask-position-y': '0%', 'mask-position': '0% 0%',
+    'mask-size': 'auto', 'mask-repeat': 'repeat', 'mask-origin': 'border-box', 'mask-clip': 'border-box',
+    'mask-composite': 'add', 'mask-mode': 'match-source',
+  };
+  // Top-level comma-separated layers of a value.
+  const __ptCssLayers = (v) => {
+    const out = [];
+    let depth = 0, cur = '';
+    for (const ch of String(v)) {
+      if (ch === '(') depth++;
+      if (ch === ')') depth--;
+      if (ch === ',' && depth === 0) { out.push(__s_trim(cur)); cur = ''; continue; }
+      cur += ch;
+    }
+    out.push(__s_trim(cur));
+    return out.filter((x) => x !== '');
+  };
+  const __POS_KW = /^(left|right|top|bottom|center)$/i;
+  const __isPosLen = (t) => /^[+-]?(\d|\.\d)/.test(t) || /^calc\(/i.test(t);
+  // A background or mask position: [x, y] as written per axis (`right 5px`,
+  // `top`, `center`, `10px`), or null.
+  function __bgPos(toks) {
+    const groups = [];
+    for (let i = 0; i < toks.length; i++) {
+      const t = toks[i], low = __s_toLowerCase(t);
+      if (__POS_KW.test(low)) {
+        if (low !== 'center' && i + 1 < toks.length && __isPosLen(toks[i + 1]) && toks.length > 2) { groups.push({ kw: low, off: toks[i + 1] }); i++; }
+        else groups.push({ kw: low });
+      } else if (__isPosLen(t)) groups.push({ len: t });
+      else return null;
+    }
+    const str = (g) => (g.len != null ? g.len : g.off != null ? g.kw + ' ' + g.off : g.kw);
+    if (groups.length === 1) {
+      const g = groups[0];
+      return g.kw === 'top' || g.kw === 'bottom' ? ['center', str(g)] : [str(g), 'center'];
+    }
+    if (groups.length !== 2) return null;
+    let [a, b] = groups;
+    if (a.kw === 'top' || a.kw === 'bottom' || b.kw === 'left' || b.kw === 'right') [a, b] = [b, a];
+    return [str(a), str(b)];
+  }
+  // One axis of a position as Chrome computes it: keywords as percentages,
+  // an offset from the far edge as calc().
+  function __bgPosComputed(spec) {
+    const p = __ptCssParts(__s_trim(String(spec)));
+    const kw = __s_toLowerCase(p[0] || '');
+    if (p.length === 1) {
+      if (kw === 'left' || kw === 'top') return '0%';
+      if (kw === 'center') return '50%';
+      if (kw === 'right' || kw === 'bottom') return '100%';
+      return /^[+-]?[\d.]+$/.test(p[0]) ? p[0] + 'px' : p[0];
+    }
+    const off = p[1];
+    if (kw === 'left' || kw === 'top') return off;
+    if (/%$/.test(off)) return (100 - parseFloat(off)) + '%';
+    const n = parseFloat(off);
+    return n < 0 ? 'calc(100% + ' + __s_slice(off, 1) + ')' : 'calc(100% - ' + off + ')';
+  }
+  // One background or mask layer's parts, as written; null when it does not
+  // parse.
+  function __bgLayer(v, mask) {
+    const parts = __ptCssParts(v);
+    const toks = [];
+    for (const t of parts) {
+      if (__s_indexOf(t, '/') < 0 || __s_indexOf(t, '(') >= 0) { toks.push(t); continue; }
+      __s_split(t, '/').forEach((x, i) => { if (i) toks.push('/'); if (x) toks.push(x); });
+    }
+    const L = { image: null, x: null, y: null, pos: null, size: null, repeat: null, attachment: null, origin: null, clip: null, color: null, composite: null, mode: null };
+    const pos = [], size = [], boxes = [];
+    let slash = false;
+    for (let i = 0; i < toks.length; i++) {
+      const t = toks[i], low = __s_toLowerCase(t);
+      if (t === '/') { if (!pos.length || slash) return null; slash = true; continue; }
+      if (slash && size.length < 2 && (__isPosLen(t) || low === 'auto' || low === 'cover' || low === 'contain')) { size.push(t); continue; }
+      if (slash && size.length && !__isPosLen(t)) slash = false;
+      if (/^(url|linear-gradient|radial-gradient|conic-gradient|repeating-|image-set|-webkit-image-set|-webkit-gradient|cross-fade)/i.test(t) || low === 'none') { if (L.image != null) return null; L.image = __s_replace(t, /^url\(\s*(['"]?)(.*?)\1\s*\)$/i, (m, q, u) => 'url("' + u + '")'); }
+      else if (/^(repeat-x|repeat-y|repeat|space|round|no-repeat)$/.test(low)) L.repeat = L.repeat ? L.repeat + ' ' + low : low;
+      else if (!mask && /^(scroll|fixed|local)$/.test(low)) L.attachment = low;
+      else if (/^(border-box|padding-box|content-box|fill-box|stroke-box|view-box|no-clip|text)$/.test(low)) boxes.push(low);
+      else if (mask && /^(add|subtract|intersect|exclude)$/.test(low)) L.composite = low;
+      else if (mask && /^(alpha|luminance|match-source)$/.test(low)) L.mode = low;
+      else if (__POS_KW.test(low) || __isPosLen(t)) { if (slash) return null; pos.push(t); }
+      else if (!mask && __ptIsColour(t)) L.color = t;
+      else return null;
+    }
+    if (pos.length) {
+      const xy = __bgPos(pos);
+      if (!xy) return null;
+      [L.x, L.y] = xy;
+      L.pos = xy[0] + ' ' + xy[1];
+    }
+    if (size.length) L.size = size.length === 2 && __s_toLowerCase(size[1]) === 'auto' ? size[0] : size.join(' ');
+    if (boxes.length) { L.origin = boxes[0]; L.clip = boxes[1] || boxes[0]; }
+    return L;
+  }
   // Returns [longhand, value] pairs, or null if not a shorthand.
   const __ptExpand = (prop, value) => {
     const v = __s_trim(String(value));
@@ -15218,16 +15411,32 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
         : [p[0], p[1], p[2], p[3]];
       return corners.map((c, i) => ['border-' + c + '-radius', order[i]]);
     }
-    if (prop === 'background') {
-      let colour = null, image = null;
-      for (const t of parts) {
-        if (/^(url|linear-gradient|radial-gradient|conic-gradient|image-set)\(/i.test(t)) image = t;
-        else if (__ptIsColour(t)) colour = t;
-      }
-      if (colour) out.push(['background-color', colour]);
-      if (image) out.push(['background-image', image]);
-      if (!out.length) return [];
-      return out;
+    // `background` and `mask`: each comma-separated layer's parts, what a
+    // layer leaves out as `initial` (Chrome 151 prints it so), positions as
+    // their two halves too.
+    if (prop === 'background' || prop === 'mask' || prop === '-webkit-mask') {
+      const mask = prop !== 'background';
+      const layers = __ptCssLayers(v).map((l) => __bgLayer(l, mask));
+      if (!layers.length || layers.some((l) => !l)) return [];
+      if (layers.slice(0, -1).some((l) => l.color != null)) return [];
+      const col = (k) => layers.map((l) => (l[k] == null ? 'initial' : l[k])).join(', ');
+      const pre = mask ? 'mask-' : 'background-';
+      const px = mask ? '-webkit-mask-position-x' : 'background-position-x', py = mask ? '-webkit-mask-position-y' : 'background-position-y';
+      const out2 = [[pre + 'image', col('image')], [px, col('x')], [py, col('y')], [pre + 'position', col('pos')],
+        [pre + 'size', col('size')], [pre + 'repeat', col('repeat')]];
+      if (!mask) out2.push(['background-attachment', col('attachment')]);
+      out2.push([pre + 'origin', col('origin')], [pre + 'clip', col('clip')]);
+      if (mask) out2.push(['mask-composite', col('composite')], ['mask-mode', col('mode')]);
+      else out2.push(['background-color', layers[layers.length - 1].color == null ? 'initial' : layers[layers.length - 1].color]);
+      return out2;
+    }
+    if (prop === 'background-position' || prop === 'mask-position' || prop === '-webkit-mask-position') {
+      const layers = __ptCssLayers(v).map((l) => __bgPos(__ptCssParts(l)));
+      if (!layers.length || layers.some((l) => !l)) return [];
+      const mask = prop !== 'background-position';
+      return [[mask ? '-webkit-mask-position-x' : 'background-position-x', layers.map((l) => l[0]).join(', ')],
+        [mask ? '-webkit-mask-position-y' : 'background-position-y', layers.map((l) => l[1]).join(', ')],
+        [mask ? 'mask-position' : 'background-position', layers.map((l) => l[0] + ' ' + l[1]).join(', ')]];
     }
     if (prop === 'outline') {
       let width = 'medium', style = 'none', colour = 'currentcolor';
@@ -15580,6 +15789,34 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
           const px = (x) => (/^[-\d.]+$/.test(x) ? x + 'px' : x);
           map.set('box-shadow', [colour || map.get('color'), px(lens[0]), px(lens[1]), px(lens[2]), px(lens[3])]
             .join(' ') + (inset ? ' inset' : ''));
+        }
+      }
+      // Positions compute to percentages and calc(), their halves too;
+      // `20px auto` is `20px`.
+      for (const [pos, hx, hy] of [['background-position', 'background-position-x', 'background-position-y'],
+        ['mask-position', '-webkit-mask-position-x', '-webkit-mask-position-y']]) {
+        const raw = map.get(pos), rx = map.get(hx), ry = map.get(hy);
+        const xs = [], ys = [];
+        if (raw && raw !== '0% 0%' && __s_indexOf(raw, ',') < 0 ? true : raw && raw !== '0% 0%') {
+          for (const layer of __ptCssLayers(raw)) {
+            const xy = __bgPos(__ptCssParts(layer));
+            if (!xy) { xs.length = 0; break; }
+            xs.push(__bgPosComputed(xy[0])); ys.push(__bgPosComputed(xy[1]));
+          }
+        }
+        if (!xs.length && ((rx && rx !== '0%') || (ry && ry !== '0%'))) {
+          for (const l of __ptCssLayers(rx || '0%')) xs.push(__bgPosComputed(l));
+          for (const l of __ptCssLayers(ry || '0%')) ys.push(__bgPosComputed(l));
+        }
+        if (xs.length) {
+          map.set(pos, xs.map((x, k) => x + ' ' + (ys[k] || ys[0])).join(', '));
+          if (map.has(hx) || hx[0] === '-') { map.set(hx, xs.join(', ')); map.set(hy, ys.join(', ')); }
+        }
+      }
+      for (const k of ['background-size', 'mask-size']) {
+        const v = map.get(k);
+        if (v && __s_indexOf(v, 'auto') >= 0) {
+          map.set(k, __ptCssLayers(v).map((l) => { const p = __ptCssParts(l); return p.length === 2 && __s_toLowerCase(p[1]) === 'auto' ? p[0] : l; }).join(', '));
         }
       }
       // A line-height multiplier is printed in pixels, of the used font size
@@ -15989,9 +16226,13 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     set('background', g('background-color') + ' ' + g('background-image') + ' ' + g('background-repeat') +
       ' ' + g('background-attachment') + ' ' + g('background-position') + ' / ' + g('background-size') +
       ' ' + g('background-origin') + ' ' + g('background-clip'));
-    const bp = __s_split(g('background-position'), /\s+/);
-    set('background-position-x', bp[0] || '');
-    set('background-position-y', bp[1] || bp[0] || '');
+    for (const [pos, hx, hy] of [['background-position', 'background-position-x', 'background-position-y'],
+      ['mask-position', '-webkit-mask-position-x', '-webkit-mask-position-y']]) {
+      if (map.get(hx) && map.get(hy)) continue;
+      const ls = __ptCssLayers(g(pos)).map((l) => __ptCssParts(l));
+      set(hx, ls.map((p) => p[0] || '').join(', '));
+      set(hy, ls.map((p) => p[1] || p[0] || '').join(', '));
+    }
     set('flex', g('flex-grow') + ' ' + g('flex-shrink') + ' ' + g('flex-basis'));
     set('flex-flow', g('flex-direction') + ' ' + g('flex-wrap'));
     // Font: style, variant, weight, size/line-height, family.
