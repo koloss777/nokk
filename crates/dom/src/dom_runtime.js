@@ -565,6 +565,47 @@
     if (!best) for (const c of cands) if (!best || c[1] > best[1]) best = c;
     return best[0];
   }
+  // A data: image never reaches the network, where an image's size is read
+  // from its header: read it here (PNG, GIF, BMP, WebP, JPEG, as the
+  // fetcher does) and, with a rasterizer, hand it the bytes to draw.
+  function __dataImageMeta(url, payload, b64) {
+    if (typeof globalThis.__pt_imageMeta !== 'function' || (globalThis.__pt_imageSizeOf && __pt_imageSizeOf(url))) return;
+    let bin;
+    // The native decoder: the page's own `atob` may be anything.
+    if (b64 && typeof globalThis.__pt_atob !== 'function') return;
+    try { bin = b64 ? __pt_atob(payload) : decodeURIComponent(payload); } catch (e) { return; }
+    if (typeof bin !== 'string') return;
+    const at = (i) => (i < bin.length ? bin.charCodeAt(i) & 255 : -1);
+    const has = (i, n) => i + n <= bin.length;
+    const be16 = (i) => at(i) << 8 | at(i + 1), le16 = (i) => at(i) | at(i + 1) << 8;
+    const be32 = (i) => (at(i) * 16777216) + (at(i + 1) << 16 | at(i + 2) << 8 | at(i + 3));
+    const le32 = (i) => (at(i + 3) * 16777216) + (at(i + 2) << 16 | at(i + 1) << 8 | at(i));
+    let size = null;
+    const sig = __s_slice(bin, 0, 16);
+    if (__s_startsWith(sig, '\x89PNG\r\n\x1a\n') && __s_slice(bin, 12, 16) === 'IHDR' && has(16, 8)) size = [be32(16), be32(20)];
+    else if ((__s_startsWith(sig, 'GIF87a') || __s_startsWith(sig, 'GIF89a')) && has(6, 4)) size = [le16(6), le16(8)];
+    else if (__s_startsWith(sig, 'BM') && has(18, 8)) { const h = le32(22); size = [le32(18), h >= 2147483648 ? 4294967296 - h : h]; }
+    else if (__s_startsWith(sig, 'RIFF') && __s_slice(bin, 8, 12) === 'WEBP') {
+      const kind = __s_slice(bin, 12, 16);
+      if (kind === 'VP8 ' && has(26, 4)) size = [le16(26) & 0x3fff, le16(28) & 0x3fff];
+      else if (kind === 'VP8L' && has(21, 4)) { const b = le32(21); size = [(b & 0x3fff) + 1, ((b >>> 14) & 0x3fff) + 1]; }
+      else if (kind === 'VP8X' && has(24, 6)) size = [(at(24) | at(25) << 8 | at(26) << 16) + 1, (at(27) | at(28) << 8 | at(29) << 16) + 1];
+    } else if (at(0) === 0xff && at(1) === 0xd8) {
+      let i = 2;
+      while (i + 9 < bin.length) {
+        if (at(i) !== 0xff) { i++; continue; }
+        const m = at(i + 1);
+        if ((m >= 0xd0 && m <= 0xd9) || m === 0x01 || m === 0xff) { i += 2; continue; }
+        if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xcc) { size = [be16(i + 7), be16(i + 5)]; break; }
+        i += 2 + Math.max(2, be16(i + 2));
+      }
+    }
+    if (!size) return;
+    __pt_imageMeta(url, size[0], size[1], false);
+    if (b64 && typeof globalThis.__pt_imageBytes === 'function') {
+      try { __pt_imageBytes(url, __s_replace(payload, /[\s]/g, '')); } catch (e) {}
+    }
+  }
   function __imgCurrent(el, url, later) {
     Object.defineProperty(el, '__ptCurWant', { value: url, writable: true, configurable: true, enumerable: false });
     const put = () => { if (el.__ptCurWant === url) Object.defineProperty(el, '__ptCurSrc', { value: url, writable: true, configurable: true, enumerable: false }); };
@@ -2116,6 +2157,7 @@
               const payload = comma < 0 ? '' : __s_slice(url, comma + 1);
               const head = /;base64/.test(meta) ? globalThis.atob(__s_slice(payload, 0, 16)) : decodeURIComponent(__s_slice(payload, 0, 24));
               isImage = /^(\x89PNG|GIF8|\xff\xd8|RIFF|BM|\x00\x00\x01\x00|<svg|<\?xml)/.test(head);
+              if (isImage) __dataImageMeta(url, payload, /;base64/.test(meta));
             }
           } else if (globalThis.__pt_blobs) {
             const b = __pt_blobs.get(url);
