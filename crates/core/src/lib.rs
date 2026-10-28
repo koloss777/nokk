@@ -18040,6 +18040,48 @@ variationSettings,weight",
         );
     }
 
+    /// A canvas lays out at its bitmap size, as in Chrome 151: 300x150 with no
+    /// attributes, its width attribute as a flex item, and in quirks mode a
+    /// line holding only it has no strut below. A canvas in a flex row was 0
+    /// wide, so clicks aimed by its rect missed.
+    #[tokio::test]
+    async fn a_canvas_lays_out_at_its_bitmap_size() {
+        let _serial = serial().await;
+        let engine = Engine::new(EngineConfig::default()).expect("engine");
+        let probe = r#"(() => JSON.stringify(['a', 'd', 'f'].map((id) => { const r = document.getElementById(id).getBoundingClientRect(); return [r.y, r.width, r.height]; })))()"#;
+        let body = r#"<body style="margin:0"><canvas id="a" width="320" height="160"></canvas><div style="display:flex"><canvas id="d" width="320" height="160"></canvas></div><canvas id="f"></canvas></body>"#;
+        for (doctype, want) in [
+            ("", "[[0,320,160],[160,320,160],[320,300,150]]"),
+            ("<!doctype html>", "[[0,320,160],[164,320,160],[324,300,150]]"),
+        ] {
+            let ctx = engine.new_context().await.unwrap();
+            ctx.load_html("https://example.com/", &format!("{doctype}<html>{body}</html>")).await.unwrap();
+            assert_eq!(ctx.evaluate(probe).await.unwrap(), Value::String(want.into()), "doctype {doctype:?}");
+        }
+    }
+
+    /// A clone of a fetched response has the body too; it was empty, since
+    /// only bytes were copied and a network body is kept as text.
+    #[tokio::test]
+    async fn a_cloned_response_keeps_its_body() {
+        let _serial = serial().await;
+        let engine = Engine::new(EngineConfig::default()).expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<html><body></body></html>").await.unwrap();
+        ctx.evaluate(
+            r#"(async () => {
+                const a = new Response('hello'); const b = a.clone();
+                const c = new Response(new ReadableStream({ start(k) { k.enqueue(new TextEncoder().encode('abc')); k.close(); } })); const d = c.clone();
+                const q = new Request('https://example.com/', { method: 'POST', body: new ReadableStream({ start(k) { k.enqueue(new TextEncoder().encode('q')); k.close(); } }), duplex: 'half' });
+                const qc = q.clone();
+                globalThis.__got = [await b.text(), await a.text(), await d.text(), await c.text(), await qc.text(), await q.text()].join(); })()"#,
+        )
+        .await
+        .unwrap();
+        ctx.run_event_loop().await.unwrap();
+        assert_eq!(ctx.evaluate("globalThis.__got").await.unwrap(), Value::String("hello,hello,abc,abc,q,q".into()));
+    }
+
     /// Editing as Chrome 151 answers it: inherited from the nearest element
     /// that says, `false` stops it, an unknown value defers, designMode turns
     /// on every element. `<body>` without the attribute was editable, and

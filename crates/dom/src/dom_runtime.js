@@ -14025,7 +14025,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (tag === 'select') return { w: 28, h: 17, p: [0, 0], b: 1, m: [0, 0] };
     if (tag === 'textarea') return { w: 195, h: 36, p: [2, 2], b: 1, m: [0, 0] };
     if (tag === 'iframe') return { w: 300, h: 150, p: [0, 0], b: 2, m: [0, 0] };
-    if (tag === 'img' || tag === 'canvas' || tag === 'video') return { w: 0, h: 0, p: [0, 0], b: 0, m: [0, 0] };
+    // A canvas without width/height attributes is 300x150, as its bitmap is.
+    if (tag === 'canvas') return { w: 300, h: 150, p: [0, 0], b: 0, m: [0, 0] };
+    if (tag === 'img' || tag === 'video') return { w: 0, h: 0, p: [0, 0], b: 0, m: [0, 0] };
     return null;
   }
 
@@ -14103,6 +14105,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     };
     const w = len('width');
     if (w != null) return clamp(bbox ? w : w + pad);
+    // A replaced element is as wide as its width attribute (a canvas's bitmap).
+    if (tag === 'canvas' || tag === 'img' || tag === 'iframe' || tag === 'video') {
+      const aw = __lengthPx(__ptGetA(el, 'width'), fs, null);
+      if (aw != null) return clamp(aw + pad);
+    }
     const ua = __uaBox(el, tag);
     if (ua && ua.w != null) return clamp(ua.w + pad);
     let familyRaw = cs.get('font-family');
@@ -14169,11 +14176,19 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     let y = originY, widest = 0;
     let line = [];
     let lineW = 0;
+    const quirks = !!(globalThis.document && globalThis.document.compatMode === 'BackCompat');
+    const par = run.length ? run[0].__ptParent : null;
+    const parentText = !!(quirks && par && __s_trim(String(__OWN_TEXT(par) || '')));
     const flush = () => {
       if (!line.length) return;
       // Empty inline boxes make no line: `<span></span>` has no height.
       const solid = line.some((it) => it.atomic || it.text);
-      let asc = solid ? sAsc : 0, desc = solid ? sDesc : 0;
+      // Quirks mode: a line of atomic boxes alone (images, a canvas, an
+      // inline-block) with no text beside them has no strut, so no room below
+      // the baseline; Chrome's line is as tall as the box (160 for a 160px
+      // canvas, not 164).
+      const bare = quirks && !parentText && line.every((it) => it.atomic);
+      let asc = solid && !bare ? sAsc : 0, desc = solid && !bare ? sDesc : 0;
       for (const it of line) {
         const over = it.atomic ? it.box.h + it.mt + it.mb : (it.box.asc || sAsc);
         const under = it.atomic ? 0 : Math.max(0, (it.box.h || 0) - (it.box.asc || sAsc));

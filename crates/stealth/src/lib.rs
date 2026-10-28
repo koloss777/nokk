@@ -9879,6 +9879,13 @@ const FETCH_TEMPLATE: &str = r#"(() => {
     });
     return body.stream;
   };
+  // A body for a clone: a stream is teed (the original keeps one branch), and
+  // a network body that is still text stays text. Copying only `bytes` left a
+  // fetched response's clone empty.
+  const cloneBody = (body) => {
+    if (body.stream) { const [a, c] = body.stream.tee(); body.stream = a; return { stream: c }; }
+    return { bytes: body.bytes, text: body.text };
+  };
   const bodyUsed = (body) => { const s = body.stream && ST.get(body.stream); return !!(body.consumed || (s && s.disturbed)); };
   // A network body arrives as text when it is UTF-8: its bytes are made only
   // if someone asks for bytes or the stream.
@@ -10022,7 +10029,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       if (!st) throw __pt_mkErr(TypeError, 'Illegal invocation');
       if (bodyUsed(st.body)) throw __pt_mkErr(TypeError, "Failed to execute 'clone' on 'Request': Request body is already used");
       const c = Object.create(globalThis.Request.prototype);
-      REQ.set(c, Object.assign({}, st, { headers: new globalThis.Headers(st.headers), body: { bytes: st.body.bytes } }));
+      REQ.set(c, Object.assign({}, st, { headers: new globalThis.Headers(st.headers), body: cloneBody(st.body) }));
       return c;
     }
   };
@@ -10058,8 +10065,7 @@ const FETCH_TEMPLATE: &str = r#"(() => {
       const st = RESP.get(this);
       if (!st) throw __pt_mkErr(TypeError, 'Illegal invocation');
       if (bodyUsed(st.body) || st.body.consumed) throw __pt_mkErr(TypeError, "Failed to execute 'clone' on 'Response': Response body is already used");
-      let body = { bytes: st.body.bytes };
-      if (st.body.stream) { const [a, c] = st.body.stream.tee(); st.body.stream = a; body = { stream: c }; }
+      const body = cloneBody(st.body);
       return newResponse(Object.assign({}, st, { headers: new globalThis.Headers(st.headers), body }));
     }
     static error() { return newResponse({ type: 'error', url: '', redirected: false, status: 0, statusText: '', headers: new globalThis.Headers(), body: { bytes: null } }); }
