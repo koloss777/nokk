@@ -8958,11 +8958,12 @@ mod tests {
         .await;
 
         let sum = p["sum"].as_f64().expect("the sum is a number");
-        // Bit-exact on the kind of machine the numbers were taken from: Chrome 151 on
-        // x86_64 Linux. The compressor calls the host's libm on purpose, as Chrome does,
-        // so another libm (aarch64 glibc gives 124.04347546336066, and so does a Pi)
-        // lands an ulp off here and there, exactly as Chrome on that machine would.
-        let exact = cfg!(all(target_os = "linux", target_arch = "x86_64"));
+        // The compressor calls the host's libm on purpose, as Chrome does, so the
+        // last digits follow the libm: the reference was taken with glibc 2.36 on
+        // x86_64; aarch64 glibc gives 124.04347546336066, and GitHub's newer runner
+        // image 124.04347544345364, exactly as Chrome on those machines would.
+        // NOKK_AUDIO_EXACT=1 checks the reference to the last bit on its machine.
+        let exact = std::env::var_os("NOKK_AUDIO_EXACT").is_some();
         let tolerance = if exact { 1e-12 } else { 1e-6 };
         assert!(
             (sum - 124.04347527516074).abs() < tolerance,
