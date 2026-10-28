@@ -311,8 +311,11 @@ fn draw_with_layers(data: &mut [u8], w: u32, h: u32, path: &Path, ctm: &Matrix, 
     if !path.is_finite() {
         return true;
     }
-    // Hairline: coverage folds into the paint alpha.
-    let mut alpha: u8 = 255;
+    // The paint's alpha is its colour's; a hairline's coverage folds into it.
+    let mut alpha: u8 = match paint {
+        PaintKind::Solid(c) => c[3],
+        PaintKind::Gradient(_) => 255,
+    };
     let style = match line_width {
         None => match rect {
             Some(r) => Style::Rect(r),
@@ -325,7 +328,7 @@ fn draw_with_layers(data: &mut [u8], w: u32, h: u32, path: &Path, ctm: &Matrix, 
                     return false;
                 }
                 let scale = (coverage * 256.0) as i32;
-                alpha = ((255 * scale) >> 8) as u8;
+                alpha = ((alpha as i32 * scale) >> 8) as u8;
             }
             Style::Hairline { coverage }
         }
@@ -777,6 +780,20 @@ mod tests {
         let mut data = vec![0u8; (w * h * 4) as usize];
         fill_ops(&mut data, w, h, &ops, [0.384, 0.0, 0.0, 0.384, 0.0, 0.0], false, [128, 153, 0, 255], 0);
         assert_eq!(data[((38 * w) * 4 + 3) as usize], 128);
+    }
+
+    // A fill colour's alpha is the paint's: half-transparent red is 128
+    // premultiplied, a transparent one draws nothing (it was drawn opaque).
+    #[test]
+    fn a_fill_keeps_its_colour_alpha() {
+        let (w, h) = (4u32, 4u32);
+        let ops = [OP_RECT as f32, 0.0, 0.0, 4.0, 4.0];
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        fill_ops(&mut data, w, h, &ops, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], false, [255, 0, 0, 128], 0);
+        assert_eq!(&data[20..24], &[128, 0, 0, 128]);
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        fill_ops(&mut data, w, h, &ops, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], false, [255, 0, 0, 0], 0);
+        assert_eq!(&data[20..24], &[0, 0, 0, 0]);
     }
 
     #[test]
