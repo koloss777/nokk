@@ -13473,6 +13473,18 @@ href|http://www.w3.org/1999/xlink href|http://www.w3.org/1999/xlink".into()));
         assert_eq!(out, Value::String("0 1 null".into()));
     }
 
+    /// A declaration with a `!` left once `!important` is cut is invalid and
+    /// dropped, in a sheet and in a style attribute (Chrome 151).
+    #[tokio::test]
+    async fn a_stray_bang_drops_the_declaration() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html("https://example.com/", "<!doctype html><style>.m2{margin-left:7px !important !important}.m4{quotes:'!' '!';margin-left:1px}</style><div id=m1 style=\"margin-left:5px !important !important\"></div><div id=m2 class=m2></div><div id=m4 class=m4></div>").await.unwrap();
+        let out = ctx.evaluate(r#"['m1', 'm2', 'm4'].map((i) => getComputedStyle(document.getElementById(i)).marginLeft).join(' ')"#).await.unwrap();
+        assert_eq!(out, Value::String("0px 0px 1px".into()));
+    }
+
     /// Media queries and @supports answer as in Chrome 151 (values measured
     /// there): media types, `not`/`only`, `and`/`or`, ranges, calc(), em,
     /// resolutions and boolean features; the text prints as Chrome prints it;

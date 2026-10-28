@@ -4889,6 +4889,7 @@
         let raw = __s_slice(decl, colon + 1);
         const im = /!\s*important\s*$/i.exec(raw);
         if (im) raw = __s_slice(raw, 0, im.index);
+        if (__cssStrayBang(prop, raw)) continue;
         // A later normal declaration does not undo an earlier important one.
         if (!im && map.__ptImp && map.__ptImp.has(prop)) continue;
         map.delete(prop);
@@ -5001,6 +5002,12 @@
     if (!m.__ptImp) { try { Object.defineProperty(m, '__ptImp', { value: new Set(), enumerable: false, configurable: true }); } catch (e) { return new Set(); } }
     return m.__ptImp;
   };
+  // A `!` left in a value once `!important` is cut (`0 !important
+  // !important`) makes the declaration invalid; quoted text may hold one.
+  function __cssStrayBang(prop, v) {
+    if (__s_indexOf(v, '!') < 0 || __s_startsWith(prop, '--')) return false;
+    return __s_indexOf(__s_replace(v, /"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'/g, ''), '!') >= 0;
+  }
   const __cssImportantIn = (v) => typeof v === 'string' && /!\s*important\s*$/i.test(v);
   // The exact value is kept next to the printed one: Chrome stores the parsed
   // number and only prints six digits. Layout and text scaling use the exact
@@ -5911,6 +5918,7 @@
       let v = __s_trim(__s_slice(part, i + 1));
       const im = /!\s*important\s*$/i.exec(v);
       if (im) v = __s_trim(__s_slice(v, 0, im.index));
+      if (__cssStrayBang(k, v)) continue;
       if (k) { m.set(k, v); if (im) __cssImp(m).add(k); }
     }
     return m;
