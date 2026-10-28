@@ -8972,11 +8972,12 @@ mod tests {
         // The joined length reads every one of the 44100 samples' decimal
         // digits. The compressor calls the machine's libm for log10f/powf —
         // on purpose (see crates/pool/src/compressor.rs): nokk matches the
-        // Chrome of the machine it runs on. On anything but the Linux box the
-        // constants were recorded on, a few samples land one ulp off and spell
-        // one character longer, so that exact length holds on Linux only.
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        assert_eq!(p["joined"], 882861, "joined samples length: {p}");
+        // Chrome of the machine it runs on. On any other libm a few samples
+        // land one ulp off and spell longer or shorter, so the exact length is
+        // checked on the reference machine only (NOKK_AUDIO_EXACT).
+        if exact {
+            assert_eq!(p["joined"], 882861, "joined samples length: {p}");
+        }
         let mid: Vec<f64> = p["mid"]
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
@@ -8984,7 +8985,7 @@ mod tests {
         let chrome = [-0.10808052122592926, -0.3909117579460144, -0.005692707374691963, 0.3892313539981842];
         assert_eq!(mid.len(), 4, "four samples: {p}");
         for (got, want) in mid.iter().zip(chrome) {
-            assert!((got - want).abs() < tolerance, "samples bit for bit on x86_64 Linux: {p}");
+            assert!((got - want).abs() < tolerance, "samples as Chrome's: {p}");
         }
         // Live context: card rate, buffer latency, suspended until a gesture.
         assert_eq!(p["rate"], 48000);
