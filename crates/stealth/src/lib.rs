@@ -3318,9 +3318,25 @@ const SHAPE_FIXES: &str = r#"(() => {
     const natp = (f, n) => { try { Object.defineProperty(f, 'name', { value: n, configurable: true }); } catch (e) {} return globalThis.__pt_native ? __pt_native(f) : f; };
     const pm = function postMessage(message, targetOrigin) {
       if (arguments.length < 1) throw __pt_mkErr(TypeError, "Failed to execute 'postMessage' on 'Window': 1 argument required, but only 0 present.");
-      let origin = '*';
-      if (targetOrigin && typeof targetOrigin === 'object') { if (targetOrigin.targetOrigin !== undefined) origin = String(targetOrigin.targetOrigin); }
-      else if (targetOrigin !== undefined) origin = String(targetOrigin);
+      let origin = '*', transfer = null;
+      if (targetOrigin && typeof targetOrigin === 'object') {
+        if (targetOrigin.targetOrigin !== undefined) origin = String(targetOrigin.targetOrigin);
+        if (targetOrigin.transfer != null) transfer = targetOrigin.transfer;
+      } else {
+        if (targetOrigin !== undefined) origin = String(targetOrigin);
+        if (arguments.length > 2 && arguments[2] != null) transfer = arguments[2];
+      }
+      // Ports in the transfer list arrive as `event.ports`: a same-origin
+      // frame hands its parent a MessageChannel port this way, and the page
+      // talks to the frame over it (dropping it left a widget waiting for
+      // a handshake that never came).
+      let list = [];
+      if (transfer != null) {
+        try { list = Array.from(transfer); }
+        catch (e) { throw __pt_mkErr(TypeError, "Failed to execute 'postMessage' on 'Window': The provided value cannot be converted to a sequence."); }
+      }
+      const isPort = (x) => !!(x && typeof x === 'object' && x.__pt && typeof x.__pt === 'object' && 'peer' in x.__pt);
+      const ports = Object.freeze(list.filter(isPort));
       const mine = (globalThis.location && location.origin) || 'null';
       // The window whose script called: a same-origin frame posting to its
       // parent is the message's source and origin, as in Chrome.
@@ -3328,6 +3344,8 @@ const SHAPE_FIXES: &str = r#"(() => {
       try { const c = typeof __pt_callerWindow === 'function' ? __pt_callerWindow() : null; if (c) from = c; } catch (e) {}
       let fromOrigin = mine;
       try { if (from !== globalThis) fromOrigin = from.location.origin; } catch (e) {}
+      // A joined frame is known here by its WindowProxy (the iframe's contentWindow).
+      try { if (from !== globalThis && typeof __pt_windowProxyOf === 'function') from = __pt_windowProxyOf(from); } catch (e) {}
       if (origin !== '*' && origin !== '/') {
         let ok = false;
         try { ok = new URL(origin).origin === mine; } catch (e) {
@@ -3335,10 +3353,10 @@ const SHAPE_FIXES: &str = r#"(() => {
         }
         if (!ok) return;
       }
-      const data = typeof structuredClone === 'function' ? structuredClone(message) : message;
+      const data = typeof structuredClone === 'function' ? structuredClone(message, { transfer: list.filter((x) => !isPort(x)) }) : message;
       const deliver = () => {
         let ev;
-        try { ev = new MessageEvent('message', { data, origin: fromOrigin, lastEventId: '', source: from, ports: [] }); } catch (e) { return; }
+        try { ev = new MessageEvent('message', { data, origin: fromOrigin, lastEventId: '', source: from, ports }); } catch (e) { return; }
         try { if (globalThis.__pt_trustEvent) __pt_trustEvent(ev); } catch (e) {}
         try { globalThis.dispatchEvent(ev); } catch (e) {}
       };

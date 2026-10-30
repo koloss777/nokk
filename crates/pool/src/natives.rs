@@ -2580,12 +2580,84 @@ fn named_props_definer<'s>(
     v8::Intercepted::kYes
 }
 
+/// A named property of WindowProperties: a child frame reached by its name
+/// (`window[name]`, `parent.frames[name]`). The window's own page answers
+/// through `__pt_namedWindowProp`; non-masking, so only names nothing else on
+/// the chain defines get here, as in Chrome.
+fn named_window_prop<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    key: v8::Local<'s, v8::Name>,
+    holder: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    // Every missing name on a window comes through here (the engine itself
+    // asks `typeof globalThis.__pt_x` all the time), so first the page's map
+    // of named frames: two property reads, no call, for any other name.
+    let ctx = holder.get_creation_context(scope)?;
+    let global = ctx.global(scope);
+    // Own properties only: a plain get of a name the window lacks walks the
+    // chain back into this interceptor.
+    let own = |scope: &mut v8::PinScope<'s, '_>, name: &str| -> Option<v8::Local<'s, v8::Value>> {
+        let k = v8::String::new(scope, name)?;
+        if !global.has_own_property(scope, k.into())? {
+            return None;
+        }
+        global.get(scope, k.into())
+    };
+    let map = v8::Local::<v8::Object>::try_from(own(scope, "__pt_frameNameMap")?).ok()?;
+    if !map.get(scope, key.into())?.is_true() {
+        return None;
+    }
+    let tag = v8::Symbol::get_to_string_tag(scope);
+    let is_wp = holder
+        .get(scope, tag.into())
+        .is_some_and(|v| v.is_string() && v.to_rust_string_lossy(scope) == "WindowProperties");
+    if !is_wp {
+        return None;
+    }
+    let f = v8::Local::<v8::Function>::try_from(own(scope, "__pt_namedWindowProp")?).ok()?;
+    let v = f.call(scope, global.into(), &[key.into()])?;
+    (!v.is_undefined()).then_some(v)
+}
+
+fn named_props_getter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    key: v8::Local<'s, v8::Name>,
+    args: v8::PropertyCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<v8::Value>,
+) -> v8::Intercepted {
+    match named_window_prop(scope, key, args.holder()) {
+        Some(v) => {
+            rv.set(v);
+            v8::Intercepted::kYes
+        }
+        None => v8::Intercepted::kNo,
+    }
+}
+
+fn named_props_query<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    key: v8::Local<'s, v8::Name>,
+    args: v8::PropertyCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<v8::Integer>,
+) -> v8::Intercepted {
+    if named_window_prop(scope, key, args.holder()).is_none() {
+        return v8::Intercepted::kNo;
+    }
+    // DontEnum: a frame name is no enumerable member of the window.
+    rv.set_int32(v8::PropertyAttribute::DONT_ENUM.as_u32() as i32);
+    v8::Intercepted::kYes
+}
+
 fn build_proto_templates(scope: &mut v8::PinScope<'_, '_, ()>) -> ProtoTemplates {
     use v8::MapFnTo;
     let ctor: v8::FunctionCallback = template_ctor.map_fn_to();
     note_ref(ctor as usize);
     let definer: v8::NamedPropertyDefinerCallback = named_props_definer.map_fn_to();
     note_ref(definer as usize);
+    let getter: v8::NamedPropertyGetterCallback = named_props_getter.map_fn_to();
+    note_ref(getter as usize);
+    let query: v8::NamedPropertyQueryCallback = named_props_query.map_fn_to();
+    note_ref(query as usize);
     let et = v8::FunctionTemplate::new_raw(scope, ctor);
     et.prototype_template(scope).set_immutable_proto();
     let wp = v8::FunctionTemplate::new_raw(scope, ctor);
@@ -2594,6 +2666,8 @@ fn build_proto_templates(scope: &mut v8::PinScope<'_, '_, ()>) -> ProtoTemplates
     wpt.set_immutable_proto();
     wpt.set_named_property_handler(
         v8::NamedPropertyHandlerConfiguration::new()
+            .getter_raw(getter)
+            .query_raw(query)
             .definer_raw(definer)
             .flags(v8::PropertyHandlerFlags::ONLY_INTERCEPT_STRINGS | v8::PropertyHandlerFlags::NON_MASKING),
     );

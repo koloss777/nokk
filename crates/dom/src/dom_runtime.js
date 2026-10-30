@@ -2686,7 +2686,7 @@
       // at first, and navigates afterwards). Waiting for the load was enough to
       // make widgets that poll this synchronously give up and start over.
       const st = __frames.get(this.__ptFrameId);
-      if (st) return st.real || st.win;
+      if (st) return __ptFrameView(st);
       return this.__ptRealmWindow();
     }
     get contentDocument() {
@@ -9114,6 +9114,19 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       return i >= 0 && i < els.length ? windowOf(els[i]) : undefined;
     };
     let __slots = 0;
+    // A frame is reachable by its name too, `window[name]` and `frames[name]`
+    // (a widget finds its sibling frame this way through `parent.frames`).
+    // WindowProperties asks here for names nothing else defines; the first
+    // frame of a name wins, as in Chrome.
+    // The names WindowProperties may answer for, kept in step with the frames:
+    // the engine reads it before calling the lookup below.
+    const __nameMap = Object.create(null);
+    try { Object.defineProperty(globalThis, '__pt_frameNameMap', { value: __nameMap, enumerable: false, configurable: true, writable: false }); } catch (e) {}
+    globalThis.__pt_namedWindowProp = (name) => {
+      if (typeof name !== 'string' || !name) return undefined;
+      for (const el of frameEls()) if (__ptGetA(el, 'name') === name) return windowOf(el) || undefined;
+      return undefined;
+    };
     const __syncSlots = () => {
       const n = frameEls().length;
       for (let i = 0; i < n; i++) {
@@ -9126,6 +9139,8 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       }
       for (let i = n; i < __slots; i++) { try { delete globalThis[String(i)]; } catch (e) {} }
       __slots = n;
+      for (const k in __nameMap) delete __nameMap[k];
+      for (const el of frameEls()) { const nm = __ptGetA(el, 'name'); if (nm) __nameMap[nm] = true; }
     };
     globalThis.__pt_syncFrameSlots = __syncSlots;
     __syncSlots();
@@ -10826,41 +10841,80 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (w) return w;
       throw blocked(isIndex(k) ? "Failed to read an indexed property [" + k + "] from 'Window'" : named(k));
     };
-    return __ptProxy({}, {
-      get(t, k) { return opts.restricted() ? read(k) : base[k]; },
+    // Joined to a same-origin frame (`opts.real()` gives its window), the
+    // proxy is that frame's WindowProxy: the same object from the frame's
+    // first moment, reaching whatever window the frame has now. A method read
+    // through it runs on the real window.
+    const bound = new WeakMap();
+    let px = null;
+    const viaReal = (w, k) => {
+      const v = Reflect.get(w, k);
+      if (typeof v !== 'function') return v;
+      let f = bound.get(v);
+      if (!f) { f = function () { return Reflect.apply(v, this === px ? w : this, arguments); }; bound.set(v, f); }
+      return f;
+    };
+    const real = () => (opts.real ? opts.real() : null);
+    px = __ptProxy({}, {
+      get(t, k) { const w = real(); if (w) return viaReal(w, k); return opts.restricted() ? read(k) : base[k]; },
       set(t, k, v) {
+        const w = real(); if (w) return Reflect.set(w, k, v);
         if (!opts.restricted()) { base[k] = v; return true; }
         if (k === 'location') return true;
         throw blocked("Failed to set a named property '" + String(k) + "' on 'Window'");
       },
       has(t, k) {
+        const w = real(); if (w) return k in w;
         if (!opts.restricted()) return k in base;
         return (typeof k === 'string' && __xoAllowed.has(k)) || child(k) !== undefined;
       },
-      getPrototypeOf() { return opts.restricted() ? null : Object.getPrototypeOf(base); },
+      getPrototypeOf() { const w = real(); if (w) return Object.getPrototypeOf(w); return opts.restricted() ? null : Object.getPrototypeOf(base); },
       ownKeys() {
+        const w = real(); if (w) return Reflect.ownKeys(w);
         if (!opts.restricted()) return Reflect.ownKeys(base);
         const n = opts.length ? opts.length() : 0, out = [];
         for (let i = 0; i < n; i++) out.push(String(i));
         return out;
       },
       getOwnPropertyDescriptor(t, k) {
+        const w = real();
+        // Reported configurable: the proxy's own target holds none of them.
+        if (w) { const d = Reflect.getOwnPropertyDescriptor(w, k); if (d) d.configurable = true; return d; }
         if (!opts.restricted()) return Reflect.getOwnPropertyDescriptor(base, k);
         return { value: read(k), writable: false, enumerable: isIndex(k), configurable: true };
       },
-      defineProperty(t, k) {
+      defineProperty(t, k, d) {
+        const w = real(); if (w) return Reflect.defineProperty(w, k, d);
         if (!opts.restricted()) return false;
         throw blocked("Failed to set a named property '" + String(k) + "' on 'Window'");
       },
       deleteProperty(t, k) {
+        const w = real(); if (w) return Reflect.deleteProperty(w, k);
         if (!opts.restricted()) return delete base[k];
         throw blocked("Failed to delete a named property '" + String(k) + "' from 'Window'");
       },
     });
+    return px;
   }
   const __frameWindow = (id, st) => __ptCrossWindow(__frameWindowBase(id, st), {
     restricted: () => st.ready && !st.sameOrigin && !st.real,
+    real: () => st.real || null,
   });
+  // A joined frame's window as the caller sees it: the frame itself gets its
+  // own window back (`parent[name] === window`), anyone else the WindowProxy.
+  // In Chrome both are one object; here they are two.
+  function __ptFrameView(st) {
+    if (st.real && typeof globalThis.__pt_callerWindow === 'function') {
+      try { if (globalThis.__pt_callerWindow() === st.real) return st.real; } catch (e) {}
+    }
+    return st.win;
+  }
+  // The WindowProxy the page knows a joined frame's window by: a message
+  // from the frame names it as `source`, so `e.source === iframe.contentWindow`.
+  globalThis.__pt_windowProxyOf = (w) => {
+    for (const st of __frames.values()) if (st.real && st.real === w) return st.win;
+    return w;
+  };
   const __frameWindowBase = (id, st) => ({
     postMessage: (data, targetOrigin, transfer) => {
       const origin = (targetOrigin && typeof targetOrigin === 'object') ? targetOrigin.targetOrigin : targetOrigin;

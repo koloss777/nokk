@@ -3131,7 +3131,7 @@ mod tests {
                     let mut buf = [0u8; 2048];
                     let n = stream.read(&mut buf).await.unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]);
-                    let body = if req.starts_with("GET /f") { "<html><body><b>x</b></body></html>" } else { r#"<html><body><iframe src="/f"></iframe></body></html>"# };
+                    let body = if req.starts_with("GET /f") { "<html><body><b>x</b></body></html>" } else { r#"<html><body><iframe name="nf" src="/f"></iframe></body></html>"# };
                     let out = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                     let _ = stream.write_all(out.as_bytes()).await;
                 });
@@ -3187,6 +3187,19 @@ mod tests {
         assert_eq!(v["result"]["value"], json!("x,true,true"), "{v}");
         let v = frame_eval(&ctx, frame, &dev_value("[frameElement.tagName, frameElement.ownerDocument === parent.document, parent === top].join()"), true, false).await;
         assert_eq!(v["result"]["value"], json!("IFRAME,true,true"), "{v}");
+        // A named frame is reachable by its name, below the window's own
+        // members and out of Object.keys, and sees itself there.
+        let v = remote_eval(&ctx, &dev_value("(() => { const f = document.querySelector('iframe'); return [window.nf === f.contentWindow, frames.nf === f.contentWindow, 'nf' in window, Object.keys(window).includes('nf')].join(); })()"), true, false).await;
+        assert_eq!(v["result"]["value"], json!("true,true,true,false"), "{v}");
+        let v = frame_eval(&ctx, frame, &dev_value("parent.nf === window"), true, false).await;
+        assert_eq!(v["result"]["value"], json!(true), "{v}");
+        // A port in the transfer list arrives as event.ports and carries the reply.
+        remote_eval(&ctx, &dev_value("addEventListener('message', (e) => { if (e.ports.length) e.ports[0].postMessage('pong'); })"), true, false).await;
+        frame_eval(&ctx, frame, &dev_value("(() => { const ch = new MessageChannel(); ch.port1.onmessage = (m) => { globalThis.reply = m.data; }; parent.postMessage('ping', '*', [ch.port2]); })()"), true, false).await;
+        for _ in 0..5 {
+            ctx.run_event_loop().await.unwrap();
+        }
+        assert_eq!(frame_eval(&ctx, frame, &dev_value("globalThis.reply"), true, false).await["result"]["value"], json!("pong"));
         // A frame posting to its parent is the message's source.
         remote_eval(&ctx, &dev_value("addEventListener('message', (e) => { globalThis.got = [e.data, e.source === document.querySelector('iframe').contentWindow].join(); })"), true, false).await;
         frame_eval(&ctx, frame, &dev_value("parent.postMessage('up', '*')"), true, false).await;
