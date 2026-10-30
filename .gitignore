@@ -17,3 +17,9 @@ CLAUDE.md
 
 # Local measurement traces (Chrome and nokk captures), kept out of the repository
 .nokk-notes/
+# Local probes and captures, not part of the project
+doc.html
+chrome_gl.json
+glcmp.js
+tools/chrome-compare.js
+tools/netwatch.js

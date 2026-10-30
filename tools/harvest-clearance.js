@@ -11,8 +11,8 @@
 // page itself with it.
 //
 // The browser is headed (DISPLAY=:0): headless does noticeably worse on the
-// managed challenge. Nothing is injected into the page, only network and the
-// cookie list, as in `netwatch.js`.
+// managed challenge. Nothing is injected into the page: only the network and
+// the cookie list are read.
 //
 // Then hand the clearance to the engine:
 //

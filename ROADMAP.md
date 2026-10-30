@@ -45,7 +45,7 @@ pass on every run.
   rules, error stacks, the widget's layout and the click's coordinates, and
   resource timing that hides cross-origin detail without `Timing-Allow-Origin`.
 - ⬜ Other vendors: DataDome is recognised (`challengeState` names it) but not
-  solved; hCaptcha / reCAPTCHA are out of scope.
+  solved; other widgets get at most their checkbox pressed.
 
 ## Near-term: fingerprint hardening (Phase 6)
 

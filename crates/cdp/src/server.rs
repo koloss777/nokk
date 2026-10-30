@@ -3091,7 +3091,7 @@ mod tests {
             .is_none());
         assert!(super::parse_proxy_server("ftp://h:1").is_none());
         assert!(super::parse_proxy_server("no-port").is_none());
-        assert_eq!(super::parse_proxy_server("http://p.webshare.io:80/").unwrap().port, 80);
+        assert_eq!(super::parse_proxy_server("http://proxy.example.net:80/").unwrap().port, 80);
     }
 
     /// DevTools evaluation is not the page's code: Chrome runs it under any CSP.

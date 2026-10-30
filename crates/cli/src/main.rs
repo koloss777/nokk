@@ -637,8 +637,8 @@ async fn real_main() -> Result<()> {
                           } catch (e) {}
                         }
                         // Size oracle: which program came back for the first POST and what the
-                        // report got. Decrypted length, not compressed; compare with Chrome via
-                        // `tools/netwatch.js`.
+                        // report got. Decrypted length, not compressed; compare with Chrome's
+                        // run on the same address.
                         // Mark in the probe feed: everything read before it went into the first
                         // POST body.
                         if (/\/cdn-cgi\/challenge-platform\//.test(this.__ptU || '') && b && b.length > 1000
@@ -1115,8 +1115,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     &std::env::var("NOKK_ENC_MIN").unwrap_or_else(|_| "30".into()),
                 );
                 // Which piece to dump whole: `NOKK_DUMP_ENC=30000-32000`. Defaults to the
-                // audio block. Set the same range for Chrome via `DUMPENC` in
-                // `chrome-compare`.
+                // audio block. Use the same range for the Chrome run it is compared with.
                 let window = std::env::var("NOKK_DUMP_ENC").unwrap_or_else(|_| "15000-16000".into());
                 let (lo, hi) = window.split_once('-').unwrap_or(("15000", "16000"));
                 let probe = probe.replace("__DUMPLO__", lo.trim()).replace("__DUMPHI__", hi.trim());
@@ -1820,8 +1819,8 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                           }
                           let host = '?';
                           try { host = location.host.slice(0, 12); } catch (e) {}
-                          // Join sequence: same feed as chrome-compare prints ([j n host length
-                          // separator]); shows what was joined in what order and which join we lack.
+                          // Join sequence ([j n host length separator]): what was joined in what
+                          // order, to put beside a Chrome run and find the join we lack.
                           if (n < 40) {
                             try {
                               console.error('[j ' + n + ' ' + host + ' ' + out.length + ' ' +
@@ -2987,7 +2986,7 @@ mod tests {
         // No default-port inference — the proxy port must be given.
         assert!(parse_proxy("http://host.example").is_none());
         // Written out, the scheme's default port counts (`url` hides it).
-        assert_eq!(parse_proxy("http://u:p@p.webshare.io:80").expect(":80").port, 80);
+        assert_eq!(parse_proxy("http://u:p@proxy.example.net:80").expect(":80").port, 80);
         assert_eq!(parse_proxy("https://h.example:443/").expect(":443").port, 443);
         assert!(parse_proxy("http://h.example:8080").is_some());
     }
