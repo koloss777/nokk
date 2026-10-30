@@ -2660,7 +2660,7 @@ impl BrowserContext {
                 }
                 for (info, handle) in out {
                     tracing::debug!(target: "nokk::load", url = %info.url, "slow request left in flight");
-                    let doc = Some(self.doc_seq.load(std::sync::atomic::Ordering::Acquire));
+                    let doc = Some(self.doc_gen.load(std::sync::atomic::Ordering::Acquire));
                     if let Ok(mut v) = self.inflight.lock() {
                         v.push(InFlight { deliver: Deliver::Frame(index), info, handle, doc });
                     }
@@ -2769,6 +2769,12 @@ impl BrowserContext {
             // now". Wait briefly for a frame rather than spinning, and still return
             // promptly: continuous delivery is the caller's job (the CDP server
             // pumps periodically), not this call's.
+            // A request still out is unfinished work too: its answer is settled
+            // by a later round, and a driver that pumps only while there is
+            // work never delivered it.
+            if self.inflight.lock().is_ok_and(|v| !v.is_empty()) {
+                break;
+            }
             if !self.has_open_sockets().await {
                 self.work_left.store(false, std::sync::atomic::Ordering::Release);
                 break;
@@ -5441,7 +5447,7 @@ impl BrowserContext {
             Ok(Value::String(q)) => serde_json::from_str(&q).unwrap_or_default(),
             _ => return,
         };
-        let doc = Some(self.doc_seq.load(std::sync::atomic::Ordering::Acquire));
+        let doc = Some(self.doc_gen.load(std::sync::atomic::Ordering::Acquire));
         for r in &reqs {
             match self.prepare_fetch(index, base, r) {
                 Prepared::Settled(js) => {
@@ -5475,7 +5481,11 @@ impl BrowserContext {
             Err(_) => Vec::new(),
         };
         let mut n = 0;
-        let doc_now = self.doc_seq.load(std::sync::atomic::Ordering::Acquire);
+        // The document a request was made by: `doc_gen` moves when a new one
+        // starts. `doc_seq` moves when one finishes loading, so a request made
+        // during the load and answered after it was dropped as another
+        // document's (Tilda's feeds stayed on their preloader).
+        let doc_now = self.doc_gen.load(std::sync::atomic::Ordering::Acquire);
         for f in done {
             if f.doc.is_some_and(|d| d != doc_now) {
                 continue;
@@ -13265,6 +13275,60 @@ href|http://www.w3.org/1999/xlink href|http://www.w3.org/1999/xlink".into()));
         }
         assert_eq!(ctx.evaluate("document.title").await.unwrap(), Value::String("async;timer;".into()));
         assert!(t.elapsed() < std::time::Duration::from_secs(8), "took {:?}", t.elapsed());
+    }
+
+    /// A request the page made while loading (from a timer, while the parser
+    /// waits for a stylesheet) and answered after the load still reaches the page, and the page counts as having work until it
+    /// does: a driver pumping only when `has_work_left` delivered nothing, and
+    /// the answer was dropped as another document's (Tilda's feeds).
+    #[tokio::test]
+    async fn a_late_answer_reaches_the_page_after_its_load() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let (ctype, body) = if req.contains("GET /slow") {
+                        tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+                        ("text/plain", "late")
+                    } else if req.contains("GET /s.css") {
+                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                        ("text/css", "p{}")
+                    } else {
+                        ("text/html", "<html><head><title></title><script>setTimeout(() => { const x = new XMLHttpRequest(); x.open('GET', '/slow'); x.onload = () => { document.title = 'got ' + x.responseText; }; x.send(); }, 50);</script><link rel=stylesheet href=/s.css><script>1</script></head><body></body></html>")
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&format!("http://127.0.0.1:{}/", addr.port())).await.unwrap();
+        let t = std::time::Instant::now();
+        while t.elapsed() < std::time::Duration::from_secs(8)
+            && ctx.evaluate("document.title").await.unwrap_or_default() != Value::String("got late".into())
+        {
+            if ctx.has_work_left() || ctx.timer_due() {
+                let _ = ctx.run_event_loop().await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        assert_eq!(ctx.evaluate("document.title").await.unwrap(), Value::String("got late".into()));
     }
 
     /// A press in a frame answers on time though what it set off is slow: a
