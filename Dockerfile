@@ -15,6 +15,9 @@ COPY . .
 
 # Build just the binary. The first build compiles BoringSSL (~45s) and downloads
 # the prebuilt V8 static library, then links a release binary (stripped).
+# Release version for `nokk --version`, from the tag (empty in a local build).
+ARG NOKK_VERSION=
+ENV NOKK_VERSION=$NOKK_VERSION
 RUN cargo build --release --bin nokk
 
 # ---- build stage: render variant ----------------------------------------------

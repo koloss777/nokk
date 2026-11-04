@@ -22,6 +22,10 @@ jobs:
         with:
           fetch-depth: 0   # annotated tag objects, for the release notes below
 
+      - name: Version from the tag
+        if: github.ref_type == 'tag'
+        run: echo "NOKK_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
       # What actually changed in *this* release comes from the tag's own
       # annotation (`git tag -a v0.1.23-alpha -m '…'`), so the notes are written
       # once, at the moment of tagging, by whoever knows what shipped — instead of
@@ -46,7 +50,7 @@ jobs:
       # while a build step installs fine (the image job builds the same way).
       - name: Build (Debian bullseye — broad glibc floor ~2.30)
         run: |
-          docker build -f .github/bullseye-build.Dockerfile --target bin-out \
+          docker build -f .github/bullseye-build.Dockerfile --target bin-out --build-arg NOKK_VERSION \
             --output type=local,dest=out/bin .
           tar -czf "nokk-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" -C out/bin nokk
 
@@ -57,7 +61,7 @@ jobs:
       # after the first, so the build reuses that target dir.
       - name: Build render variant (--features render,webgl)
         run: |
-          docker build -f .github/bullseye-build.Dockerfile --target bin-render-out \
+          docker build -f .github/bullseye-build.Dockerfile --target bin-render-out --build-arg NOKK_VERSION \
             --output type=local,dest=out/render .
           tar -czf "nokk-render-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" -C out/render nokk
 
@@ -110,10 +114,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Version from the tag
+        if: github.ref_type == 'tag'
+        run: echo "NOKK_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
       - name: Build (Debian bullseye, as the x86 binary)
         if: runner.os == 'Linux'
         run: |
-          docker build -f .github/bullseye-build.Dockerfile --target bin-out --output type=local,dest=out .
+          docker build -f .github/bullseye-build.Dockerfile --target bin-out --build-arg NOKK_VERSION --output type=local,dest=out .
           tar -czf "nokk-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" -C out nokk
 
       - uses: dtolnay/rust-toolchain@stable
@@ -159,6 +167,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Version from the tag
+        if: github.ref_type == 'tag'
+        run: echo "NOKK_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
@@ -184,6 +196,7 @@ jobs:
         with:
           context: .
           target: distroless
+          build-args: NOKK_VERSION=${{ env.NOKK_VERSION }}
           push: true
           tags: ${{ steps.meta_distroless.outputs.tags }}
           labels: ${{ steps.meta_distroless.outputs.labels }}
@@ -196,6 +209,7 @@ jobs:
         with:
           context: .
           target: debian
+          build-args: NOKK_VERSION=${{ env.NOKK_VERSION }}
           push: true
           tags: |
             ghcr.io/${{ github.repository }}:debian
@@ -210,6 +224,7 @@ jobs:
         with:
           context: .
           target: render
+          build-args: NOKK_VERSION=${{ env.NOKK_VERSION }}
           push: true
           tags: |
             ghcr.io/${{ github.repository }}:render

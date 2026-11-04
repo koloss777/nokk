@@ -32,6 +32,7 @@ jobs:
           PEP="${RAW/-alpha/a1}"; PEP="${PEP/-beta/b1}"; PEP="${PEP/-rc./rc}"
           echo "wheel version: $PEP"
           sed -i "s/^version = \".*\"/version = \"$PEP\"/" python/pyproject.toml
+          echo "NOKK_VERSION=$RAW" >> "$GITHUB_ENV"
 
       # Build in Debian 11 (bullseye, glibc 2.31) so the embedded binary runs on a
       # broad range of Linux (RHEL/Alma 9, Ubuntu 20.04+, Debian 11+) — matching the
@@ -41,7 +42,7 @@ jobs:
       # The context carries the pyproject.toml edited above.
       - name: Build wheel (Debian bullseye — broad glibc floor ~2.30)
         run: |
-          docker build -f .github/bullseye-build.Dockerfile --target wheel-out \
+          docker build -f .github/bullseye-build.Dockerfile --target wheel-out --build-arg NOKK_VERSION \
             --output type=local,dest=python/dist .
 
       - name: Sanity-check the wheel embeds the binary
@@ -83,11 +84,12 @@ jobs:
           RAW="${GITHUB_REF_NAME#v}"
           PEP="${RAW/-alpha/a1}"; PEP="${PEP/-beta/b1}"; PEP="${PEP/-rc./rc}"
           sed -i.bak "s/^version = \".*\"/version = \"$PEP\"/" python/pyproject.toml && rm python/pyproject.toml.bak
+          echo "NOKK_VERSION=$RAW" >> "$GITHUB_ENV"
 
       - name: Build wheel (Debian bullseye, as the x86 wheel)
         if: runner.os == 'Linux'
         run: |
-          docker build -f .github/bullseye-build.Dockerfile --target wheel-out \
+          docker build -f .github/bullseye-build.Dockerfile --target wheel-out --build-arg NOKK_VERSION \
             --output type=local,dest=python/dist .
 
       - uses: dtolnay/rust-toolchain@stable

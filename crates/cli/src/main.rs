@@ -11,9 +11,16 @@ use clap::Parser;
 use nokk::{BrowserContext, Engine, EngineConfig, PoolConfig};
 use nokk_net::ClientConfig;
 
+/// The release version, set by CI from the tag (`NOKK_VERSION=0.1.48-alpha`);
+/// a local build reports the crate version with `-dev`.
+const VERSION: &str = match option_env!("NOKK_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
+};
+
 /// Headless browser-emulation engine with a Chrome-compatible fingerprint.
 #[derive(Debug, Parser)]
-#[command(name = "nokk", version, about)]
+#[command(name = "nokk", version = VERSION, about)]
 struct Cli {
     /// CDP WebSocket port. With no one-shot flag, nokk runs as a CDP server on
     /// this port for Puppeteer to connect to.

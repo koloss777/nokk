@@ -26,6 +26,9 @@ COPY . .
 # The release binary, as `cargo build --release` makes it: the light build
 # (no rasterizers; the default features are empty).
 FROM base AS bin
+# Release version for `nokk --version`, from the tag (empty in a local build).
+ARG NOKK_VERSION=
+ENV NOKK_VERSION=$NOKK_VERSION
 RUN cargo build --release --bin nokk
 FROM scratch AS bin-out
 COPY --from=bin /w/target/release/nokk /nokk
