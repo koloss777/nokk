@@ -160,12 +160,30 @@ fn retag_chrome_version(headers: &mut wreq::header::HeaderMap, major: u32) {
     }
 }
 
+/// Chrome majors nokk can emulate faithfully: a `wreq-util` profile exists
+/// for each, and 150–152 send the same ClientHello as 149 plus ML-DSA.
+fn has_emulation(major: u32) -> bool {
+    matches!(major, 120 | 123 | 124 | 126..=152)
+}
+
+/// The Chrome major to emulate for a requested one. A version without a
+/// faithful handshake falls back to [`DEFAULT_CHROME_MAJOR`] as a whole — UA,
+/// client hints and TLS together — since a UA that names one version over the
+/// handshake of another is itself a tell.
+pub fn emulated_chrome_major(requested: u32) -> u32 {
+    if has_emulation(requested) {
+        return requested;
+    }
+    tracing::warn!(
+        requested,
+        fallback = DEFAULT_CHROME_MAJOR,
+        "no emulation for this Chrome version; using the default for the UA and the handshake"
+    );
+    DEFAULT_CHROME_MAJOR
+}
+
 /// Map a Chrome major version to the matching wreq TLS/HTTP emulation profile.
-///
-/// Covers the modern range wreq-util ships (roughly Chrome 120–149); an
-/// unavailable version falls back to [`DEFAULT_CHROME_MAJOR`] with a warning, so
-/// a caller can request "the version my `cf_clearance` was minted under" and get
-/// the closest faithful handshake nokk can actually produce.
+/// Callers pass a version already checked by [`emulated_chrome_major`].
 pub fn profile_for_major(major: u32) -> wreq_util::Profile {
     use wreq_util::Profile as P;
     match major {
@@ -195,23 +213,18 @@ pub fn profile_for_major(major: u32) -> wreq_util::Profile {
         146 => P::Chrome146,
         147 => P::Chrome147,
         148 => P::Chrome148,
-        149 => P::Chrome149,
-        // The fingerprint is from Chrome 151 but `wreq-util` tops out at 149;
-        // the ClientHello is unchanged between them, so map newer versions to
-        // 149 instead of falling back to the default with a warning.
-        150..=152 => P::Chrome149,
-        other => {
-            tracing::warn!(
-                requested = other,
-                fallback = DEFAULT_CHROME_MAJOR,
-                "no wreq emulation for this Chrome version; using the default"
-            );
-            P::Chrome148
-        }
+        // `wreq-util` tops out at 149; 150–152 differ from it only in the
+        // signature algorithms, added on top (see `CHROME_SIGALGS`).
+        _ => P::Chrome149,
     }
 }
 
-/// Chrome 151's `signature_algorithms`, in its order: three post-quantum ones
+/// Chrome turned ML-DSA signature algorithms on by default in 150
+/// (`kTlsMldsaSignatures`, net/base/features.cc; off by default in 149, absent
+/// before, unconditional from 153).
+const MLDSA_FROM_MAJOR: u32 = 150;
+
+/// Chrome 150+'s `signature_algorithms`, in its order: three post-quantum ones
 /// first, then the usual eight. BoringSSL names; `mldsa*` exist only in our
 /// vendored copy.
 const CHROME_SIGALGS: &str = concat!(
@@ -237,6 +250,10 @@ pub struct ClientConfig {
     /// What client hints report when a site asks for them (`Accept-CH`); keep
     /// in step with the JS profile.
     pub hints: HintValues,
+    /// Local address every connection is bound to. Its family also picks the
+    /// remote family: `0.0.0.0` connects over IPv4 only, `::` over IPv6 only.
+    /// With a proxy it governs the connection to the proxy.
+    pub local_address: Option<std::net::IpAddr>,
 }
 
 impl Default for ClientConfig {
@@ -249,6 +266,7 @@ impl Default for ClientConfig {
             proxy: None,
             request_timeout: Duration::from_secs(30),
             hints: HintValues::default(),
+            local_address: None,
         }
     }
 }
@@ -619,12 +637,15 @@ impl FingerprintClient {
         // per request (see `send_once`).
         emulation.headers.remove("priority");
         let defaults = Arc::new(emulation.headers.clone());
-        // Post-quantum sigalgs: Chrome 151 advertises ML-DSA-44/65/87
+        // Post-quantum sigalgs: Chrome 150+ advertises ML-DSA-44/65/87
         // (0904/0905/0906) first, `wreq-util` does not, so the third JA4 part
         // matched no real browser. Only our BoringSSL knows these names (see
         // `vendor/btls-sys/PATCHES.md`); a server cannot actually select them.
-        if let Some(tls) = emulation.tls_options.as_mut() {
-            tls.sigalgs_list = Some(CHROME_SIGALGS.into());
+        // Older versions keep the profile's own list, as their Chrome did.
+        if config.chrome_major >= MLDSA_FROM_MAJOR {
+            if let Some(tls) = emulation.tls_options.as_mut() {
+                tls.sigalgs_list = Some(CHROME_SIGALGS.into());
+            }
         }
         let mut builder = wreq::Client::builder().emulation(emulation);
         // Decompress ourselves: the client would strip `content-encoding` and
@@ -642,6 +663,9 @@ impl FingerprintClient {
             // Moved` body instead of the destination page. Capped at 10 hops.
             .redirect(wreq::redirect::Policy::limited(10))
             .timeout(config.request_timeout);
+        if let Some(addr) = config.local_address {
+            builder = builder.local_address(addr);
+        }
 
         if let Some(p) = &config.proxy {
             let scheme = match p.scheme {
@@ -1327,6 +1351,17 @@ mod tests {
                 "failed to build client for {os:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_unknown_chrome_major_falls_back_whole() {
+        for known in [120u32, 131, 145, 149, 150, 151, 152] {
+            assert_eq!(emulated_chrome_major(known), known);
+        }
+        for unknown in [0u32, 121, 125, 153, 160, 999] {
+            assert_eq!(emulated_chrome_major(unknown), DEFAULT_CHROME_MAJOR);
+        }
+        assert!(has_emulation(DEFAULT_CHROME_MAJOR));
     }
 
     #[test]

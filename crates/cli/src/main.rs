@@ -158,10 +158,24 @@ struct Cli {
 
     /// Chrome major version to emulate (TLS fingerprint + JS UA together), e.g.
     /// `148`. Defaults to current stable; set it to match the browser a reused
-    /// `cf_clearance` was minted under. Bounded by what wreq-util ships — an
-    /// unavailable version falls back to the default.
+    /// `cf_clearance` was minted under. Versions without a faithful handshake
+    /// (outside 120–152, or 121/122/125) fall back to the default as a whole.
     #[arg(long, env = "NOKK_CHROME_VERSION", value_name = "MAJOR")]
     chrome_version: Option<u32>,
+
+    /// Connect over IPv4 only (`4`) or IPv6 only (`6`). On a dual-stack machine
+    /// the address a site sees decides which `cf_clearance` it accepts; pin the
+    /// family to replay a clearance from the same address. With a proxy it
+    /// applies to the connection to the proxy.
+    #[arg(long, env = "NOKK_IP_VERSION", value_name = "4|6",
+          value_parser = clap::builder::PossibleValuesParser::new(["4", "6"]),
+          conflicts_with = "local_address")]
+    ip_version: Option<String>,
+
+    /// Bind every connection to this local address (one of the machine's own);
+    /// its family is the only one used.
+    #[arg(long, env = "NOKK_LOCAL_ADDRESS", value_name = "IP")]
+    local_address: Option<std::net::IpAddr>,
 
     /// For `--load`: retry up to N extra times if the response is a Cloudflare
     /// "Just a moment…" challenge (the pass is probabilistic).
@@ -428,6 +442,11 @@ impl Cli {
         let mut client = ClientConfig::default();
         // Validated in `real_main`: a proxy that does not parse never gets here.
         client.proxy = self.proxy.as_deref().and_then(parse_proxy);
+        client.local_address = self.local_address.or(match self.ip_version.as_deref() {
+            Some("4") => Some(std::net::Ipv4Addr::UNSPECIFIED.into()),
+            Some("6") => Some(std::net::Ipv6Addr::UNSPECIFIED.into()),
+            _ => None,
+        });
         EngineConfig {
             pool,
             client,

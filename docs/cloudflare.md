@@ -82,3 +82,11 @@ nokk --load https://gated.example/ \
 A clearance expires, and `--fail-on-challenge` says when it did (don't trust the
 cookie's own `expires` — Cloudflare decides validity on its side, against the IP and the
 TLS fingerprint too).
+
+Two flags keep the replay on the same footing as the solve:
+
+- `--chrome-version <MAJOR>` sets the UA, the client hints and the TLS handshake together
+  (ML-DSA signature algorithms from 150 on, as in Chrome). A version nokk has no faithful
+  handshake for falls back to the default as a whole.
+- `--ip-version 4|6` (or `--local-address <IP>`): on a dual-stack machine the site may see
+  either address, and a clearance earned over one is refused over the other.

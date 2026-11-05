@@ -489,6 +489,15 @@ fn preset_for_os(os: nokk_net::EmulationOs) -> nokk_stealth::FingerprintProfile 
     }
 }
 
+/// A frame served by a challenge provider: the Cloudflare widget, reCAPTCHA,
+/// DataDome or hCaptcha.
+fn is_challenge_frame(url: &str) -> bool {
+    url.contains("challenges.cloudflare.com")
+        || url.contains("/recaptcha/")
+        || url.contains("captcha-delivery.com")
+        || url.contains("hcaptcha.com")
+}
+
 fn emulation_os_for(profile: &StealthProfile) -> nokk_net::EmulationOs {
     match profile.ua_platform.as_str() {
         "Windows" => nokk_net::EmulationOs::Windows,
@@ -647,7 +656,9 @@ impl Engine {
     pub fn new(mut config: EngineConfig) -> Result<Self, EngineError> {
         // Emulate one Chrome major across both layers: the TLS/HTTP fingerprint and
         // the JS UA / userAgentData. Re-version the default stealth profile to match
-        // so the ClientHello and the UA never disagree.
+        // so the ClientHello and the UA never disagree. A version without a
+        // faithful handshake falls back as a whole.
+        config.chrome_major = nokk_net::emulated_chrome_major(config.chrome_major);
         config.client.chrome_major = config.chrome_major;
         config.stealth = config.stealth.with_chrome_major(config.chrome_major);
         // Keep the TLS/HTTP emulation OS coherent with the JS profile's OS, so the
@@ -3323,7 +3334,13 @@ impl BrowserContext {
             // Press only what is offered, once per control that appears: a
             // widget that ignores a press is not asking for another, and a
             // flurry of clicks is its own signature.
-            if pressed < MAX_PRESSES && !self.stopped_at_clearance.load(std::sync::atomic::Ordering::Acquire) {
+            // Only once a gate is on the page: without one, the control in a frame
+            // is someone else's (a cookie-consent banner), and pressing it is not
+            // ours to do.
+            if gate_seen.is_some()
+                && pressed < MAX_PRESSES
+                && !self.stopped_at_clearance.load(std::sync::atomic::Ordering::Acquire)
+            {
                 if let Ok(Some(what)) = self.press_widget_control().await {
                     if seen_controls.insert(what.clone()) {
                         pressed += 1;
@@ -3546,8 +3563,11 @@ impl BrowserContext {
 
     pub async fn press_widget_control(&self) -> Result<Option<String>, EngineError> {
         // Frames first: a challenge widget is one, and its control is the one
-        // worth pressing.
-        let mut targets: Vec<Option<u32>> = self.frame_list().iter().map(|f| Some(f.id)).collect();
+        // worth pressing. A challenge's own frames go before the page's other
+        // frames (a consent banner is one too).
+        let mut frames = self.frame_list();
+        frames.sort_by_key(|f| !is_challenge_frame(&f.url));
+        let mut targets: Vec<Option<u32>> = frames.iter().map(|f| Some(f.id)).collect();
         targets.push(None);
 
         for frame in targets {
@@ -17807,6 +17827,35 @@ variationSettings,weight",
         assert_eq!(ice["mdns"], true, "behind an mDNS name, as Chrome has since 2019");
         assert_eq!(ice["state"], "complete");
         assert_eq!(ice["sdp"], true, "the offer carries a ufrag and a DTLS fingerprint");
+    }
+
+    /// A frame that is not a challenge is someone else's: on a page with no gate,
+    /// the solver presses nothing in it and answers "no challenge" within its
+    /// grace instead of waiting out the whole budget.
+    #[tokio::test]
+    async fn the_solver_leaves_a_frame_alone_when_there_is_no_gate() {
+        let _serial = serial().await;
+        let url = frame_server().await;
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 4, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&url).await.unwrap();
+
+        let out = ctx.solve_challenge(std::time::Duration::from_secs(20)).await;
+        assert_eq!(out.status, ChallengeStatus::NoChallenge, "{out:?}");
+        assert_eq!(out.presses, 0);
+        assert!(out.elapsed_ms < 10_000, "answered within the grace: {out:?}");
+
+        let frame = ctx.frame_list().first().map(|f| f.id).expect("the frame is live");
+        let hits = ctx
+            .evaluate_in_frame(frame, "__ptJSON.stringify(globalThis.__hits || [])")
+            .await
+            .unwrap();
+        assert_eq!(hits.as_str(), Some("[]"), "nothing pressed in the frame");
     }
 
     /// The engine can press what a widget puts up, wherever it keeps it — this
