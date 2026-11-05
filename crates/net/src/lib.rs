@@ -647,7 +647,9 @@ impl FingerprintClient {
                 tls.sigalgs_list = Some(CHROME_SIGALGS.into());
             }
         }
-        let mut builder = wreq::Client::builder().emulation(emulation);
+        // No proxy from the environment (`HTTPS_PROXY` and the like): the route is
+        // part of the identity, so only `--proxy` chooses it.
+        let mut builder = wreq::Client::builder().emulation(emulation).no_proxy();
         // Decompress ourselves: the client would strip `content-encoding` and
         // `content-length` and lose the on-wire size. `accept-encoding` still
         // comes from the emulation profile, so the request looks the same.
@@ -1305,6 +1307,34 @@ mod tests {
             referrer_policy: None,
             credentials_include: None,
         }
+    }
+
+    /// A proxy in the environment is not ours to use: with `HTTP_PROXY` pointing
+    /// at a listener, a request to another host never reaches that listener.
+    #[tokio::test]
+    async fn the_environment_proxy_is_ignored() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let used = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = used.clone();
+        tokio::spawn(async move {
+            if listener.accept().await.is_ok() {
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        for k in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+            std::env::set_var(k, format!("http://{proxy}"));
+        }
+        let client = FingerprintClient::new(&ClientConfig {
+            request_timeout: Duration::from_millis(500),
+            ..Default::default()
+        })
+        .unwrap();
+        // A documentation-range address: unreachable, and not loopback, which
+        // the environment proxy would skip anyway.
+        let _ = client.send(req("GET", "http://192.0.2.1:9/")).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!used.load(std::sync::atomic::Ordering::SeqCst), "went through HTTP_PROXY");
     }
 
     #[tokio::test]

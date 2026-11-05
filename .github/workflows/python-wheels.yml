@@ -188,3 +188,32 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: python-mcp/dist
+
+  # The official MCP registry entry (server.json) at the tag's version, once
+  # `nokk-mcp` is on PyPI: the registry checks that package. GitHub OIDC proves
+  # the io.github.koloss777 namespace, so no token is stored.
+  publish-registry:
+    name: Publish to the MCP registry
+    needs: [publish-mcp]
+    runs-on: ubuntu-latest
+    if: always() && github.ref_type == 'tag' && needs.publish-mcp.result == 'success'
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: server.json at the tag's version
+        run: |
+          RAW="${GITHUB_REF_NAME#v}"
+          PEP="${RAW/-alpha/a1}"; PEP="${PEP/-beta/b1}"; PEP="${PEP/-rc./rc}"
+          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$PEP\"/g" server.json
+          grep '"version"' server.json
+
+      - name: Publish
+        run: |
+          curl -sSfL https://github.com/modelcontextprotocol/registry/releases/download/v1.8.4/mcp-publisher_linux_amd64.tar.gz | tar xz mcp-publisher
+          ./mcp-publisher login github-oidc
+          # PyPI can take a minute to show the new nokk-mcp to the registry.
+          for i in 1 2 3 4 5; do ./mcp-publisher publish && exit 0; sleep 60; done
+          exit 1
