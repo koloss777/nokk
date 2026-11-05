@@ -2141,6 +2141,13 @@ impl BrowserContext {
             // dozens, modules included, and a module leaves this loop early.
             if index == self.idx() {
                 self.frames_take_a_turn().await;
+                // The script first, the sheets then: a script in hand that a sheet
+                // holds runs as soon as the sheet is in.
+                if let nokk_dom::Script::External(src) = script {
+                    if let Some(abs) = resolve_url(&script_base, src) {
+                        self.wait_script_live(index, preload.get(&abs)).await;
+                    }
+                }
                 let is_async = page.script_modes.get(idx) == Some(&nokk_dom::ScriptMode::Async);
                 // A deferred script runs after parsing: every sheet still loading holds it.
                 let before = if page.script_modes.get(idx) == Some(&nokk_dom::ScriptMode::Blocking) {
@@ -2221,7 +2228,6 @@ impl BrowserContext {
                             self.record("GET", &abs, "script", 0, &[]);
                             continue;
                         }
-                        self.wait_script_live(index, preload.get(&abs)).await;
                         match self.with_frames_live(self.take_preloaded(preload.remove(&abs), &abs)).await {
                             // `sourceURL` matters: without it every stack frame reads `<anonymous>` instead
                             // of the script URL, and the stack shape is part of the fingerprint.
