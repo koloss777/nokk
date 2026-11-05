@@ -1398,6 +1398,7 @@ dependencies = [
  "nokk-net",
  "nokk-stealth",
  "percent-encoding",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

@@ -120,6 +120,7 @@ nokk --fetch https://tls.browserleaks.com/json                   # Chrome TLS + 
 nokk --load https://example.com --eval 'document.title'          # run the page, query the DOM
 nokk --load https://quotes.toscrape.com --dump-requests          # every request the page makes
 nokk --load https://target --proxy socks5://host:1080            # through a proxy
+nokk --load https://target --solve-challenge 30 --json           # one JSON result: status, challenge, cookies
 nokk --port 9222 --rotate-fingerprint --geoip-timezone           # CDP server, a machine per context
 ```
 

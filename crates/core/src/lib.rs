@@ -442,6 +442,12 @@ impl EngineInner {
     }
 }
 
+/// A file kept beside a named session's jar in `store`, e.g. `s1.browser.json`
+/// for `suffix` `browser.json`. `None` when the name has no safe form.
+pub fn session_side_file(store: &std::path::Path, name: &str, suffix: &str) -> Option<PathBuf> {
+    sanitize_session_name(name).map(|safe| store.join(format!("{safe}.{suffix}")))
+}
+
 /// Restrict a session name to a safe single-path-segment filename — no directory
 /// separators or `..`, so a name coming from a CDP client can't escape the store.
 /// Returns `None` when nothing usable remains.

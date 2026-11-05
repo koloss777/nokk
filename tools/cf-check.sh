@@ -3,7 +3,8 @@
 # verdict (exit code 0 = through, 3 = a gate is still up), the time, the final
 # page title and, where a Turnstile widget sits on the page, its token length.
 # A target that passes but made Turnstile send its error beacon is marked EB:
-# the challenge script threw in the engine, the first sign of a break.
+# the challenge script threw in the engine, the first sign of a break. One that
+# answers with Cloudflare's block page is marked IP: blocked by address.
 # Exits non-zero when any target is not a clean OK, so it doubles as a canary.
 # Do not run it alongside `cargo test` or a Chrome: under load a challenge can
 # run out of time.
@@ -23,6 +24,9 @@ for url in \
   code=$?
   case $code in 0) st="OK  ";; 3) st="FAIL";; 124) st="TIME";; *) st="E$code";; esac
   [ $code = 0 ] && grep -q "error beacon" <<<"$out" && st="EB  "
+  # Cloudflare's block page ("Attention Required!") is a firewall rule against the
+  # address, not a challenge: real Chrome from the same IP gets it too.
+  [ $code = 0 ] && grep -q "Attention Required" <<<"$out" && st="IP  "
   [ "$st" = "OK  " ] || bad=1
   printf '%s %3ss  %-52s %s\n' "$st" $(( $(date +%s)-t0 )) "$url" "$(echo "$out" | grep -v '^\s*$' | grep -v 'error beacon' | tail -1)"
 done

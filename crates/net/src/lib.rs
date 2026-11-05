@@ -45,6 +45,34 @@ pub enum NetError {
     HostSaturated(String),
 }
 
+impl NetError {
+    /// What kind of failure this is, for a caller that branches on it rather
+    /// than on the text: `dns`, `proxy`, `tls`, `refused`, `reset`, `timeout`,
+    /// `unreachable`, `connect` (any other connection failure) or `other`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            NetError::Timeout => "timeout",
+            NetError::Unreachable(_) => "unreachable",
+            NetError::Connect(m) => {
+                if m.contains("ProxyConnect") || m.contains("tunnel error") {
+                    "proxy"
+                } else if m.contains("dns error") || m.contains("failed to lookup address") {
+                    "dns"
+                } else if m.contains("CERTIFICATE") || m.contains("SSL") || m.contains("handshake") {
+                    "tls"
+                } else if m.contains("Connection refused") {
+                    "refused"
+                } else if m.contains("Connection reset") {
+                    "reset"
+                } else {
+                    "connect"
+                }
+            }
+            NetError::Unimplemented | NetError::HostSaturated(_) => "other",
+        }
+    }
+}
+
 /// Which browser's network fingerprint to emulate. Must stay coherent with the
 /// JS-level fingerprint chosen in the stealth layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1120,10 +1148,21 @@ impl FingerprintClient {
                 // "No route" differs from "refused" or "name not resolved":
                 // Chrome reports those at once but keeps trying an
                 // unreachable address.
+                // The message keeps the chain's own words after the top line, so
+                // the reason (a name that did not resolve, a refused proxy) is
+                // readable and `NetError::kind` can tell them apart.
+                let mut parts: Vec<&str> = Vec::new();
+                for link in chain.iter().skip(1) {
+                    if !chain[0].contains(link.as_str()) && !parts.contains(&link.as_str()) {
+                        parts.push(link);
+                    }
+                }
+                let reason = parts.join(": ");
+                let message = if reason.is_empty() { e.to_string() } else { format!("{e}: {reason}") };
                 if cause.contains("Network is unreachable") || cause.contains("No route to host") {
-                    NetError::Unreachable(e.to_string())
+                    NetError::Unreachable(message)
                 } else {
-                    NetError::Connect(e.to_string())
+                    NetError::Connect(message)
                 }
             }
         })?;
@@ -1381,6 +1420,18 @@ mod tests {
                 "failed to build client for {os:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_failure_says_what_kind_it_is() {
+        let c = |m: &str| NetError::Connect(m.into()).kind();
+        assert_eq!(c("client error (Connect): dns error: failed to lookup address information"), "dns");
+        assert_eq!(c("client error (ProxyConnect): tunnel error: tcp connect error"), "proxy");
+        assert_eq!(c("client error (Connect): [CERTIFICATE_VERIFY_FAILED]"), "tls");
+        assert_eq!(c("client error (Connect): tcp connect error: Connection refused (os error 111)"), "refused");
+        assert_eq!(c("client error (Connect)"), "connect");
+        assert_eq!(NetError::Timeout.kind(), "timeout");
+        assert_eq!(NetError::Unreachable(String::new()).kind(), "unreachable");
     }
 
     #[test]

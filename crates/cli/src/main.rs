@@ -123,6 +123,21 @@ struct Cli {
     #[arg(long, value_name = "NAME")]
     session: Option<String>,
 
+    /// For `--load`: print one JSON object instead of the text summary — the
+    /// final URL and HTTP status, the challenge found and how it ended, the
+    /// cookies, the `--eval` result. A failure prints `{"ok": false, "error":
+    /// {"kind", "message"}}`, `kind` being `dns`, `proxy`, `tls`, `refused`,
+    /// `reset`, `timeout`, `unreachable`, `connect` or `error`.
+    #[arg(long)]
+    json: bool,
+
+    /// For `--load`: write the page's cookies to this file at the end. A `.txt`
+    /// file gets the Netscape `cookies.txt` format (curl, wget, yt-dlp); any other
+    /// name gets the JSON shape `--import-cookies` reads, plus every cookie in full
+    /// under `records`.
+    #[arg(long, value_name = "FILE")]
+    export_cookies: Option<std::path::PathBuf>,
+
     /// For `--load`: import cookies from a JSON file into the `--session` jar
     /// before navigating — e.g. a `cf_clearance.json` harvested by nokk-cf
     /// (`{ "cookies": { name: value, … }, "domain": "…", "url": "…" }`). Replay
@@ -381,6 +396,14 @@ async fn wait_response(
 /// complete, and print the result. If the expression is (or resolves to) a
 /// Promise, the *resolved* value is printed; otherwise the value itself.
 async fn eval_and_print(ctx: &BrowserContext, js: &str) -> Result<()> {
+    let out = eval_value(ctx, js).await?;
+    println!("{}", render(&out));
+    Ok(())
+}
+
+/// Evaluate `js` the way `eval_and_print` does and return the value: a JSON
+/// string for an object, the text of anything else.
+async fn eval_value(ctx: &BrowserContext, js: &str) -> Result<serde_json::Value> {
     // Route both sync values and Promise resolutions through `__out`.
     let wrapped = format!(
         "(() => {{ const put = (k, v) => Object.defineProperty(globalThis, k, {{ value: v, writable: true, enumerable: false, configurable: true }}); \
@@ -418,8 +441,7 @@ async fn eval_and_print(ctx: &BrowserContext, js: &str) -> Result<()> {
         )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!("{}", render(&out));
-    Ok(())
+    Ok(out)
 }
 
 impl Cli {
@@ -439,14 +461,16 @@ impl Cli {
         if let Some(mb) = self.max_heap_mb {
             pool.max_heap_mb = Some(mb.max(16)); // a tiny cap would fail instantly
         }
-        let mut client = ClientConfig::default();
-        // Validated in `real_main`: a proxy that does not parse never gets here.
-        client.proxy = self.proxy.as_deref().and_then(parse_proxy);
-        client.local_address = self.local_address.or(match self.ip_version.as_deref() {
-            Some("4") => Some(std::net::Ipv4Addr::UNSPECIFIED.into()),
-            Some("6") => Some(std::net::Ipv6Addr::UNSPECIFIED.into()),
-            _ => None,
-        });
+        let client = ClientConfig {
+            // Validated in `real_main`: a proxy that does not parse never gets here.
+            proxy: self.proxy.as_deref().and_then(parse_proxy),
+            local_address: self.local_address.or(match self.ip_version.as_deref() {
+                Some("4") => Some(std::net::Ipv4Addr::UNSPECIFIED.into()),
+                Some("6") => Some(std::net::Ipv6Addr::UNSPECIFIED.into()),
+                _ => None,
+            }),
+            ..Default::default()
+        };
         EngineConfig {
             pool,
             client,
@@ -489,16 +513,104 @@ fn limit_malloc_arenas() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn limit_malloc_arenas() {}
 
+/// Set once `--json` is parsed: failures are then reported as JSON too.
+static JSON_OUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 fn main() -> Result<()> {
     limit_malloc_arenas();
-    tokio::runtime::Builder::new_multi_thread()
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(real_main())
+        .block_on(real_main());
+    match result {
+        Err(e) if JSON_OUT.get().copied().unwrap_or(false) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": false,
+                    "error": { "kind": failure_kind(&e), "message": e.to_string() },
+                })
+            );
+            std::process::exit(1);
+        }
+        other => other,
+    }
+}
+
+/// The kind of a failure, for `--json`: a network error's own kind, else `error`.
+fn failure_kind(e: &anyhow::Error) -> &'static str {
+    for cause in e.chain() {
+        if let Some(nokk::EngineError::Net(n)) = cause.downcast_ref::<nokk::EngineError>() {
+            return n.kind();
+        }
+        if let Some(n) = cause.downcast_ref::<nokk_net::NetError>() {
+            return n.kind();
+        }
+    }
+    "error"
+}
+
+/// The browser a named session was earned with, kept beside its jar: a
+/// clearance is only good from the same Chrome version and address family.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct SessionBrowser {
+    chrome_major: u32,
+    #[serde(default)]
+    user_agent: String,
+    #[serde(default)]
+    platform: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ip_version: Option<String>,
+}
+
+/// Netscape `cookies.txt`: one tab-separated line per cookie, `#HttpOnly_`
+/// before the domain of an HttpOnly one (the curl convention).
+fn netscape_cookies(records: &[nokk_net::CookieRecord], host: &str) -> String {
+    let mut out = String::from("# Netscape HTTP Cookie File\n");
+    for c in records {
+        let domain = c.domain.clone().unwrap_or_else(|| host.to_string());
+        let sub = if domain.starts_with('.') { "TRUE" } else { "FALSE" };
+        out.push_str(&format!(
+            "{}{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            if c.http_only { "#HttpOnly_" } else { "" },
+            domain,
+            sub,
+            c.path.as_deref().unwrap_or("/"),
+            if c.secure { "TRUE" } else { "FALSE" },
+            c.expires.map(|t| t as i64).unwrap_or(0),
+            c.name,
+            c.value
+        ));
+    }
+    out
 }
 
 async fn real_main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    let _ = JSON_OUT.set(cli.json);
+    // A session earned before keeps its browser: reuse its Chrome version and
+    // address family unless asked otherwise.
+    let browser_file = match (&cli.session_store, &cli.session) {
+        (Some(store), Some(name)) => nokk::session_side_file(store, name, "browser.json"),
+        _ => None,
+    };
+    if let Some(saved) = browser_file
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<SessionBrowser>(&t).ok())
+    {
+        match cli.chrome_version {
+            None => cli.chrome_version = Some(saved.chrome_major),
+            Some(v) if v != saved.chrome_major => eprintln!(
+                "warning: session was earned with Chrome {}, running as Chrome {v}; its clearance may be refused",
+                saved.chrome_major
+            ),
+            _ => {}
+        }
+        if cli.ip_version.is_none() && cli.local_address.is_none() {
+            cli.ip_version = saved.ip_version;
+        }
+    }
     // Going direct when the proxy was meant would expose the real address.
     if let Some(spec) = &cli.proxy {
         if parse_proxy(spec).is_none() {
@@ -2570,9 +2682,12 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
         let ctx = ctx.expect("retry loop runs at least once");
         tracing::info!(elapsed_ms = t.elapsed().as_millis(), "page loaded");
 
+        let gate_found = ctx.challenge_state().await.kind;
+        let mut solved = None;
         if let Some(seconds) = cli.solve_challenge {
             let outcome = ctx.solve_challenge(Duration::from_secs(seconds)).await;
             tracing::debug!(status = outcome.status.as_str(), presses = outcome.presses, elapsed_ms = outcome.elapsed_ms, "solve finished");
+            solved = Some(outcome);
         }
 
         // With the probe tracer on, say what the page asked us — in the page and
@@ -2839,8 +2954,13 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
 
         // Run `--eval` first — it may trigger further requests (fetch/beacon/img)
         // that should then appear in the interception log.
+        let mut eval_result = serde_json::Value::Null;
         if let Some(js) = &cli.eval {
-            eval_and_print(&ctx, js).await?;
+            if cli.json {
+                eval_result = eval_value(&ctx, js).await?;
+            } else {
+                eval_and_print(&ctx, js).await?;
+            }
         }
 
         // Wait for the page's own answer (e.g. a bill query's XHR), print its
@@ -2918,7 +3038,84 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
             }
         }
 
-        if cli.eval.is_none() {
+        // The document's own answer: the last response for the address the page
+        // ended on (a challenge's 403 is followed by the site's 200).
+        let final_url = ctx.document_url();
+        let status = ctx
+            .requests()
+            .iter()
+            .rev()
+            .find(|r| r.resource_type.eq_ignore_ascii_case("document") && r.url == final_url)
+            .map(|r| r.status);
+        let cookies = ctx.cookies(std::slice::from_ref(&final_url));
+        let host = url::Url::parse(&final_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_default();
+
+        if let Some(path) = &cli.export_cookies {
+            let text = if path.extension().is_some_and(|e| e == "txt") {
+                netscape_cookies(&cookies, &host)
+            } else {
+                let map: serde_json::Map<String, serde_json::Value> = cookies
+                    .iter()
+                    .map(|c| (c.name.clone(), serde_json::Value::String(c.value.clone())))
+                    .collect();
+                let origin = url::Url::parse(&final_url)
+                    .map(|u| u.origin().ascii_serialization())
+                    .unwrap_or_default();
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "cookies": map, "domain": host, "url": origin, "records": cookies,
+                }))?
+            };
+            std::fs::write(path, text)
+                .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
+        }
+
+        if let Some(path) = &browser_file {
+            let probe = ctx
+                .evaluate("JSON.stringify([navigator.userAgent, navigator.platform])")
+                .await
+                .ok()
+                .and_then(|v| v.as_str().and_then(|t| serde_json::from_str::<(String, String)>(t).ok()))
+                .unwrap_or_default();
+            let saved = SessionBrowser {
+                chrome_major: nokk_net::emulated_chrome_major(
+                    cli.chrome_version.unwrap_or(nokk_net::DEFAULT_CHROME_MAJOR),
+                ),
+                user_agent: probe.0,
+                platform: probe.1,
+                ip_version: cli.ip_version.clone(),
+            };
+            if let Ok(text) = serde_json::to_string_pretty(&saved) {
+                let _ = std::fs::write(path, text);
+            }
+        }
+
+        if cli.json {
+            let challenge = serde_json::json!({
+                "found": gate_found.as_str(),
+                "result": solved.as_ref().map(|o| o.status.as_str()),
+                "elapsed_ms": solved.as_ref().map(|o| o.elapsed_ms),
+                "presses": solved.as_ref().map(|o| o.presses),
+                "still_up": still_challenged,
+            });
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": !still_challenged,
+                    "url": url,
+                    "final_url": final_url,
+                    "status": status,
+                    "title": final_title,
+                    "challenge": challenge,
+                    "cf_clearance": cookies.iter().any(|c| c.name == "cf_clearance"),
+                    "cookies": cookies,
+                    "eval": eval_result,
+                    "elapsed_ms": t.elapsed().as_millis() as u64,
+                })
+            );
+        } else if cli.eval.is_none() {
             // Default summary: title + a count of elements in the built DOM.
             let title = final_title.clone();
             let count = ctx
@@ -2926,6 +3123,7 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                 .await
                 .unwrap_or_default();
             println!("loaded {url}");
+            println!("status: {}", status.map(|s| s.to_string()).unwrap_or_else(|| "-".into()));
             println!("title: {title}");
             println!("elements: {count}");
         }
@@ -2974,6 +3172,41 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
 mod tests {
     use super::*;
     use nokk_net::ProxyScheme;
+
+    #[test]
+    fn cookies_txt_is_the_netscape_format() {
+        let rec = |name: &str, domain: Option<&str>, http_only: bool, expires: Option<f64>| nokk_net::CookieRecord {
+            name: name.into(),
+            value: "v".into(),
+            domain: domain.map(str::to_string),
+            path: Some("/".into()),
+            secure: true,
+            http_only,
+            expires,
+            same_site: None,
+        };
+        let text = netscape_cookies(
+            &[
+                rec("a", Some(".example.com"), false, Some(1_900_000_000.0)),
+                rec("b", None, true, None),
+            ],
+            "www.example.com",
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "# Netscape HTTP Cookie File");
+        assert_eq!(lines[1], ".example.com\tTRUE\t/\tTRUE\t1900000000\ta\tv");
+        assert_eq!(lines[2], "#HttpOnly_www.example.com\tFALSE\t/\tTRUE\t0\tb\tv");
+    }
+
+    #[test]
+    fn a_failure_kind_is_found_through_the_chain() {
+        let e = anyhow::Error::from(nokk::EngineError::Net(nokk_net::NetError::Connect(
+            "client error (Connect): dns error: failed to lookup address".into(),
+        )))
+        .context("load");
+        assert_eq!(failure_kind(&e), "dns");
+        assert_eq!(failure_kind(&anyhow::anyhow!("something else")), "error");
+    }
 
     #[test]
     fn parse_proxy_http_with_credentials() {
