@@ -77,6 +77,8 @@
   // A hold taken after `load` started is no hold.
   // Each hold is named by what took it, for `__pt_loadHoldList` when a load
   // never finishes.
+  // Markup stylesheets still loading that hold back the scripts after them.
+  const __blockingSheetEls = new Set();
   const __loadHold = { n: 0, live: new Set() };
   const __holdLoad = (what) => {
     const doc = globalThis.document;
@@ -2319,6 +2321,7 @@
       if (blocking) {
         globalThis.__ptBlockingSheets = (globalThis.__ptBlockingSheets | 0) + 1;
         (globalThis.__ptBlockingSheetUrls || (globalThis.__ptBlockingSheetUrls = new Set())).add(url);
+        __blockingSheetEls.add(this);
       }
       let released = false;
       const dclRel = blocking ? __holdDcl(this) : null;
@@ -2328,6 +2331,7 @@
         dclRel();
         globalThis.__ptBlockingSheets = Math.max(0, (globalThis.__ptBlockingSheets | 0) - 1);
         try { globalThis.__ptBlockingSheetUrls.delete(url); } catch (e) {}
+        __blockingSheetEls.delete(this);
       };
       if (rel === 'stylesheet') this.__ptHoldLoad();
       __pt_subresource(url, kind).then(
@@ -9657,6 +9661,32 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
   // The index matches the loader's document-order script list.
   // A document script is a task; over 50 ms it gets a long-animation-frame entry.
   let __ptScriptT0 = 0;
+  // A parser-inserted script waits only for the sheets before it in the
+  // document (HTML "a style sheet that is blocking scripts"): Chrome runs an
+  // inline script in <head> ahead of a <link> after it at once.
+  const __precedes = (a, b) => {
+    const up = (n) => { const c = []; for (; n; n = n.__ptParent) c.push(n); return c; };
+    const ca = up(a), cb = up(b);
+    let i = ca.length - 1, j = cb.length - 1;
+    if (ca[i] !== cb[j]) return false;
+    while (i > 0 && j > 0 && ca[i - 1] === cb[j - 1]) { i--; j--; }
+    if (i === 0) return true;
+    if (j === 0) return false;
+    const x = ca[i - 1], y = cb[j - 1], kids = ca[i].__ptKids || [];
+    for (let k = 0; k < kids.length; k++) {
+      if (kids[k] === x) return true;
+      if (kids[k] === y) return false;
+    }
+    return false;
+  };
+  Object.defineProperty(globalThis, '__pt_sheetsBefore', { value: (i) => {
+    if (!__blockingSheetEls.size) return 0;
+    const el = scriptNodes[i];
+    if (!el) return __blockingSheetEls.size;
+    let n = 0;
+    for (const l of __blockingSheetEls) if (__precedes(l, el)) n++;
+    return n;
+  }, configurable: true, enumerable: false });
   globalThis.__pt_beginScript = (i) => { document.__ptCurScript = scriptNodes[i] || null; try { __ptScriptT0 = performance.now(); } catch (e) {} };
   // Whether a document script is blocked by CSP (inline without nonce, foreign URL).
   globalThis.__pt_cspScriptBlocked = (i) => {

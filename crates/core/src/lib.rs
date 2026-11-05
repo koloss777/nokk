@@ -2142,7 +2142,13 @@ impl BrowserContext {
             if index == self.idx() {
                 self.frames_take_a_turn().await;
                 let is_async = page.script_modes.get(idx) == Some(&nokk_dom::ScriptMode::Async);
-                self.wait_for_blocking_sheets(index, if is_async { SHEETS_WAIT_ASYNC } else { SHEETS_WAIT }).await;
+                // A deferred script runs after parsing: every sheet still loading holds it.
+                let before = if page.script_modes.get(idx) == Some(&nokk_dom::ScriptMode::Blocking) {
+                    format!("typeof __pt_sheetsBefore === 'function' ? __pt_sheetsBefore({idx}) : {SHEETS_LEFT}")
+                } else {
+                    SHEETS_LEFT.to_string()
+                };
+                self.wait_for_blocking_sheets(index, &before, if is_async { SHEETS_WAIT_ASYNC } else { SHEETS_WAIT }).await;
                 self.send_early_fetches(index, base_url).await;
             }
             // `<script nomodule>` is addressed to a browser without modules. We
@@ -2215,6 +2221,7 @@ impl BrowserContext {
                             self.record("GET", &abs, "script", 0, &[]);
                             continue;
                         }
+                        self.wait_script_live(index, preload.get(&abs)).await;
                         match self.with_frames_live(self.take_preloaded(preload.remove(&abs), &abs)).await {
                             // `sourceURL` matters: without it every stack frame reads `<anonymous>` instead
                             // of the script URL, and the stack shape is part of the fingerprint.
@@ -5001,7 +5008,7 @@ impl BrowserContext {
     /// Wait for markup stylesheets before running the next script, as a browser does.
     /// The wait is not idle: the page lives, its timers run, and the stylesheet
     /// requests are served by the same loop.
-    async fn wait_for_blocking_sheets(&self, index: usize, cap: std::time::Duration) {
+    async fn wait_for_blocking_sheets(&self, index: usize, left: &str, cap: std::time::Duration) {
         // One deadline per document, not per script: a sheet that missed 15 s will not
         // arrive for the next script, and a SvelteKit page carries dozens (stake.com sat
         // like this for half an hour at 100% CPU).
@@ -5011,7 +5018,7 @@ impl BrowserContext {
         }
         let deadline = std::time::Instant::now() + cap;
         loop {
-            let pending = self.js_count(index, SHEETS_LEFT).await;
+            let pending = self.js_count(index, left).await;
             if pending == 0 {
                 return;
             }
@@ -5031,7 +5038,7 @@ impl BrowserContext {
                 return;
             }
             // The loop may load a document itself, which then waits for sheets again.
-            let worked = match Box::pin(self.run_event_loop_waiting(std::time::Duration::ZERO, Some(SHEETS_LEFT))).await {
+            let worked = match Box::pin(self.run_event_loop_waiting(std::time::Duration::ZERO, Some(left))).await {
                 Ok(n) => n,
                 Err(_) => return,
             };
@@ -5886,6 +5893,24 @@ impl BrowserContext {
                 .await
                 .unwrap_or_default();
             if worked == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    /// While the parser waits for a script, the page lives as in Chrome: its
+    /// timers fire and style passes start the images and fonts the sheets
+    /// name. Here they waited for the script, and `load` behind them.
+    async fn wait_script_live(&self, index: usize, pre: Option<&Preloaded>) {
+        let Some((_, handle)) = pre else { return };
+        if index != self.idx() {
+            return;
+        }
+        while !handle.is_finished() {
+            let worked: u32 = Box::pin(self.run_event_loop_waiting(std::time::Duration::ZERO, None))
+                .await
+                .unwrap_or_default();
+            if worked == 0 && !handle.is_finished() {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         }
@@ -13295,6 +13320,56 @@ href|http://www.w3.org/1999/xlink href|http://www.w3.org/1999/xlink".into()));
         }
         assert_eq!(ctx.evaluate("document.title").await.unwrap(), Value::String("async;timer;".into()));
         assert!(t.elapsed() < std::time::Duration::from_secs(8), "took {:?}", t.elapsed());
+    }
+
+    /// While the parser waits for a script the page lives, as in Chrome 151:
+    /// its timers fire, a sheet after an inline script does not hold that
+    /// script, and the images the sheet names start loading. Here the timers
+    /// ran after DOMContentLoaded and the image waited for the script.
+    #[tokio::test]
+    async fn the_page_lives_while_the_parser_waits_for_a_script() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let (ctype, body) = if req.contains("GET /s.css") {
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        ("text/css", ".a{background:url(/bg.png)}")
+                    } else if req.contains("GET /bg.png") {
+                        ("image/png", "")
+                    } else if req.contains("GET /slow.js") {
+                        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                        ("text/javascript", "__log.push('slow');")
+                    } else {
+                        ("text/html", "<html><head><script>window.__log=[];setTimeout(()=>__log.push('t0'));setTimeout(()=>__log.push('t400'),400);document.addEventListener('DOMContentLoaded',()=>__log.push('dcl'));</script><link rel=stylesheet href=/s.css onload=\"__log.push('sheet')\"></head><body><div class=a>a</div><script src=/slow.js></script><script>__log.push('after')</script></body></html>")
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&format!("http://127.0.0.1:{}/", addr.port())).await.unwrap();
+        let got = ctx
+            .evaluate("(() => { const r = performance.getEntriesByType('resource'); const g = (n) => r.find(e => e.name.endsWith(n)); return __log.join(',') + ' ' + (g('/bg.png').startTime < g('/slow.js').responseEnd); })()")
+            .await
+            .unwrap();
+        assert_eq!(got, Value::String("t0,sheet,t400,slow,after,dcl true".into()));
     }
 
     /// A request the page made while loading (from a timer, while the parser
