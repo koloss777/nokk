@@ -65,7 +65,7 @@ jobs:
   macos-arm64:
     name: macos apple silicon
     continue-on-error: true   # bring-up: read results per job, no failure mail
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -154,7 +154,7 @@ jobs:
       matrix:
         include:
           - { name: linux-aarch64, os: ubuntu-24.04-arm }
-          - { name: macos-aarch64, os: macos-14 }
+          - { name: macos-aarch64, os: macos-15 }
           - { name: windows-x86_64, os: windows-latest }
     continue-on-error: true   # bring-up
     runs-on: ${{ matrix.os }}

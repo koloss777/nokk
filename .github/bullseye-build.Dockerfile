@@ -8,12 +8,15 @@
 # bullseye is past its security support and deb.debian.org no longer serves its
 # security pool; the image is built from snapshot.debian.org, whose lines sit
 # commented in its sources.list, and those still have every package at the exact
-# version the image expects (clang pins libc6-i386 to the image's libc).
+# version the image expects (clang pins libc6-i386 to the image's libc). It has
+# outages (503 "No healthy backends"), hence the retries.
 FROM rust:1-bullseye AS base
 RUN grep "^# deb http://snapshot" /etc/apt/sources.list | sed "s/^# //" > /tmp/sources.list \
  && APT="apt-get -o Dir::Etc::SourceList=/tmp/sources.list -o Dir::Etc::SourceParts=/dev/null -o Acquire::Check-Valid-Until=false -o Acquire::Retries=3" \
- && $APT update -qq \
- && $APT install -y --no-install-recommends clang libclang-dev pkg-config python3 python3-pip patchelf \
+ && for try in 1 2 3 4 5; do \
+      $APT update -qq && $APT install -y --no-install-recommends clang libclang-dev pkg-config python3 python3-pip patchelf && break; \
+      [ $try = 5 ] && exit 1; echo "snapshot.debian.org failed, retrying in 60 s"; sleep 60; \
+    done \
  && pip3 install --no-cache-dir cmake maturin \
  && ln -s "$(dirname "$(find /usr/lib -name 'libclang.so*' | head -1)")" /opt/libclang \
  && rm -rf /var/lib/apt/lists/*
