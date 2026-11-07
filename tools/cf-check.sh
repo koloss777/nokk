@@ -5,7 +5,7 @@
 # A target that passes but made Turnstile send its error beacon is marked EB:
 # the challenge script threw in the engine, the first sign of a break. One that
 # answers with Cloudflare's block page is marked IP: blocked by address.
-# Exits non-zero when any target is not a clean OK, so it doubles as a canary.
+# Exits non-zero when any target is not OK or IP, so it doubles as a canary.
 # Do not run it alongside `cargo test` or a Chrome: under load a challenge can
 # run out of time.
 NOKK=${NOKK:-./target/release/nokk}   # or: NOKK=$(command -v nokk) tools/cf-check.sh
@@ -27,7 +27,8 @@ for url in \
   # Cloudflare's block page ("Attention Required!") is a firewall rule against the
   # address, not a challenge: real Chrome from the same IP gets it too.
   [ $code = 0 ] && grep -q "Attention Required" <<<"$out" && st="IP  "
-  [ "$st" = "OK  " ] || bad=1
+  # Not the engine's failure, so a warning rather than a red canary.
+  case $st in "OK  "|"IP  ") ;; *) bad=1;; esac
   printf '%s %3ss  %-52s %s\n' "$st" $(( $(date +%s)-t0 )) "$url" "$(echo "$out" | grep -v '^\s*$' | grep -v 'error beacon' | tail -1)"
 done
 exit ${bad:-0}
