@@ -12189,6 +12189,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if (l) l.push(r); else byRule.set(r.rule, [r]);
     }
     const keys = new Set(), kept = [], probe = [];
+    // The changed rules' selectors by key: an element carrying a key is
+    // restyled only when one of them matches it. Null when one does not parse.
+    let byKey = new Map();
     const docEl = __docElement(globalThis.document);
     const note = (r) => {
       // `::before`/`::after` restyle their element (their images load with
@@ -12200,7 +12203,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       // rule up by it.
       const k = __ruleKey(sel);
       if (k != null) {
-        if (typeof k === 'string') keys.add(k); else for (const x of k) keys.add(x);
+        const list = byKey && __selCompiled(sel);
+        if (!list) byKey = null;
+        for (const x of (typeof k === 'string' ? [k] : k)) {
+          keys.add(x);
+          if (!byKey) continue;
+          const l = byKey.get(x);
+          if (l) l.push(list); else byKey.set(x, [list]);
+        }
         return true;
       }
       // No key (`.a > *`): the elements it matches now, in the document only;
@@ -12232,8 +12242,29 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       if ((p.layer - q.layer || p.order - q.order) >= 0) return null;
     }
     if (probe.length) keys.__ptProbe = probe;
+    if (byKey) keys.__ptRules = byKey;
     return keys;
   }
+  // A class attribute's rule keys (`c` + each class, once), kept per string:
+  // a page has a few hundred distinct ones over thousands of elements, and a
+  // key built afresh is hashed afresh on every lookup.
+  let __classKeyMemo = new Map();
+  function __classKeys(raw) {
+    let out = __classKeyMemo.get(raw);
+    if (out !== undefined) return out;
+    out = [];
+    const seen = new Set();
+    for (const c of __s_split(raw, /[\t\n\f\r ]+/)) if (c && !seen.has(c)) { seen.add(c); out.push('c' + c); }
+    if (__classKeyMemo.size >= 8192) __classKeyMemo = new Map();
+    __classKeyMemo.set(raw, out);
+    return out;
+  }
+  const __tagKeyMemo = new Map();
+  const __tagKey = (local) => {
+    let k = __tagKeyMemo.get(local);
+    if (k === undefined) { k = 't' + __s_toLowerCase(String(local || '')); if (__tagKeyMemo.size < 4096) __tagKeyMemo.set(local, k); }
+    return k;
+  };
   // Elements carrying any of `keys` or matching a selector of `keys.__ptProbe`,
   // in the document and its shadow trees.
   // With `every`, each such element, nested ones too; else the topmost (a
@@ -12242,16 +12273,27 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const out = [];
     let attrs = false;
     for (const k of keys) if (k[0] === 'a') { attrs = true; break; }
-    const probe = keys.__ptProbe;
+    const probe = keys.__ptProbe, byKey = keys.__ptRules;
+    // With the rules behind the keys, a key counts only when one of its
+    // rules matches (a sheet with `.x a` rules restyled every link).
+    const hit = !byKey ? (e, k) => keys.has(k) : (e, k) => {
+      const l = byKey.get(k);
+      if (!l) return false;
+      const bloom = __ancBloom(e);
+      for (let i = 0; i < l.length; i++) {
+        try { if (__bloomMayMatch(l[i], bloom) && __selAny(l[i], e, __CASCADE_CTX)) return true; } catch (x) { return true; }
+      }
+      return false;
+    };
     const has = (e) => {
       if (probe) for (let i = 0; i < probe.length; i++) { try { if (__selAny(probe[i], e, __CASCADE_CTX)) return true; } catch (x) { return true; } }
-      if (keys.has('t' + __s_toLowerCase(String(e.__ptLocal || '')))) return true;
-      if (e === (docRoot || de) && keys.has('r')) return true;
+      if (hit(e, __tagKey(e.__ptLocal))) return true;
+      if (e === (docRoot || de) && hit(e, 'r')) return true;
       const id = __ptGetA(e, 'id');
-      if (id && keys.has('i' + id)) return true;
-      const set = __ptClassSet(e);
-      if (set) for (const c of set) if (keys.has('c' + c)) return true;
-      if (attrs && e.__ptAttrs) for (const name of e.__ptAttrs.keys()) if (keys.has('a' + __s_toLowerCase(String(name)))) return true;
+      if (id && hit(e, 'i' + id)) return true;
+      const cls = __ptGetA(e, 'class');
+      if (cls) { const ck = __classKeys(cls); for (let i = 0; i < ck.length; i++) if (hit(e, ck[i])) return true; }
+      if (attrs && e.__ptAttrs) for (const name of e.__ptAttrs.keys()) if (hit(e, 'a' + __s_toLowerCase(String(name)))) return true;
       return false;
     };
     let seen = 0;
@@ -12438,10 +12480,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       const under = (e) => { for (let a = e; a; a = a.__ptParent || a.__ptHost || null) if (gone.has(a)) return true; return false; };
       const kidsOf = (x) => (x.__ptShadow ? __s_slice(x.__ptKids || []).concat(x.__ptShadow.__ptKids || []) : (x.__ptKids || []));
       // Below a changed cascade: kept layouts go, and so do the inherited
-      // values each kept cascade remembered (`__ptInh`).
+      // values each kept cascade remembered (`__ptInh`). Nothing refills them
+      // before the pass ends: a subtree cleared once is skipped after (each
+      // changed element under a changed one walked it again).
+      const cleared = new Set();
       const layoutDown = (x) => {
         for (const k of kidsOf(x)) {
-          if (k.__ptType !== ELEMENT_NODE) continue;
+          if (k.__ptType !== ELEMENT_NODE || cleared.has(k)) continue;
+          cleared.add(k);
           __layoutMemo.delete(k);
           const c = __styleCache.get(k);
           if (c !== undefined && c.__ptInh) c.__ptInh.clear();
@@ -12512,6 +12558,10 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     if (!__cascadeEntriesSame(a, b)) return false;
     return __varsSame(a, b);
   }
+  // The last answer per variables object: a set is never changed once built,
+  // and every element below a `:root` with hundreds of variables compares
+  // the same two sets (Wikipedia: half of a restyle).
+  const __varsPair = new WeakMap();
   function __varsSame(a, b) {
     // Variables chain to the parent's: the same parent object and the same
     // own values, or counted as changed (GitHub has thousands at the root;
@@ -12519,10 +12569,14 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const x = a.__ptVars, y = b.__ptVars;
     if (x === y) return true;
     if (!x || !y || Object.getPrototypeOf(x) !== Object.getPrototypeOf(y)) return false;
+    const memo = __varsPair.get(x);
+    if (memo !== undefined && memo.y === y) return memo.same;
+    let same = true;
     const kx = Object.keys(x), ky = Object.keys(y);
-    if (kx.length !== ky.length) return false;
-    for (const k of kx) if (x[k] !== y[k] || !Object.prototype.hasOwnProperty.call(y, k)) return false;
-    return true;
+    if (kx.length !== ky.length) same = false;
+    else for (const k of kx) if (x[k] !== y[k] || !Object.prototype.hasOwnProperty.call(y, k)) { same = false; break; }
+    __varsPair.set(x, { y, same });
+    return same;
   }
   // Font size and inherited values walk the ancestors and are asked many
   // times per pass; cache them for the cascade's lifetime.
@@ -12753,9 +12807,11 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
     const cls = __ptGetA(el, 'class');
     // Elements alike in tag, id, classes and attribute names have the same
     // candidates (a list's thousand items cost one lookup). Read-only list.
+    // An id no rule is keyed by adds nothing: three of four elements of a
+    // Wikipedia article carry one, and each missed the memo.
     let memoKey = null;
     if (all) {
-      memoKey = (el === docEl ? 'R' : '') + el.__ptLocal + '\x00' + (id || '') + '\x00' + (cls || '');
+      memoKey = (el === docEl ? 'R' : '') + el.__ptLocal + '\x00' + (id && ix.keyed.has('i' + id) ? id : '') + '\x00' + (cls || '');
       if (ix.attrs && el.__ptAttrs) for (const name of el.__ptAttrs.keys()) memoKey += '\x00' + name;
       const hit = ix.memo && ix.memo.get(memoKey);
       if (hit) return hit;
@@ -12774,12 +12830,9 @@ const CHROME_IFACE_MEMBERS = {"HTMLAnchorElement":["attributionSrc","charset","c
       }
     };
     if (el === docEl) add('r');
-    add('t' + __s_toLowerCase(String(el.__ptLocal || '')));
+    add(__tagKey(el.__ptLocal));
     if (id) add('i' + id);
-    if (cls) {
-      const seen = new Set();
-      for (const c of __s_split(cls, /[\t\n\f\r ]+/)) if (c && !seen.has(c)) { seen.add(c); add('c' + c); }
-    }
+    if (cls) for (const k of __classKeys(cls)) add(k);
     if (ix.attrs && el.__ptAttrs) for (const name of el.__ptAttrs.keys()) add('a' + __s_toLowerCase(String(name)));
     if (memoKey !== null) {
       if (!ix.memo || ix.memo.size >= 4096) ix.memo = new Map();
