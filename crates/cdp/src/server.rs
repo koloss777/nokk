@@ -2188,6 +2188,13 @@ impl Conn {
                         js_str(&text)
                     );
                     let frame = focused_frame(&ctx).await;
+                    // A key that activates a frame activates the page above it,
+                    // across origins; the frame's script does its own.
+                    let activates = matches!(ktype.as_str(), "keyDown" | "rawKeyDown")
+                        && !matches!(key.as_str(), "Shift" | "Control" | "Alt" | "Meta" | "CapsLock" | "NumLock" | "Escape");
+                    if activates && frame.is_some() {
+                        let _ = run_in(&ctx, None, "typeof __pt_userActivate === 'function' && __pt_userActivate(true)").await;
+                    }
                     let _ = run_in(&ctx, frame, &js).await;
                     let _ = ctx.run_event_loop().await;
                     let _ = tx.send(Message::Text(ok(id, &session, json!({})).to_string()));

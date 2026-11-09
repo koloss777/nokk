@@ -271,6 +271,31 @@ impl EngineInner {
         cache.entry(key).or_insert(built).clone()
     }
 
+    /// With a geolocated exit, the wire `Accept-Language` follows the same
+    /// languages `navigator.languages` reports for it.
+    fn follow_geo_language(
+        &self,
+        client: &Client,
+        profile: Option<nokk_stealth::FingerprintProfile>,
+        geo: Option<&nokk_net::GeoInfo>,
+    ) {
+        let Some(g) = geo else { return };
+        let base = profile
+            .map(|p| p.stealth().with_chrome_major(self.chrome_major))
+            .unwrap_or_else(|| self.stealth.clone());
+        let langs = nokk_stealth::apply_geo(&base, &g.timezone, &g.country_code).languages;
+        client.set_accept_language(&nokk_stealth::accept_language_header(&langs));
+    }
+
+    /// The proxy a context's traffic leaves through, as a geo-cache key: its own,
+    /// else the engine's (`--proxy` on the command line sets only that one).
+    fn geo_key(&self, proxy: Option<&ProxyConfig>) -> String {
+        proxy
+            .or(self.client_config.proxy.as_ref())
+            .map(proxy_key)
+            .unwrap_or_default()
+    }
+
     /// The exit-IP geolocation for a context's `proxy_key`, or `None` when geoIP is
     /// off, there's no proxy, or the network is stubbed. Looked up once per proxy
     /// (through `client`, so the request travels that proxy) and cached — including
@@ -764,11 +789,12 @@ impl Engine {
         proxy: Option<ProxyConfig>,
     ) -> Result<BrowserContext, EngineError> {
         let profile = self.inner.rotated_profile(&identity);
-        let geo_key = proxy.as_ref().map(proxy_key).unwrap_or_default();
+        let geo_key = self.inner.geo_key(proxy.as_ref());
         let client =
             self.inner
                 .client_for(&identity, proxy, EngineInner::emulation_os_of(profile))?;
         let geo = self.inner.geo_for(&geo_key, &client).await;
+        self.inner.follow_geo_language(&client, profile, geo.as_ref());
         let bootstrap = self.inner.context_bootstrap(profile, geo.as_ref());
         let storage = nokk_pool::idb::partition_for(&format!("id:{identity}"));
         self.build_context(client, None, bootstrap, storage).await
@@ -787,7 +813,7 @@ impl Engine {
         proxy: Option<ProxyConfig>,
     ) -> Result<BrowserContext, EngineError> {
         let profile = self.inner.rotated_profile(&name);
-        let geo_key = proxy.as_ref().map(proxy_key).unwrap_or_default();
+        let geo_key = self.inner.geo_key(proxy.as_ref());
         let jar = self.inner.session_jar(&name)?;
         let client = self.inner.client_for_session(
             &name,
@@ -796,6 +822,7 @@ impl Engine {
             EngineInner::emulation_os_of(profile),
         )?;
         let geo = self.inner.geo_for(&geo_key, &client).await;
+        self.inner.follow_geo_language(&client, profile, geo.as_ref());
         let bootstrap = self.inner.context_bootstrap(profile, geo.as_ref());
         let storage = nokk_pool::idb::partition_for(&format!("s:{name}"));
         self.build_context(client, Some(name), bootstrap, storage).await
@@ -3025,6 +3052,7 @@ impl BrowserContext {
         clicks: i64,
     ) -> Result<bool, EngineError> {
         let mut frame: Option<u32> = None;
+        let mut path: Vec<Option<u32>> = Vec::new();
         let (mut fx, mut fy) = (x, y);
         // Frames nest; the bound is a guard against a cycle, not a real depth.
         for _ in 0..8 {
@@ -3044,6 +3072,7 @@ impl BrowserContext {
             else {
                 break;
             };
+            path.push(frame);
             frame = Some(id as u32);
             fx = nx;
             fy = ny;
@@ -3057,6 +3086,17 @@ impl BrowserContext {
             None => self.evaluate(&js).await?,
             Some(id) => self.evaluate_in_frame(id, &js).await?,
         };
+        // A press in a frame activates every document above it too, across
+        // origins, which the frame's own script cannot reach.
+        if kind == "mousePressed" {
+            for above in path {
+                let js = "typeof __pt_userActivate === 'function' && __pt_userActivate(true)";
+                let _ = match above {
+                    None => self.evaluate(js).await,
+                    Some(id) => self.evaluate_in_frame(id, js).await,
+                };
+            }
+        }
         Ok(out.as_bool().unwrap_or(false))
     }
 
@@ -17916,6 +17956,63 @@ variationSettings,weight",
         assert_eq!(ice["sdp"], true, "the offer carries a ufrag and a DTLS fingerprint");
     }
 
+    /// User activation as Chrome 151 gives it: nothing until a press or a key
+    /// other than a modifier, a lock key or Escape; then `hasBeenActive` for
+    /// good and `isActive` for 5 s. Handlers of the press already see it.
+    #[tokio::test]
+    async fn a_press_or_a_key_activates_the_page() {
+        let _serial = serial().await;
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/",
+            "<html><body style=\"margin:0\"><button id=b style=\"width:200px;height:60px\">x</button><script>\
+               window.__seen = null;\
+               document.getElementById('b').addEventListener('pointerdown', () => { __seen = navigator.userActivation.isActive; });\
+             </script></body></html>",
+        )
+        .await
+        .unwrap();
+        let state = "JSON.stringify([navigator.userActivation.hasBeenActive, navigator.userActivation.isActive])";
+        assert_eq!(ctx.evaluate(state).await.unwrap().as_str(), Some("[false,false]"));
+        for key in ["Shift", "Control", "Alt", "Meta", "CapsLock", "NumLock", "Escape"] {
+            ctx.evaluate(&format!("__pt_key('keyDown', {{ key: '{key}' }})")).await.unwrap();
+        }
+        assert_eq!(ctx.evaluate(state).await.unwrap().as_str(), Some("[false,false]"), "modifiers, locks and Escape do not activate");
+        ctx.dispatch_mouse("mouseMoved", 50.0, 20.0, "left", 0).await.unwrap();
+        assert_eq!(ctx.evaluate(state).await.unwrap().as_str(), Some("[false,false]"), "a move does not");
+        ctx.dispatch_mouse("mousePressed", 50.0, 20.0, "left", 1).await.unwrap();
+        assert_eq!(ctx.evaluate(state).await.unwrap().as_str(), Some("[true,true]"));
+        assert_eq!(ctx.evaluate("String(__seen)").await.unwrap().as_str(), Some("true"), "the pointerdown handler sees it");
+        // Transient: gone after 5 s, sticky stays.
+        ctx.evaluate("(() => { const n = performance.now(); while (performance.now() - n < 5050) {} })()").await.unwrap();
+        assert_eq!(ctx.evaluate(state).await.unwrap().as_str(), Some("[true,false]"));
+        ctx.evaluate("__pt_key('keyDown', { key: 'a' })").await.unwrap();
+        assert_eq!(ctx.evaluate(state).await.unwrap().as_str(), Some("[true,true]"), "a letter key activates");
+    }
+
+    /// `--proxy` sets the engine's proxy, not the context's: the geolocation of
+    /// the exit still has to come from it.
+    #[test]
+    fn geolocation_follows_the_engine_proxy() {
+        let engine = Engine::new(EngineConfig {
+            client: nokk_net::ClientConfig {
+                proxy: Some(ProxyConfig {
+                    scheme: ProxyScheme::Http,
+                    host: "proxy.example.net".into(),
+                    port: 8080,
+                    username: None,
+                    password: None,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!engine.inner.geo_key(None).is_empty());
+        assert_eq!(Engine::new(EngineConfig::default()).unwrap().inner.geo_key(None), "");
+    }
+
     /// A frame that is not a challenge is someone else's: on a page with no gate,
     /// the solver presses nothing in it and answers "no challenge" within its
     /// grace instead of waiting out the whole budget.
@@ -18043,6 +18140,10 @@ variationSettings,weight",
         let hits = hits.as_array().expect("the frame reports what it was clicked with");
 
         assert_eq!(hits.len(), 1, "exactly one click landed in the frame: {hits:?}");
+        // The press activated the frame and the page above it.
+        let active = "JSON.stringify([navigator.userActivation.hasBeenActive, navigator.userActivation.isActive])";
+        assert_eq!(ctx.evaluate_in_frame(frame, active).await.unwrap().as_str(), Some("[true,true]"));
+        assert_eq!(ctx.evaluate(active).await.unwrap().as_str(), Some("[true,true]"));
         assert_eq!(hits[0]["trusted"], true, "input from the engine is trusted");
         assert_eq!(hits[0]["checked"], true, "and the checkbox toggled before the click ran");
 

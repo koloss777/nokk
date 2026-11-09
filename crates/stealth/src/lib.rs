@@ -453,6 +453,21 @@ pub fn country_languages(country_code: &str) -> Vec<String> {
     }
 }
 
+/// `Accept-Language` for a language list, as Chrome builds it: the first
+/// language bare, then `q` falling by 0.1 from 0.9, and languages past 0.1
+/// left out (measured on Chrome 151).
+pub fn accept_language_header(languages: &[String]) -> String {
+    let mut out = String::new();
+    for (i, lang) in languages.iter().take(10).enumerate() {
+        if i > 0 {
+            out.push_str(&format!(",{lang};q=0.{}", 10 - i));
+        } else {
+            out.push_str(lang);
+        }
+    }
+    out
+}
+
 /// Return `profile` with its timezone and locale overridden to match an exit IP's
 /// geolocation (IANA `timezone` + ISO `country_code`), leaving the OS-derived
 /// identity (UA, platform, screen, WebGL) untouched. The timezone is only changed
@@ -13845,8 +13860,8 @@ const FINGERPRINT_TEMPLATE: &str = r#"(() => {
   // Before the first gesture the browser answers false to both; a click
   // raises the flag itself.
   navExtra('userActivation', {
-    get hasBeenActive() { return !!globalThis.__pt_userActivated; },
-    get isActive() { return !!globalThis.__pt_userActive; },
+    get hasBeenActive() { const f = globalThis.__pt_userActivation; return !!(f && f()[0]); },
+    get isActive() { const f = globalThis.__pt_userActivation; return !!(f && f()[1]); },
   });
   // `navigator.mediaSession`: the browser has six members on the prototype,
   // and `playbackState` is read.
@@ -15315,6 +15330,17 @@ mod tests {
 
         // Rotation actually changes the JS-visible fingerprint.
         assert_ne!(win, mac);
+    }
+
+    #[test]
+    fn accept_language_is_built_as_chrome_builds_it() {
+        let l = |v: &[&str]| accept_language_header(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(l(&["en-IE", "en"]), "en-IE,en;q=0.9");
+        // Measured on Chrome 151: q falls by 0.1, and languages past 0.1 are left out.
+        assert_eq!(
+            l(&["de-DE", "de", "en-US", "en", "fr", "es", "it", "pt", "nl", "pl", "ru", "ja"]),
+            "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7,fr;q=0.6,es;q=0.5,it;q=0.4,pt;q=0.3,nl;q=0.2,pl;q=0.1"
+        );
     }
 
     #[test]

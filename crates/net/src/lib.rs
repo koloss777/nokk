@@ -588,6 +588,9 @@ pub struct FingerprintClient {
     /// Accept-Language): a CORS preflight carries these and nothing else of
     /// the default set.
     defaults: Arc<wreq::header::HeaderMap>,
+    /// `Accept-Language` in place of the emulation's, once the context's locale
+    /// is known (it follows the proxy's country with `--geoip-timezone`).
+    accept_language: Arc<std::sync::RwLock<Option<wreq::header::HeaderValue>>>,
 }
 
 /// Header names the emulation profile owns; caller-supplied values for these are
@@ -719,6 +722,7 @@ impl FingerprintClient {
             hint_store: Arc::default(),
             hint_values: Arc::new(config.hints.clone()),
             defaults,
+            accept_language: Arc::default(),
         })
     }
 }
@@ -841,13 +845,17 @@ impl FingerprintClient {
         if media {
             rb = rb.header("accept-encoding", "identity;q=1, *;q=0").header("range", "bytes=0-");
         }
+        let language = self.accept_language.read().ok().and_then(|g| g.clone());
         if preflight {
             rb = rb.default_headers(false);
             for name in ["user-agent", "accept-encoding", "accept-language"] {
-                if let Some(v) = self.defaults.get(name) {
-                    rb = rb.header(name, v.clone());
+                let own = if name == "accept-language" { language.clone() } else { None };
+                if let Some(v) = own.or_else(|| self.defaults.get(name).cloned()) {
+                    rb = rb.header(name, v);
                 }
             }
+        } else if let Some(v) = language {
+            rb = rb.header("accept-language", v);
         }
         // The emulation ships one header set — a navigation's — for every request.
         // Correct the parts that vary by destination, and put them on the wire in
@@ -1272,6 +1280,16 @@ impl Client {
         match self {
             Client::Stub(_) => Default::default(),
             Client::Fingerprint(c) => c.hint_store.snapshot(),
+        }
+    }
+
+    /// Send `value` as `Accept-Language` from now on, in place of the
+    /// emulation's. It has to agree with `navigator.languages`.
+    pub fn set_accept_language(&self, value: &str) {
+        if let (Client::Fingerprint(c), Ok(v)) = (self, wreq::header::HeaderValue::from_str(value)) {
+            if let Ok(mut slot) = c.accept_language.write() {
+                *slot = Some(v);
+            }
         }
     }
 

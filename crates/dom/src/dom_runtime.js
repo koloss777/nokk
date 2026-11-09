@@ -3687,6 +3687,33 @@
   // The worker scope is set up by a separate script and marks its deliveries with this.
   try { Object.defineProperty(globalThis, '__pt_trustEvent', { value: __ptTrust, enumerable: false, configurable: true }); } catch (e) {}
 
+  // User activation: a press, or a key other than a modifier, a lock key or
+  // Escape, activates the page before its handlers run. `hasBeenActive` stays
+  // true, `isActive` lasts 5 s (measured on Chrome 151). Same-origin ancestors
+  // are activated from here; the engine activates the rest.
+  const __ACTIVATION_MS = 5000;
+  const __NO_ACTIVATION_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'CapsLock', 'NumLock', 'Escape']);
+  const __activationNow = performance.now.bind(performance);
+  let __hasBeenActive = false, __activeUntil = -1;
+  const __ptUserActivate = (self_only) => {
+    __hasBeenActive = true;
+    __activeUntil = __activationNow() + __ACTIVATION_MS;
+    if (self_only) return;
+    try {
+      let w = globalThis;
+      while (w.parent && w.parent !== w) {
+        w = w.parent;
+        const f = w.__pt_userActivate;
+        if (typeof f === 'function') f(true);
+      }
+    } catch (e) {}
+  };
+  const __hidden = (name, value) => {
+    try { Object.defineProperty(globalThis, name, { value, enumerable: false, configurable: true }); } catch (e) {}
+  };
+  __hidden('__pt_userActivate', __ptUserActivate);
+  __hidden('__pt_userActivation', () => [__hasBeenActive, __activeUntil > __activationNow()]);
+
   evtAccessors(Event, ['type', 'bubbles', 'cancelable', 'composed', 'defaultPrevented', 'target',
     'currentTarget', 'eventPhase', 'timeStamp']);
   // `srcElement` is the same as `target`.
@@ -17188,6 +17215,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     const scX = globalThis.scrollX || 0, scY = globalThis.scrollY || 0;
     const b = button === 'right' ? 2 : button === 'middle' ? 1 : (button | 0);
     const down = type === 'mousePressed', up = type === 'mouseReleased', move = type === 'mouseMoved';
+    if (down) __ptUserActivate();
     const clicks = clickCount || 1;
     // Fields not in the constructor dictionary are set after creation.
     const finish = (ev, mouse, extra) => {
@@ -17331,6 +17359,7 @@ const CS_REPLACED = {"block-size":"150px","border-block-end-style":"inset","bord
     const el = (doc && doc.activeElement) || (doc && doc.body);
     if (!el) return false;
     const name = { keyDown: 'keydown', rawKeyDown: 'keydown', keyUp: 'keyup', char: 'keypress' }[type] || type;
+    if (name === 'keydown' && !__NO_ACTIVATION_KEYS.has(init.key || '')) __ptUserActivate();
     const ev = { bubbles: true, cancelable: true, key: init.key || '', code: init.code || '', keyCode: init.keyCode || 0 };
     el.dispatchEvent(__ptTrust(new KeyboardEvent(name, ev)));
     if (name === 'keydown') {
