@@ -82,6 +82,14 @@ pub struct ParsedPage {
     /// The `href` of the document's first `<base>` that has one, as written:
     /// the base its markup's scripts resolve against.
     pub base_href: Option<String>,
+    /// What a preload scanner would request before the tree is built: each
+    /// `<link>` the document loads as a stylesheet (`rel` exactly
+    /// `stylesheet` or `preload` with `as=style`), its `href` as written and
+    /// its resource type, first occurrence per address, in document order.
+    pub early_links: Vec<(String, &'static str)>,
+    /// A `<meta http-equiv>` names client hints (`accept-ch`, `delegate-ch`):
+    /// requests made before it is read would go without them.
+    pub meta_hints: bool,
 }
 
 impl ParsedPage {
@@ -122,6 +130,46 @@ fn first_base_href(root: &Handle) -> Option<String> {
         }
     }
     None
+}
+
+/// The stylesheet links and the client-hint meta of the document's tree, in
+/// tree order (template contents are not children). No stack frame per level.
+fn early_links(root: &Handle) -> (Vec<(String, &'static str)>, bool) {
+    let mut out: Vec<(String, &'static str)> = Vec::new();
+    let mut hints = false;
+    let mut stack = vec![root.clone()];
+    while let Some(node) = stack.pop() {
+        if let NodeData::Element { name, attrs, .. } = &node.data {
+            let html = &*name.ns == "http://www.w3.org/1999/xhtml";
+            let attrs = attrs.borrow();
+            let get = |n: &str| attrs.iter().find(|a| &*a.name.local == n).map(|a| a.value.to_string());
+            if html && &*name.local == "meta" {
+                if let Some(e) = get("http-equiv") {
+                    let e = e.trim().to_ascii_lowercase();
+                    if e == "accept-ch" || e == "delegate-ch" {
+                        hints = true;
+                    }
+                }
+            } else if html && &*name.local == "link" {
+                // As the runtime reads it: the whole `rel` lowercased, no trimming.
+                let rel = get("rel").unwrap_or_default().to_ascii_lowercase();
+                let kind = match rel.as_str() {
+                    "stylesheet" => Some("stylesheet"),
+                    "preload" if get("as").unwrap_or_default().eq_ignore_ascii_case("style") => Some("link-style"),
+                    _ => None,
+                };
+                if let (Some(kind), Some(href)) = (kind, get("href")) {
+                    if !href.is_empty() && !out.iter().any(|(h, _)| *h == href) {
+                        out.push((href, kind));
+                    }
+                }
+            }
+        }
+        for c in node.children.borrow().iter().rev() {
+            stack.push(c.clone());
+        }
+    }
+    (out, hints)
 }
 
 /// Parse an HTML document into a JSON tree plus its ordered script list.
@@ -171,7 +219,10 @@ pub fn parse(html: &str) -> ParsedPage {
     before.push(']');
     after.push(']');
 
+    let (early_links, meta_hints) = early_links(&dom.document);
     ParsedPage {
+        early_links,
+        meta_hints,
         root,
         scripts,
         script_modes,

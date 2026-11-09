@@ -910,6 +910,8 @@ impl Engine {
             worker_init_scripts: std::sync::Mutex::new(Vec::new()),
             init_scripts: std::sync::Mutex::new(Vec::new()),
             inflight: std::sync::Mutex::new(Vec::new()),
+            early: std::sync::Mutex::new(HashMap::new()),
+            early_taken: std::sync::Mutex::new(HashMap::new()),
             pending_scripts: std::sync::Mutex::new(Vec::new()),
             doc_gen: std::sync::atomic::AtomicU64::new(0),
             pending_frames: std::sync::Mutex::new(Vec::new()),
@@ -1044,6 +1046,9 @@ enum Deliver {
 
 /// A request on its way: what it was, and the task bringing the answer.
 type Sending = (FetchInfo, tokio::task::JoinHandle<Result<nokk_net::Response, NetError>>);
+
+/// A preload scanner's request: resource type, document, the answer on its way.
+type EarlyLoad = (String, u64, std::time::Instant, tokio::task::JoinHandle<Result<nokk_net::Response, NetError>>);
 
 struct InFlight {
     deliver: Deliver,
@@ -1194,6 +1199,13 @@ pub struct BrowserContext {
     init_scripts: std::sync::Mutex<Vec<String>>,
     /// Frame and worker requests still on the network: JS keeps running meanwhile, as in a browser.
     inflight: std::sync::Mutex<Vec<InFlight>>,
+    /// Stylesheets the preload scanner asked for before the page's tree was
+    /// built, by address: the resource type and document they were asked
+    /// for, and the answer on its way. The page's own request takes one.
+    early: std::sync::Mutex<HashMap<String, EarlyLoad>>,
+    /// When the page took one, when it went out: its resource entry starts
+    /// there, not where the page asked.
+    early_taken: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     /// Inserted scripts whose source is still loading (see [`PendingScript`]).
     pending_scripts: std::sync::Mutex<Vec<PendingScript>>,
     /// The page document now loading or loaded, counted from the start of its
@@ -1697,6 +1709,13 @@ impl BrowserContext {
     pub async fn load_html(&self, base_url: &str, html: &str) -> Result<(), EngineError> {
         self.loading.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let r = self.load_html_now(base_url, html).await;
+        // A preload the document never asked for is dropped with the load.
+        if let Ok(mut early) = self.early.lock() {
+            early.clear();
+        }
+        if let Ok(mut t) = self.early_taken.lock() {
+            t.clear();
+        }
         self.loading.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         r
     }
@@ -2004,6 +2023,14 @@ impl BrowserContext {
             .and_then(|h| resolve_url(base_url, h.trim()))
             .unwrap_or_else(|| base_url.to_string());
         tracing::debug!(target: "nokk::load", ms = t_parse.elapsed().as_millis() as u64, "parsed");
+        self.start_early_links(index, base_url, &script_base, &page);
+        // Preload scanner: a browser finds a document's external scripts while parsing and
+        // requests them all at once, executing in its own order. Fetching each only when
+        // its turn came chained chess.com's hundred files: a second from api.js start to
+        // widget render vs 200-300 ms in Chrome, and that number goes into the first POST.
+        let early_scripts = index == self.idx() && !page.meta_hints;
+        let mut preload: HashMap<String, Preloaded> =
+            if early_scripts { self.preload_scripts(index, &page, &script_base) } else { HashMap::new() };
         let install = page.install_script();
         tracing::debug!(target: "nokk::load", bytes = install.len(), ms = t_parse.elapsed().as_millis() as u64, "install script built");
 
@@ -2068,41 +2095,13 @@ impl BrowserContext {
         // requests them all at once, executing in its own order. Fetching each only when
         // its turn came chained chess.com's hundred files: a second from api.js start to
         // widget render vs 200-300 ms in Chrome, and that number goes into the first POST.
-        let mut preload: HashMap<String, Preloaded> = HashMap::new();
         if index == self.idx() {
             self.pull_doc_hints(index).await;
         }
-        if index == self.idx() && std::env::var_os("NOKK_NO_PRELOAD").is_none() {
-            for (si, script) in page.scripts.iter().enumerate() {
-                let (src, module) = match script {
-                    nokk_dom::Script::External(src) => (src, false),
-                    nokk_dom::Script::ExternalModule(src) => (src, true),
-                    _ => continue,
-                };
-                // Chrome's priority by how the script runs: parser-blocking
-                // High, `async`/`defer` Low; a module is a CORS load.
-                let ty = if module {
-                    "module"
-                } else if mode_of(si) == nokk_dom::ScriptMode::Blocking {
-                    "script"
-                } else {
-                    "script-low"
-                };
-                let Some(abs) = resolve_url(&script_base, src) else { continue };
-                if preload.contains_key(&abs)
-                    || abs.starts_with("data:")
-                    || abs.starts_with("blob:")
-                    || (self.engine.block_trackers && nokk_net::is_blocked_url(&abs))
-                {
-                    continue;
-                }
-                let mut req = self.get_request(&abs, ty, None);
-                req.doc_hints = self.doc_hints_of(index);
-                let client = self.client.clone();
-                let started = std::time::Instant::now();
-                let handle = tokio::spawn(async move { client.send(req).await });
-                preload.insert(abs, (started, handle));
-            }
+        // Without client hints in the markup the scripts went out before the
+        // tree was built; otherwise now, with the hints the tree named.
+        if preload.is_empty() && !early_scripts {
+            preload = self.preload_scripts(index, &page, &script_base);
         }
         let finish = |upto: u8| async move {
             for attempt in 0..3 {
@@ -2584,8 +2583,8 @@ impl BrowserContext {
                     match self.prepare_fetch(index, &base, r) {
                         Prepared::Settled(js) => settles.push(js),
                         Prepared::Send(req, info) => {
-                            let client = self.client.clone();
-                            out.push((info, tokio::spawn(async move { client.send(*req).await })));
+                            let handle = self.send_page_request(req, &info);
+                            out.push((info, handle));
                         }
                     }
                 }
@@ -5499,8 +5498,7 @@ impl BrowserContext {
                 if matches!(deliver, Deliver::Worker(..)) {
                     info.context = WORKER_RECORD_BASE + context;
                 }
-                let client = self.client.clone();
-                let handle = tokio::spawn(async move { client.send(*req).await });
+                let handle = self.send_page_request(req, &info);
                 if let Ok(mut v) = self.inflight.lock() {
                     v.push(InFlight { deliver, info, handle, doc: None });
                 }
@@ -5533,8 +5531,7 @@ impl BrowserContext {
                     let _ = self.eval_in(index, &js).await;
                 }
                 Prepared::Send(req, info) => {
-                    let client = self.client.clone();
-                    let handle = tokio::spawn(async move { client.send(*req).await });
+                    let handle = self.send_page_request(req, &info);
                     if let Ok(mut v) = self.inflight.lock() {
                         v.push(InFlight { deliver: Deliver::Frame(index), info, handle, doc });
                     }
@@ -5591,6 +5588,95 @@ impl BrowserContext {
             n += 1;
         }
         Ok(n)
+    }
+
+    /// Send a request, or take the page document's preload of the same address
+    /// and resource type: a browser's preload scanner asked for it while the
+    /// tree was still being built, and one address is one request.
+    fn send_page_request(
+        &self,
+        req: Box<Request>,
+        info: &FetchInfo,
+    ) -> tokio::task::JoinHandle<Result<nokk_net::Response, NetError>> {
+        if info.context == self.idx() && info.method == "GET" && req.initiator.is_none() && req.credentials_include.is_none() {
+            let doc = self.doc_gen.load(std::sync::atomic::Ordering::Acquire);
+            if let Ok(mut early) = self.early.lock() {
+                if early.get(&info.url).is_some_and(|(kind, d, _, _)| *kind == info.kind && *d == doc) {
+                    if let Some((_, _, at, handle)) = early.remove(&info.url) {
+                        if let Ok(mut t) = self.early_taken.lock() {
+                            t.insert(info.url.clone(), at);
+                        }
+                        return handle;
+                    }
+                }
+            }
+        }
+        let client = self.client.clone();
+        tokio::spawn(async move { client.send(*req).await })
+    }
+
+    /// The document's external scripts, requested at once (top page only).
+    fn preload_scripts(&self, index: usize, page: &nokk_dom::ParsedPage, script_base: &str) -> HashMap<String, Preloaded> {
+        let mut preload: HashMap<String, Preloaded> = HashMap::new();
+        if index != self.idx() || std::env::var_os("NOKK_NO_PRELOAD").is_some() {
+            return preload;
+        }
+        for (si, script) in page.scripts.iter().enumerate() {
+            let (src, module) = match script {
+                nokk_dom::Script::External(src) => (src, false),
+                nokk_dom::Script::ExternalModule(src) => (src, true),
+                _ => continue,
+            };
+            // Chrome's priority by how the script runs: parser-blocking
+            // High, `async`/`defer` Low; a module is a CORS load.
+            let blocking = page.script_modes.get(si).copied().unwrap_or(nokk_dom::ScriptMode::Blocking) == nokk_dom::ScriptMode::Blocking;
+            let ty = if module { "module" } else if blocking { "script" } else { "script-low" };
+            let Some(abs) = resolve_url(script_base, src) else { continue };
+            if preload.contains_key(&abs)
+                || abs.starts_with("data:")
+                || abs.starts_with("blob:")
+                || (self.engine.block_trackers && nokk_net::is_blocked_url(&abs))
+            {
+                continue;
+            }
+            let mut req = self.get_request(&abs, ty, None);
+            req.doc_hints = self.doc_hints_of(index);
+            let client = self.client.clone();
+            let started = std::time::Instant::now();
+            let handle = tokio::spawn(async move { client.send(req).await });
+            preload.insert(abs, (started, handle));
+        }
+        preload
+    }
+
+    /// The preload scanner's stylesheets: requested as the page's tree will
+    /// request them (same type, headers and referrer), before the tree is built.
+    /// Chrome asks for them a few milliseconds into the response; building the
+    /// tree of a large article took 200 ms here before the first went out.
+    fn start_early_links(&self, index: usize, base_url: &str, script_base: &str, page: &nokk_dom::ParsedPage) {
+        // A frame's document is not the page's: its load must not drop them.
+        if index != self.idx() {
+            return;
+        }
+        let doc = self.doc_gen.load(std::sync::atomic::Ordering::Acquire);
+        let Ok(mut early) = self.early.lock() else { return };
+        early.clear();
+        if page.meta_hints || std::env::var_os("NOKK_NO_PRELOAD").is_some() {
+            return;
+        }
+        for (href, kind) in &page.early_links {
+            let Some(abs) = resolve_url(script_base, href.trim()) else { continue };
+            if !(abs.starts_with("http://") || abs.starts_with("https://")) || early.contains_key(&abs) {
+                continue;
+            }
+            let r = serde_json::json!({ "id": 0, "url": abs, "method": "GET", "kind": kind });
+            if let Prepared::Send(req, _) = self.prepare_fetch(index, base_url, &r) {
+                let client = self.client.clone();
+                let at = std::time::Instant::now();
+                let handle = tokio::spawn(async move { client.send(*req).await });
+                early.insert(abs, (kind.to_string(), doc, at, handle));
+            }
+        }
     }
 
     fn prepare_fetch(&self, context: usize, base: &str, r: &Value) -> Prepared {
@@ -6243,7 +6329,11 @@ impl BrowserContext {
         // duration and pages read them. Without a measurement (request failed) keep the
         // fast-local estimate: a zero-duration resource is not a resource.
         let duration_ms = measured_ms.unwrap_or(12.0);
-        let started_ms = now - duration_ms;
+        let early = self.early_taken.lock().ok().and_then(|mut t| t.remove(url));
+        let started_ms = match early {
+            Some(at) => at.saturating_duration_since(self.started).as_secs_f64() * 1000.0,
+            None => now - duration_ms,
+        };
         let announced = self.client.hold.take_id(url);
         let frame = self.frame_of_context(context).or_else(|| {
             (resource_type == "document" || resource_type == "iframe")
@@ -13422,6 +13512,64 @@ href|http://www.w3.org/1999/xlink href|http://www.w3.org/1999/xlink".into()));
             .await
             .unwrap();
         assert_eq!(got, Value::String("t0,sheet,t400,slow,after,dcl true".into()));
+    }
+
+    /// A preload scanner asks for a document's stylesheets before the tree is
+    /// built, and the page's own request takes that answer: one request per
+    /// address, its resource entry starting before the first script ran.
+    #[tokio::test]
+    async fn stylesheets_go_out_before_the_tree_is_built() {
+        let _serial = serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits: std::sync::Arc<std::sync::Mutex<HashMap<String, usize>>> = Default::default();
+        let seen = hits.clone();
+        // A tree that takes a while to build: the sheets go out before it.
+        let page: &'static str = Box::leak(
+            format!(
+                "<html><head><script>window.__t0=performance.now()</script><link rel=preload as=style href=/a.css><link rel=stylesheet href=/a.css><link rel=stylesheet href=b.css></head><body><p>x</p>{}</body></html>",
+                "<i></i>".repeat(40_000)
+            )
+            .into_boxed_str(),
+        );
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                    *seen.lock().unwrap().entry(path.clone()).or_default() += 1;
+                    let (ctype, body) = match path.as_str() {
+                        "/a.css" => ("text/css", "p{color:rgb(1,2,3)}"),
+                        "/b.css" => ("text/css", "p{margin-top:7px}"),
+                        _ => ("text/html", page),
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let engine = Engine::new(EngineConfig {
+            pool: PoolConfig { workers: 1, max_live_contexts: 2, max_heap_mb: None },
+            use_real_network: true,
+            ..Default::default()
+        })
+        .expect("engine");
+        let ctx = engine.new_context().await.unwrap();
+        ctx.navigate(&format!("http://127.0.0.1:{}/", addr.port())).await.unwrap();
+        let got = ctx
+            .evaluate("(() => { const r = performance.getEntriesByType('resource'); const g = (n) => r.filter(e => e.name.endsWith(n)); const p = getComputedStyle(document.querySelector('p')); return [g('/a.css').length, g('/b.css').length, g('/b.css')[0].startTime < __t0 / 2, g('/b.css')[0].startTime <= g('/b.css')[0].responseEnd, p.color, p.marginTop].join(' '); })()")
+            .await
+            .unwrap();
+        assert_eq!(got, Value::String("1 1 true true rgb(1, 2, 3) 7px".into()));
+        let hits = hits.lock().unwrap().clone();
+        assert_eq!((hits.get("/a.css").copied(), hits.get("/b.css").copied()), (Some(1), Some(1)), "{hits:?}");
     }
 
     /// A request the page made while loading (from a timer, while the parser
