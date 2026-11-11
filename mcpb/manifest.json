@@ -44,6 +44,10 @@
       "description": "Show the page as a compact outline with numbered links, buttons and fields for click and fill."
     },
     {
+      "name": "read_page",
+      "description": "Read the page's main content as Markdown: headings, lists, tables, code and links, without navigation or hidden parts."
+    },
+    {
       "name": "solve_challenge",
       "description": "Solve the Cloudflare challenge on the current page."
     },

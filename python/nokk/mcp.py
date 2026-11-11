@@ -59,8 +59,8 @@ except ImportError as exc:  # pragma: no cover
 _INSTRUCTIONS = (
     "A headless browser with Chrome's fingerprint. Call `open` first; the other "
     "tools act on the page it opened. Cloudflare challenges are solved during `open`. "
-    "`snapshot` shows the page compactly with numbered controls (`e12`) that `click` "
-    "and `fill` accept."
+    "`read_page` gives the page's main content as Markdown, for reading; `snapshot` "
+    "shows the page compactly with numbered controls (`e12`) that `click` and `fill` accept."
 )
 # SDK 2.x reports a server version; 1.x has no such argument.
 _server_kwargs: Dict[str, Any] = {"instructions": _INSTRUCTIONS}
@@ -161,6 +161,25 @@ async def snapshot(
     `selector` matches nothing."""
     page = await _get_page()
     return await page.snapshot(selector or None, max_chars)
+
+
+@_tool
+async def read_page(
+    selector: _OptionalSelector = "",
+    max_chars: Annotated[int, Field(description="Characters per part; a longer page comes in parts.")] = 20000,
+    offset: Annotated[int, Field(description="Where the part starts, as the previous part says (with the same `links`).")] = 0,
+    links: Annotated[
+        str,
+        Field(description='"inline" ([text](url)), "refs" (numbered, listed at the end) or "none".'),
+    ] = "inline",
+) -> Optional[str]:
+    """Read the current page: its main content as Markdown, with headings, lists,
+    tables, code and links, and without navigation, headers, footers, cookie
+    banners or hidden parts. The best tool for reading an article, docs or a
+    listing. A long page comes in parts; the text ends with the `offset` of the
+    next. `null` when `selector` matches nothing."""
+    page = await _get_page()
+    return await page.read_page(selector or None, max_chars, offset, links)
 
 
 @_tool

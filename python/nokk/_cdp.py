@@ -240,6 +240,25 @@ class Page:
             f" return el ? el.outerHTML : null; }})()"
         )
 
+    async def read_page(
+        self,
+        selector: Optional[str] = None,
+        max_chars: int = 20000,
+        offset: int = 0,
+        links: str = "inline",
+    ) -> Optional[str]:
+        """The page's main content as Markdown: no navigation, headers, footers or
+        hidden parts. ``links`` is ``"inline"``, ``"refs"`` (numbered, listed at the
+        end) or ``"none"``. A long page comes in parts of ``max_chars``; the text
+        ends with the ``offset`` of the next one. ``None`` when ``selector`` matches
+        nothing."""
+        from ._markdown import MARKDOWN_JS
+
+        if links not in ("inline", "refs", "none"):
+            raise ValueError("links must be 'inline', 'refs' or 'none'")
+        args = ", ".join(json.dumps(a) for a in (selector or None, int(max_chars), int(offset), links))
+        return await self.evaluate(f"({MARKDOWN_JS})({args})")
+
     async def snapshot(self, selector: Optional[str] = None, max_chars: int = 20000) -> Optional[str]:
         """The page as an outline: text in reading order, controls numbered
         ``[e1]``, ``[e2]``… for :meth:`click` and :meth:`fill`. ``None`` when

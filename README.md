@@ -173,8 +173,11 @@ such as Claude Desktop or Claude Code browses through the fingerprinted engine. 
 ```
 
 Without uv: `pip install "nokk[mcp]"`, then `"command": "python", "args": ["-m", "nokk.mcp"]`.
-Tools: `open`, `snapshot`, `read_text`, `read_html`, `click`, `fill`, `evaluate`, `links`, `solve_challenge`,
+Tools: `open`, `snapshot`, `read_page`, `read_text`, `read_html`, `click`, `fill`, `evaluate`, `links`, `solve_challenge`,
 `challenge_state`, `reset`.
+`read_page` gives a page's main content as Markdown for the model to read — headings, lists,
+tables, code and links, without menus, footers or cookie banners: Wikipedia's *Web scraping*
+article is about 10K tokens with links and 7K without, against 105K of HTML.
 
 ### Cloudflare challenges
 

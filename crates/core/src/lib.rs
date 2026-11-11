@@ -18104,6 +18104,68 @@ variationSettings,weight",
         assert_eq!(ice["sdp"], true, "the offer carries a ufrag and a DTLS fingerprint");
     }
 
+    /// The MCP `read_page` tool (python/nokk/_markdown.py) on a page with the
+    /// usual furniture: the article comes out as Markdown, the rest does not.
+    #[tokio::test]
+    async fn read_page_gives_the_main_content_as_markdown() {
+        let _serial = serial().await;
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../python/nokk/_markdown.py")).unwrap();
+        let js = src.split("r\"\"\"").nth(1).and_then(|r| r.split("\"\"\"").next()).unwrap();
+        let engine = engine(1, 2);
+        let ctx = engine.new_context().await.unwrap();
+        ctx.load_html(
+            "https://example.com/docs/page",
+            r##"<html><head><title>Guide</title><style>.x{color:red}</style></head><body>
+              <header><a href="/">Home</a></header>
+              <nav><a href="/a">Menu A</a></nav>
+              <div class="cookie-banner">We use cookies</div>
+              <main>
+                <h1>Getting <em>started</em></h1>
+                <p>Read <a href="/docs/install">the install guide</a> or <a href="https://other.org/x?y=1">elsewhere</a>, see <a href="#part">below</a>.</p>
+                <p hidden>secret</p><p style="display:none">gone</p>
+                <ul><li>one</li><li>two<ul><li>nested</li></ul></li></ul>
+                <ol start="3"><li>three</li></ol>
+                <pre><code class="language-rust">fn main() {}</code></pre>
+                <table><tr><th>Name</th><th>Price</th></tr><tr><td>Book</td><td>£5 | cheap</td></tr></table>
+                <table><tr><td>1.</td><td><a href="/item">Item</a></td></tr></table>
+                <blockquote><p>quoted</p></blockquote>
+                <img src="/p.png" alt="A chart" width="400"><img src="/i.png" alt="icon" width="16">
+                <aside>Related links</aside>
+                <button>Click me</button>
+              </main>
+              <footer>Copyright</footer>
+            </body></html>"##,
+        )
+        .await
+        .unwrap();
+        let md = ctx.evaluate(&format!("({js})(null, 100000, 0, 'inline')")).await.unwrap();
+        let md = md.as_str().unwrap_or_default().to_string();
+        for want in [
+            "Title: Guide\nURL: https://example.com/docs/page",
+            "# Getting *started*",
+            "Read [the install guide](/docs/install) or [elsewhere](https://other.org/x?y=1), see below.",
+            "- one\n- two\n  - nested",
+            "3. three",
+            "```rust\nfn main() {}\n```",
+            "| Name | Price |\n| --- | --- |\n| Book | £5 \\| cheap |",
+            "1. [Item](/item)",
+            "> quoted",
+            "[image: A chart]",
+        ] {
+            assert!(md.contains(want), "missing {want:?} in:\n{md}");
+        }
+        for unwanted in ["Home", "Menu A", "cookies", "secret", "gone", "Related", "Click me", "Copyright", "icon", "color:red"] {
+            assert!(!md.contains(unwanted), "{unwanted:?} should be left out:\n{md}");
+        }
+        // Without links, and in parts.
+        let plain = ctx.evaluate(&format!("({js})(null, 100000, 0, 'none')")).await.unwrap();
+        assert!(plain.as_str().unwrap_or_default().contains("Read the install guide or elsewhere, see below."));
+        let part = ctx.evaluate(&format!("({js})(null, 60, 0, 'inline')")).await.unwrap();
+        assert!(part.as_str().unwrap_or_default().contains("the next part starts at offset="), "{part}");
+        let none = ctx.evaluate(&format!("String(({js})('#nope', 1000, 0, 'inline'))")).await.unwrap();
+        assert_eq!(none.as_str(), Some("null"), "a selector that matches nothing");
+    }
+
     /// User activation as Chrome 151 gives it: nothing until a press or a key
     /// other than a modifier, a lock key or Escape; then `hasBeenActive` for
     /// good and `isActive` for 5 s. Handlers of the press already see it.
