@@ -138,6 +138,13 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     export_cookies: Option<std::path::PathBuf>,
 
+    /// For `--load`: print the page's main content as Markdown, for a language
+    /// model to read: headings, lists, tables, code and links, without
+    /// navigation, headers, footers or hidden parts. With `--json`, it goes in
+    /// the `markdown` field.
+    #[arg(long)]
+    markdown: bool,
+
     /// For `--load`: import cookies from a JSON file into the `--session` jar
     /// before navigating — e.g. a `cf_clearance.json` harvested by nokk-cf
     /// (`{ "cookies": { name: value, … }, "domain": "…", "url": "…" }`). Replay
@@ -513,6 +520,18 @@ fn limit_malloc_arenas() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn limit_malloc_arenas() {}
 
+/// The page-to-Markdown script the MCP server's `read_page` runs, shared so the
+/// command line gives the same text.
+const MARKDOWN_PY: &str = include_str!("../../../python/nokk/_markdown.py");
+
+fn markdown_js() -> &'static str {
+    MARKDOWN_PY
+        .split("r\"\"\"")
+        .nth(1)
+        .and_then(|rest| rest.split("\"\"\"").next())
+        .unwrap_or("() => null")
+}
+
 /// Set once `--json` is parsed: failures are then reported as JSON too.
 static JSON_OUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
@@ -618,10 +637,16 @@ async fn real_main() -> Result<()> {
         }
     }
 
-    tracing_subscriber::fmt()
+    // A result meant for a program or a model (`--json`, `--markdown`) keeps
+    // stdout to itself; the log goes to stderr.
+    let logs = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(&cli.log))
-        .with_target(true)
-        .init();
+        .with_target(true);
+    if cli.json || cli.markdown {
+        logs.with_writer(std::io::stderr).init();
+    } else {
+        logs.init();
+    }
 
     let started = Instant::now();
     let engine = Engine::new(cli.engine_config())?;
@@ -2962,6 +2987,16 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                 eval_and_print(&ctx, js).await?;
             }
         }
+        let mut markdown = serde_json::Value::Null;
+        if cli.markdown {
+            markdown = ctx
+                .evaluate(&format!("({})(null, 100000000, 0, 'inline')", markdown_js()))
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if !cli.json {
+                println!("{}", render(&markdown));
+            }
+        }
 
         // Wait for the page's own answer (e.g. a bill query's XHR), print its
         // body, and exit.
@@ -3112,10 +3147,11 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
                     "cf_clearance": cookies.iter().any(|c| c.name == "cf_clearance"),
                     "cookies": cookies,
                     "eval": eval_result,
+                    "markdown": markdown,
                     "elapsed_ms": t.elapsed().as_millis() as u64,
                 })
             );
-        } else if cli.eval.is_none() {
+        } else if cli.eval.is_none() && !cli.markdown {
             // Default summary: title + a count of elements in the built DOM.
             let title = final_title.clone();
             let count = ctx
@@ -3172,6 +3208,13 @@ if (s.length >= __DUMPLO__ && s.length <= __DUMPHI__ && !(globalThis.__ptD = glo
 mod tests {
     use super::*;
     use nokk_net::ProxyScheme;
+
+    #[test]
+    fn the_markdown_script_is_found_in_the_python_module() {
+        let js = markdown_js();
+        assert!(js.trim_start().starts_with("((rootSel, maxChars, offset, linkMode) =>"), "{}", &js[..80.min(js.len())]);
+        assert!(js.trim_end().ends_with("})"));
+    }
 
     #[test]
     fn cookies_txt_is_the_netscape_format() {

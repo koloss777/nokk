@@ -121,6 +121,7 @@ nokk --load https://example.com --eval 'document.title'          # run the page,
 nokk --load https://quotes.toscrape.com --dump-requests          # every request the page makes
 nokk --load https://target --proxy socks5://host:1080            # through a proxy
 nokk --load https://target --solve-challenge 30 --json           # one JSON result: status, challenge, cookies
+nokk --load https://target --solve-challenge 30 --markdown       # the main content as Markdown, for a model
 nokk --port 9222 --rotate-fingerprint --geoip-timezone           # CDP server, a machine per context
 ```
 
@@ -178,6 +179,8 @@ Tools: `open`, `snapshot`, `read_page`, `read_text`, `read_html`, `click`, `fill
 `read_page` gives a page's main content as Markdown for the model to read — headings, lists,
 tables, code and links, without menus, footers or cookie banners: Wikipedia's *Web scraping*
 article is about 10K tokens with links and 7K without, against 105K of HTML.
+For agents that work through a shell (Claude Code, Cursor, Codex…) there is a skill:
+`npx skills add koloss777/nokk`.
 
 ### Cloudflare challenges
 

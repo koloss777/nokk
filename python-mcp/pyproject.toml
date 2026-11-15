@@ -11,7 +11,7 @@ build-backend = "hatchling.build"
 name = "nokk-mcp"
 # Same version as `nokk`; CI sets both from the tag.
 version = "0.1.45a1"
-description = "MCP server for nokk, a Chrome-fingerprinted headless browser engine that passes Cloudflare: give an AI agent a browser with `uvx nokk-mcp`."
+description = "MCP server for nokk, a Chrome-fingerprinted headless browser that passes Cloudflare and reads pages as Markdown: give an AI agent a browser with `uvx nokk-mcp`."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT OR Apache-2.0" }
